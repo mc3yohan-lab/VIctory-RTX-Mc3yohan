@@ -39,7 +39,7 @@
 #
 # Run from a normal (non-elevated) PowerShell window so NVIDIA keeps its DXCache in the usual place.
 param(
-    [string]$Exe = 'C:\Users\Yohan\Downloads\VersionXbox\game_scarlett_master.exe',
+    [string]$Exe = '',
     [switch]$SeriesS,
     [double]$Scale = 0.0,
     [double]$Fps = 0.0,
@@ -276,8 +276,27 @@ if (-not (Test-Path -LiteralPath $victory)) {
     }
     throw "No $victory. Build first: $hint"
 }
-if (-not (Test-Path -LiteralPath $Exe)) {
-    throw "No executable at $Exe"
+if (-not $Exe) {
+    $gameDir = $env:VICTORY_GAME_DIR
+    if (-not $gameDir) {
+        $cfgPath = if ($env:VICTORY_CONFIG) { $env:VICTORY_CONFIG } else { Join-Path $PSScriptRoot '..\victory.toml' }
+        if (Test-Path -LiteralPath $cfgPath) {
+            $m = Select-String -LiteralPath $cfgPath -Pattern "^\s*game_dir\s*=\s*['""]([^'""]+)['""]" | Select-Object -First 1
+            if ($m) { $gameDir = $m.Matches[0].Groups[1].Value }
+        }
+    }
+    if ($gameDir -and (Test-Path -LiteralPath $gameDir)) {
+        $preferred = Join-Path $gameDir 'game_scarlett_master.exe'
+        if (Test-Path -LiteralPath $preferred) {
+            $Exe = $preferred
+        } else {
+            $firstExe = Get-ChildItem -LiteralPath $gameDir -Filter '*.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($firstExe) { $Exe = $firstExe.FullName }
+        }
+    }
+}
+if (-not $Exe -or -not (Test-Path -LiteralPath $Exe)) {
+    throw "No title executable found. Pass -Exe <path\to\executable.exe> or set game_dir in victory.toml (copy victory.example.toml -> victory.toml)."
 }
 
 # Read-only pre-flight GPU check: warn if another CUDA/AI job is occupying the RTX 4090.

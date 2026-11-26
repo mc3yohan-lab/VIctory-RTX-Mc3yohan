@@ -1,137 +1,203 @@
-# VIctory on an RX 7900 XTX
+# VIctory-RTX (NVIDIA RTX / Wave32 Fork)
 
-A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files the user supplies.
+An NVIDIA-focused fork of [VIctory](https://github.com/Marvisak/VIctory) built on top of
+[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX) (`9576c45`),
+a compatibility and porting layer that runs an Xbox Series title natively on Windows 11
+from files supplied by the user, translating D3D12.X and GFX10 shaders to Direct3D 12
+Shader Model 6.6 on **Wave32 NVIDIA GPUs** (tuned on RTX 4090 + hybrid Intel Core i9).
 
-## The goal
+**This repository contains no game files, code or assets.** You must supply your own
+dump outside this folder (`victory.toml`). Every commit is audited by `cargo xtask policy`
+([docs/asset-policy.md](docs/asset-policy.md)). It is not affiliated with or endorsed by
+the game's developer or publisher.
 
-**A stable 30 fps or more without ray tracing, then as high a frame rate and as
-low frame times as the PC allows**, on an AMD RX 7900 XTX first and on PCs with
-32 GB (later 16 GB) of RAM.
+---
 
-The way there is **porting, not emulating**: patching the title's renderer so it
-behaves the way a PC renderer does, rather than having the layer watch and copy
-the console's shared memory every frame. Shaders are translated ahead of time
-into a versioned store that is kept between builds. Ray tracing stays optional
-and off by default. The picture comes after the frame rate: texture pop-in and
-lighting that is too bright or too dark when walking indoors are next in line.
+## Goal
 
-**This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's developer
-or publisher.
+**Reach a stable 30+ FPS native (60+ FPS visual with Smooth Motion) without ray tracing**
+at clean visual quality (fast texture streaming, natural indoor/outdoor indirect lighting,
+no face/eye/border glitches), then push higher frame rates and optionally enable real
+Wave32 ray tracing (`-RayTracing`).
 
-## Where it stands (2026-11-26)
+---
 
-Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
-RX 7900 XTX, the Series X profile, ray tracing off.
+## Current Status (2026-11-26 — branch `nvidia-rtx4090`)
 
-| | |
+Reference test hardware: **Windows 11, Intel Core i9-12900KF (8P/16T + 8E/8T), 64 GB RAM,
+NVIDIA GeForce RTX 4090 (24 GB GDDR6X, 32 GiB Resizable BAR, Wave32, 1M view heap)**,
+Series X profile (`2560x1440` internal, ray tracing off).
+
+| Metric | Measured Status |
 |---|---|
-| City street, renderer patches 1+2 on | about 53 ms a frame (about 19 fps) |
-| Same scene before the patches | 57-75 ms (13-17 fps) |
-| Shaders the title uses that translate | all of them (25,790 of 25,985; the rest are unused geometry shaders) |
-| Memory | about 35 GB of private memory: **64 GB of RAM recommended** for now |
+| **Menu / UI** | **60 FPS** (`16.7 ms/frame`) with native 60 FPS unlock (`-Fps 60`, game clock stays `1.00x`) |
+| **In-game / Cutscenes (pre-ReBAR baseline)** | **~16–17 FPS** (`57–62 ms/frame`, `4,900–5,045 draws/frame`) at `2560x1440` internal (`92–99% 3D` at only `54 °C` due to L0/PCIe starvation — addressed in commit `805ea6a`, live re-test pending) |
+| **Wave32 Shader Coverage** | **`25,784` shaders translated to Wave32 (`99.98%`)** — only **`6`** Wave64-only shaders remain (195 unsupported GS containers) |
+| **Pre-warmed D3D12 Pipeline Library** | **`2,543` verified PSOs in `host-pipelines.bin` (`1.02 GB`)**, **`0` driver refusals (`0x80070057`)** — including `2da4beb386509b77` (`CS_AlphTransmissionPrefilterMip`) |
+| **RTX 4090 `CARD_COMPARE` Microbenchmark** | **`17.31 ms → 14.40 ms` (`+20.3%`, `705 → 848 GB/s`)** via 6-step parallel tree reduction + VRAM `differs_gpu` |
+| **Visual Quality** | Faces animate, `x=0` dotted border fixed, cornea/sclera sky-leak fixed (`Role::RayMiss` + crease clamp), indoor/outdoor ambient settles by wall clock (`VICTORY_AMBIENT_SETTLE`), zero indirect draw drops (`0 indirect`) |
+| **Memory** | `~15–17 GB` dedicated VRAM, `~40–46 GB` private commit (**64 GB RAM strongly recommended** for now) |
 
-It started at 280 ms a frame in the same scenes three days earlier.
+---
 
-### Renderer patches (off by default while they are tested)
+## What Has Been Implemented in This Fork
 
-| Switch | What it does |
-|---|---|
-| `VICTORY_PORT_CONSTANTS=1` | The title's 174 MB constants heap is read by the card where the title writes it: no uploads, no fills |
-| `VICTORY_PORT_DESCRIPTORS=1` | The title's descriptor-table stores are patched (byte-checked) to report the slots they write, instead of a scan of ~600,000 slots a frame |
+### 1. NVIDIA Wave32 Shader Translator & Pipeline Stability
+- **Wave32 guarded joins & active-loop lowering** (ported from `codec-d/cool_fox`):
+  per-instruction `lanes.guards` tracking in `victory-shader/src/resource.rs`,
+  `DIVERGENT_MASK_EXCHANGE` / `scc_some`, `active_loop_only` single-latch loop widening,
+  and clean pre-driver rejection of `wave == Some(64)` shaders on Wave32 hosts.
+  Recovers `2da4beb386509b77` (`CS_AlphTransmissionPrefilterMip`) as a native D3D12 PSO
+  and eliminates `0x80070057` driver rejections.
+- **Wave32 RT / BVH / tiled cascade shadows** + `VICTORY_BVH_NO_HIT=1` + `VICTORY_WAVE_WIDE=last`
+  + `VICTORY_NAN_SCRUB=1` + `MED3|LEGACY` portable float paths.
+- **Offline pre-translation & pipeline library warming** (`victory shaders` + `victory warm --used --save-library`).
+  *Critical:* translator env vars (`VICTORY_SHADER_OPT=63`, `VICTORY_WAVE_WIDE=last`,
+  `VICTORY_NAN_SCRUB=1`, `VICTORY_BVH_NO_HIT=1`) must match between `shaders`/`warm` and live runs.
 
-What is known to be wrong:
+### 2. GPU Bandwidth, Shared-Memory Reduction & Synchronization
+- **Resizable BAR VRAM Windows (`VICTORY_WINDOWS_BAR_MB=4096`, `VICTORY_WINDOW_KB=256`):**
+  moves loose vertex/index/mesh windows off 25 GB/s System RAM (`L0`) into 1,008 GB/s GDDR6X
+  (`D3D12_HEAP_TYPE_GPU_UPLOAD`), automatically capping at 80% VRAM budget.
+- **Plain OS-RAM `Card::staging` (`shadow.rs`):** when `VICTORY_SEND_OWN=1` (default) and
+  `upcheck` is off, carded buffers' CPU sides use demand-paged `VirtualAlloc` instead of
+  D3D12 `L0` `shared_buffer`, saving **~1.1 GB of WDDM Shared GPU Memory** and ~3,700
+  D3D12 resource/residency objects.
+- **VRAM `differs_gpu` + 6-step tree reduction in `CARD_COMPARE` (`host.rs`, `host/torn.rs`):**
+  removes ~12,000 uncoalesced 4-byte PCIe UAV stores/frame in favor of one VRAM-to-RAM
+  `CopyBufferRegion` per submission, and speeds up hashing by `+20.3%` on RTX 4090 with
+  bit-exact CPU parity (`torn::hash`).
+- **Coalesced `CARD_COMPARE` spans, `CopyBufferRegion`, and `VICTORY_JOIN_BARRIERS=1`**,
+  plus scoped resource UAV barriers inside `ambient.rs` and removal of redundant cross-queue waits.
 
-- Trees, signs and far objects flicker in the distance in some places.
-- Lighting is too bright or too dark after walking indoors, until the title has
-  run for a while; rooms with little direct light are too dark without `-RayTracing`.
-- Textures of what just came into view appear late while the title streams.
-- The first run of a new build stutters while the driver makes pipelines
-  (`victory warm` makes them ahead).
-- Recording a frame in the world makes the title's own watchdog end it.
+### 3. CPU Frame Preparation, Descriptors, Textures & Visual Fixes
+- **NVIDIA 1M View Heap + O(1) `u64` bitmap dynamic slab allocator (`descriptor/host.rs`):**
+  lazy 64-slot per-list slabs, batched `release_dynamic_many`, and immediate `tables_done()`
+  on flight landing (`host.rs`) with zero refused descriptor tables.
+- **`WaitOnAddress` / `WakeByAddressAll` blocking fence waits (`fence.rs`)** and
+  `ahead::drain()` before skin-bake uploads (`texture/ahead.rs`, `draw.rs`).
+- **Renderer Patch #1 (`VICTORY_PORT_CONSTANTS=1`, ON by default):** keeps the 185 MB
+  constants heap in place (`0` forgotten regions).
+- **Renderer Patch #2 (`VICTORY_PORT_DESCRIPTORS=1`, opt-in):** expanded from 6 to **11**
+  byte-verified Scarlett descriptor store hooks in `victory-loader/src/descriptor_sites.rs`
+  (kept OFF by default until the remaining unpatched writers below are hooked).
+- **Ambient light stand-in (`ambient.rs`):** `Role::RayMiss` (`CS_RayMiss_*`) specular sky
+  cap preventing glowing eyes indoors, `x=0` border normal/AO tap fix, corner clamp floor
+  (`0.15 * level * room_luma`) so dark corners keep natural bounce light, and time-based
+  settling (`VICTORY_AMBIENT_SETTLE`).
+- **Safe internal render scale guard (`play-nvidia.ps1`):** clamps `-Scale <= 0.667` on
+  both Series X (`2560x1440` max internal) and Series S (`1280x720` max internal) to prevent
+  RT allocator pool overflow (`int 3` at `+0x2219650`).
 
-## How to run it
+---
 
-You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
-model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
-tools, and your own dump of the title.
+## Known Bottlenecks & Where Collaborators Can Help Most
 
+If you want to contribute toward **stable 30–60 FPS**, these are the highest-leverage open items:
+
+1. **GPU Per-Pass Profiling & Surgical RT-Off Skip List (`-GpuTiming`):**
+   - With `VICTORY_BVH_NO_HIT=1`, ~62 RT/probe/shadow compute shaders (`CS_RaytraceVBuffer_*`,
+     `CS_ScreenProbes_TraceRays`, `CS_RTShadowTrace*`) still run every frame.
+   - `scripts/rt_off_hashes.txt` (`1,034` hashes) is too broad (it kills indoor voxel bounce GI).
+   - **Task:** Capture 15s of `scripts\play-nvidia.ps1 -GpuTiming` in gameplay, identify the top
+     dead RT shaders in ms on NVIDIA, and build a minimal, GI-safe `VICTORY_SKIP_PIPELINES` list.
+2. **Global NULL UAV Barriers & L0 `PORT_CONSTANTS` A/B on NVIDIA Ada:**
+   - ~944–978 barrier calls/frame (`list.rs` Enhanced Barriers / `pipeline_sync` / buffer barriers
+     emit global NULL UAV barriers). Measure with `VICTORY_BARRIER_TEST=groups|indirect|both`
+     and scope barriers to actual resources where safe.
+   - A/B test `VICTORY_PORT_CONSTANTS=0` (`-NoPortConstants`) and `VICTORY_SEND_BAR=1` (`-SendBar`)
+     on RTX 4090 now that LOOSE windows are in VRAM.
+3. **CPU `victory-submit` Thread (`~36.9 ms preparing/frame`):**
+   - Once GPU time drops `< 33 ms`, CPU preparing becomes the next ceiling (`copies 13.2 ms / 66.7 MB`,
+     `LATE_WAIT ~3.8 ms`, `descriptor sync_heaps ~5.7–10 ms`, `VICTORY_THIN ~200 ms` across 8 threads).
+   - **Task:** Profile with `VICTORY_TIMELINE` (`diag` build) and parallelize/coalesce the
+     remaining hot submission steps.
+4. **Finish Renderer Patch #2 (`VICTORY_PORT_DESCRIPTORS=1`):**
+   - 11 sites are hooked (`descriptor_sites.rs`), saving `~7 ms` in `sync_heaps`, **but**
+     ~122K view records are still missed by unpatched title writers (an unrolled 4×32B store at
+     `title+0x4d9f25f` plus a 1-slot-per-table writer with stride 11/19 slots), which delays
+     texture discovery to ~500–900 ms via the fallback.
+   - **Task:** Disassemble & hook the remaining descriptor writers in `descriptor_sites.rs` so
+     `VICTORY_PORT_DESCRIPTORS=1` achieves `0` missed records and `<66 ms` texture latency.
+5. **Remaining 6 Wave64-Only Shaders & ~314 Dropped Draws/Frame:**
+   - Only 6 shaders fail Wave32 lowering (including `02384a60fda6f2d0` = `CS_DefragHeap_ComputeRelocations`).
+   - Run `-Build diag` to log `"dropped X/frame without a host pipeline: {why}"` and classify
+     the ~314 dropped draws/frame.
+6. **Memory Reduction for 32 GB RAM Systems:**
+   - Cut idle scratch/staging/list pools and tune `VICTORY_RESIDENCY=1` (`residency.rs`).
+
+---
+
+## How to Build, Pre-Warm & Run (Windows 11 + NVIDIA RTX)
+
+### Requirements
+- Windows 10/11 x64, AVX2 CPU, Direct3D 12 GPU with Shader Model 6.6 + Mesh Shaders (RTX 30/40/50 series).
+- Rust toolchain (pinned by `rust-toolchain.toml`) + MSVC C++ Build Tools.
+- Your own title dump placed **outside** this repository.
+
+### 1. Configure & Build
 ```powershell
-git clone https://github.com/avatarmanz/VIctory-7900XTX
-cd VIctory-7900XTX
-copy victory.example.toml victory.toml      # then set your paths, outside this folder
+copy victory.example.toml victory.toml
+# Edit victory.toml -> set game_dir = 'D:\path\to\your\dump' (outside this repo)
+
+# Fast release build (for gameplay)
+cargo build --locked --release -p victory
+
+# Diagnostics build (for -Panel, -GpuTiming, VICTORY_TIMELINE)
 cargo build --locked --profile diag -p victory --features diagnostics
-scripts\play.ps1 -Exe <path of your copy's executable>
 ```
 
-`scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
+### 2. Pre-Translate Shaders & Warm Pipeline Library (Once per Translator / Driver Update)
+Use the **exact** translator switches that `scripts\play-nvidia.ps1` uses so the cache key matches 100%:
+```powershell
+$env:VICTORY_SHADER_OPT = '63'
+$env:VICTORY_WAVE_WIDE  = 'last'
+$env:VICTORY_NAN_SCRUB  = '1'
+$env:VICTORY_BVH_NO_HIT = '1'
 
-On a hybrid-graphics PC, the runtime and offline pipeline checks prefer a
-high-performance adapter with Shader Model 6.6. The runtime logs its adapter
-name, PCI vendor and device IDs, and dedicated VRAM. Set
-`VICTORY_D3D12_ADAPTER` to a zero-based DXGI index or part of the adapter's
-name to select it explicitly. With the launcher, pass
-`-More @{VICTORY_D3D12_ADAPTER='NVIDIA'}`.
+target\release\victory.exe shaders --jobs 16 <path\to\your\dump>
+target\release\victory.exe warm --used --jobs 16 --save-library
+```
 
-Before the first run, ahead of time (both can be stopped and go on later):
+### 3. Run via `scripts\play-nvidia.ps1` (Normal, Non-Elevated PowerShell)
+`play-nvidia.ps1` auto-detects the executable from `victory.toml` (or pass `-Exe <path>`):
 
 ```powershell
-target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
-target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
+# Series X 1440p native + ReBAR 4 GB VRAM windows + Patch 1 + 60 FPS cap unlock
+.\scripts\play-nvidia.ps1 -Fps 60
+
+# Series X 1080p internal (-44% pixels, safe RT pool) + NVIDIA Smooth Motion (2x visual FPS)
+.\scripts\play-nvidia.ps1 -Fps 60 -Scale 0.5 -SmoothMotion
+
+# Series X 1296p internal (-19% pixels)
+.\scripts\play-nvidia.ps1 -Fps 60 -Scale 0.6
+
+# 15s GPU per-pass & top-40 shader profiling (auto-uses diag build)
+.\scripts\play-nvidia.ps1 -GpuTiming
+
+# Safe fallback mode (disables ReBAR windows, port patches, thin lists)
+.\scripts\play-nvidia.ps1 -Safe
 ```
 
-Commands, debugging switches and upstream's own description:
-[docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
-described in a comment where it is read.
+*(Other useful switches: `-SendBar`, `-TexStore`, `-SeriesS`, `-RayTracing`, `-Panel`, `-NoPortConstants`, `-PortDescriptors`, `-Residency`, `-Full4K`.)*
 
-## What is different here
+### Verification Before Committing
+```powershell
+cargo test --locked --release -p victory-gpu --lib -- torn ambient warp_card_compare host_ram_card_staging
+cargo run --locked -p xtask -- policy
+```
 
-In short; the reasons and the measurements are in [docs/findings.md](docs/findings.md).
-
-- **List calls are written down, not carried out, on the title's threads**
-  (`VICTORY_THIN`): eight threads of ours translate them.
-- **Submissions are prepared by a thread of ours and joined**
-  (`VICTORY_ASYNC_SUBMIT`, `VICTORY_JOIN_PARTS`), with what can be spread over
-  threads spread: refreshes, compares (AVX2), descriptor records, landings.
-- **What shaders wrote comes back beside the write guards**, by the dwords that
-  changed, on a thread of its own (`VICTORY_RELAY`, `VICTORY_LAND`).
-- **Buffer fills that need bytes still on the card are done on the card**
-  (`VICTORY_CARD_STEPS`) instead of waiting for it.
-- **The title's writes are caught more cheaply**: one view opened at a fault,
-  blocks that rest, places in the title's code that look before they write.
-- **Textures go up on a copy queue of their own** and a slot shows one only after
-  its upload ran, which also ended a device loss that came every 15 minutes or so.
-- **Boats float**: textures that shaders write and the title's CPU reads go back
-  to title memory (from fxceless and Geckomacabre, on by default here).
-- **Frame record and replay** with per-pass times and shader variants compared
-  turn by turn ([docs/replay.md](docs/replay.md)).
+---
 
 ## Credits
 
-This is a tree of other people's work with more on top. The history is kept, and
-commits taken from elsewhere name the commit and its author.
-
-- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
-  contributors: the loader, the runtime services, the Direct3D 12 back end and
-  the shader recompiler.
-- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork
-  this one started from, and the people whose pull requests it carries.
-- **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
-  cube gradients, sparse textures.
-- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
-  the ambient light idea, pipeline workers, and work by romainhedouin.
-- **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**.
-- **[myokex/victory-amd](https://github.com/myokex/victory-amd)**: the guard over
-  every view of a page (with Spexivus, joroyt and tightfall), and Joshua Odom's
-  reads into title memory.
-- **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
-- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same
-  title behaves under another layer; no code of it is here.
-- This fork's changes were made with [Claude Code](https://claude.com/claude-code).
+Built on the combined work of the VIctory open-source ecosystem (commit history preserves upstream authors):
+- **[Marvisak/VIctory](https://github.com/Marvisak/VIctory)** — core loader, HLE runtime, D3D12 backend, and GFX10-to-DXIL recompiler.
+- **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)** — direct upstream base (`9576c45`: `VICTORY_THIN`, `VICTORY_ASYNC_SUBMIT`, `VICTORY_RELAY`, `VICTORY_LAND`, `VICTORY_CARD_STEPS`, Renderer Patches 1 & 2, `VICTORY_AMBIENT_SETTLE`, `VICTORY_TEXTURE_STORE`, FPS unlock, frame record/replay).
+- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** — face animation, legacy FMA reflections, 32-bit int typed views, target format variants, texture read-back.
+- **[codec-d/cool_fox](https://github.com/codec-d/cool_fox)** — Wave32 guarded joins & active-loop lowering, immediate table release, `WaitOnAddress` fence waits, bake upload drain, residency budgets.
+- **[trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA)**, **DexNom/VIctory**, **Belobug/VIctory-Belobug-AMD**, **FQY55kai/ZJOU-VICTORY**, **myokex/victory-amd**, **Geckomacabre**, **cxy0072019-sketch**, and **romainhedouin**.
 
 ## License
 
-GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE); the one file that is not
-covered is named in [docs/asset-policy.md](docs/asset-policy.md).
+GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE) and [docs/asset-policy.md](docs/asset-policy.md).
