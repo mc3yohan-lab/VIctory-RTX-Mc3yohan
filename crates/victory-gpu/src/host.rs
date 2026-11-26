@@ -4628,10 +4628,27 @@ impl Host {
                 }
             }
             let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
+            // Coalesce sub-ranges that map to touching or overlapping 64 KiB
+            // card pieces so each piece is compared once (eliminates ~350
+            // redundant CARD_COMPARE dispatches/frame and avoids racing stores
+            // to the same piece's hash slot in mode 2).
+            let mut merged_spans: Vec<((usize, usize), crate::shadow::CardSpan)> = Vec::new();
             for (from, to) in spans {
                 let Some(span) = shadow.card_span(from, to) else {
                     continue;
                 };
+                if let Some((decl, last)) = merged_spans.last_mut()
+                    && span.first <= last.first + last.pieces
+                {
+                    let end_piece = (last.first + last.pieces).max(span.first + span.pieces);
+                    last.pieces = end_piece - last.first;
+                    last.to = last.to.max(span.to);
+                    decl.1 = decl.1.max(to);
+                } else {
+                    merged_spans.push(((from, to), span));
+                }
+            }
+            for ((from, to), span) in merged_spans {
                 let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2;
                 plan.ranges.push(CardRange {
                     shadow: shadow.clone(),
@@ -4933,9 +4950,14 @@ impl Host {
         let copy_queue = f.queue.clone();
         let waiting = std::time::Instant::now();
         // The flights the fetch runs behind: those in the line by now have
-        // been given to the queue. On the copy queue, those landed here.
-        let ahead = match copy_queue {
-            Some(_) => 0,
+        // been given to the queue. On the copy queue, order behind the direct
+        // queue's already-completed fence value (`~0 us` GPU wait) so `Had`
+        // (`VICTORY_LAND_SKIP=1`) knows which flights' writes are held.
+        let ahead = match &copy_queue {
+            Some(_) => {
+                // SAFETY: a plain fence query.
+                unsafe { self.fence.GetCompletedValue() }
+            }
             None => line().target,
         };
         // SAFETY: the list's last run was waited for by this thread; live
@@ -4945,13 +4967,30 @@ impl Host {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
-                for (shadow, lo, hi, at) in check.as_ref().map_or(&pieces, |c| &c.copies) {
-                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                let src_copies = check.as_ref().map_or(&pieces, |c| &c.copies);
+                let mut merged_copies: Vec<(&ID3D12Resource, u64, u64, u64)> = Vec::with_capacity(src_copies.len().min(128));
+                for (shadow, lo, hi, at) in src_copies {
+                    let (lo, len) = (*lo as u64, (*hi - *lo) as u64);
+                    if let Some(last) = merged_copies.last_mut()
+                        && std::ptr::eq(last.0, &shadow.buffer)
+                        && last.2 + last.3 == lo
+                        && last.1 + last.3 == *at
+                    {
+                        last.3 += len;
+                    } else {
+                        merged_copies.push((&shadow.buffer, *at, lo, len));
+                    }
+                }
+                for &(src, dst_at, src_lo, len) in &merged_copies {
+                    list.CopyBufferRegion(&buffer, dst_at, src, src_lo, len);
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 let _fetching = crate::timeline::span("landing: fetching pieces");
                 if let Some(queue) = &copy_queue {
+                    if ahead > 0 {
+                        queue.Wait(&self.fence, ahead)?;
+                    }
                     queue.ExecuteCommandLists(&lists);
                     queue.Signal(&fence, sent)?;
                     meanwhile();

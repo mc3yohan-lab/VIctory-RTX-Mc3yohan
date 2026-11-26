@@ -1353,15 +1353,24 @@ fn stored_levels(r: &Resource, first: u32) -> Option<(u32, std::sync::Arc<Vec<u8
         return None;
     }
     let level = read_from(layout, first);
+    let shape = r.desc.shape();
+    if !crate::texstore::may_have(shape, level) {
+        return None;
+    }
     let len = crate::texstore::key_levels(layout, u32::from(r.desc.mip_levels))
         .into_iter()
         .find(|&(k, _)| k == level)?
         .1 as usize;
-    let mut smaller = vec![0u8; len];
-    if crate::host::read_there(r.data().cast_const(), &mut smaller) != len {
-        return None;
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
-    crate::texstore::find(r.desc.shape(), level, &smaller).map(|bytes| (level, bytes))
+    SCRATCH.with_borrow_mut(|smaller| {
+        smaller.resize(len, 0);
+        if crate::host::read_there(r.data().cast_const(), smaller) != len {
+            return None;
+        }
+        crate::texstore::find(shape, level, smaller).map(|bytes| (level, bytes))
+    })
 }
 
 /// Since the start: host copies made with a first level other than the

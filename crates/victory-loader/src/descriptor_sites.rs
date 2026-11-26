@@ -38,9 +38,11 @@ pub struct Site {
     pub bytes: &'static [u8],
 }
 
-/// The six record stores of the table fillers (game_scarlett_master.exe
-/// 1.0.2.1, image offsets).
-pub const SITES: [Site; 6] = [
+/// The eleven record stores of the title's descriptor writers (image offsets):
+/// the six 256-bit `vmovups [base+index], ymm0` table-filler loops plus the
+/// five direct 2×128-bit `vmovups [dst + 0/10h], xmm0` Scarlett descriptor
+/// creation helpers (CBV, UAV, SRV, placed SRV, and null CBV).
+pub const SITES: [Site; 11] = [
     // +0x4d9efd0, loop 1: [rcx+rsi]
     Site { window: 0x4d9f04f, store: 10, len: 5, bytes: &[0x81, 0xe1, 0xe0, 0x7f, 0x00, 0x00, 0xc5, 0xfc, 0x10, 0x00, 0xc5, 0xfc, 0x11, 0x04, 0x31, 0x0f, 0xb6, 0x47, 0x0b, 0x39, 0xc5] },
     // loop 2: [rcx+rsi]
@@ -53,6 +55,16 @@ pub const SITES: [Site; 6] = [
     Site { window: 0x4eeca08, store: 10, len: 6, bytes: &[0x81, 0xe7, 0xe0, 0x7f, 0x00, 0x00, 0xc5, 0xfc, 0x10, 0x06, 0xc4, 0xa1, 0x7c, 0x11, 0x04, 0x07, 0x0f, 0xb6, 0x72, 0x0d, 0x39, 0xf0] },
     // loop 3: [r10+r8]
     Site { window: 0x4eeca82, store: 11, len: 6, bytes: &[0x41, 0x81, 0xe2, 0xe0, 0x7f, 0x00, 0x00, 0xc5, 0xfc, 0x10, 0x00, 0xc4, 0x81, 0x7c, 0x11, 0x04, 0x02, 0x0f, 0xb6, 0x42, 0x0f, 0x41, 0x39, 0xc6] },
+    // +0x4fd2b84, direct CBV store: 2x vmovups [rax + 0/10h], xmm0 from [r9] (followed by add rsp, 28h ; ret)
+    Site { window: 0x4fd2b84, store: 0, len: 20, bytes: &[0xc4, 0xc1, 0x78, 0x10, 0x01, 0xc5, 0xf8, 0x11, 0x00, 0xc4, 0xc1, 0x78, 0x10, 0x41, 0x10, 0xc5, 0xf8, 0x11, 0x40, 0x10, 0x48, 0x83, 0xc4, 0x28, 0xc3] },
+    // +0x4fd2c2b, direct UAV store: 2x vmovups [r8 + 0/10h], xmm0 from [r9] (followed by add rsp, 28h ; ret)
+    Site { window: 0x4fd2c2b, store: 0, len: 22, bytes: &[0xc4, 0xc1, 0x78, 0x10, 0x01, 0xc4, 0xc1, 0x78, 0x11, 0x00, 0xc4, 0xc1, 0x78, 0x10, 0x41, 0x10, 0xc4, 0xc1, 0x78, 0x11, 0x40, 0x10, 0x48, 0x83, 0xc4, 0x28, 0xc3] },
+    // +0x4fd2c94, direct SRV store: 2x vmovups [rax + 0/10h], xmm0 from [r9] (followed by add rsp, 28h ; ret)
+    Site { window: 0x4fd2c94, store: 0, len: 20, bytes: &[0xc4, 0xc1, 0x78, 0x10, 0x01, 0xc5, 0xf8, 0x11, 0x00, 0xc4, 0xc1, 0x78, 0x10, 0x41, 0x10, 0xc5, 0xf8, 0x11, 0x40, 0x10, 0x48, 0x83, 0xc4, 0x28, 0xc3] },
+    // +0x4e31cf0, placed SRV store: 2x vmovups [r8 + 0/10h], xmm0 from [rbx] (followed by add rsp, 0a8h)
+    Site { window: 0x4e31cf0, store: 0, len: 20, bytes: &[0xc5, 0xf8, 0x10, 0x03, 0xc4, 0xc1, 0x78, 0x11, 0x00, 0xc5, 0xf8, 0x10, 0x43, 0x10, 0xc4, 0xc1, 0x78, 0x11, 0x40, 0x10, 0x48, 0x81, 0xc4, 0xa8, 0x00, 0x00, 0x00] },
+    // +0x555ebb4, null CBV store: 2x vmovups [r8 + 0/10h], xmm0 from [r9] (followed by mov rcx, [rcx+18h] ; xor edx, edx)
+    Site { window: 0x555ebb4, store: 0, len: 22, bytes: &[0xc4, 0xc1, 0x78, 0x10, 0x01, 0xc4, 0xc1, 0x78, 0x11, 0x00, 0xc4, 0xc1, 0x78, 0x10, 0x41, 0x10, 0xc4, 0xc1, 0x78, 0x11, 0x40, 0x10, 0x48, 0x8b, 0x49, 0x18, 0x31, 0xd2] },
 ];
 
 /// `lea rax, [base+index]` for a `vmovups [base+index], ymm0` (VEX, ModRM
@@ -81,13 +93,67 @@ fn lea_of(store: &[u8]) -> Option<[u8; 4]> {
     Some([0x48 | u8::from(x) << 1 | u8::from(b), 0x8d, 0x04, sib])
 }
 
+/// Emits instructions placing the 32-byte destination address into `rax`
+/// (executed after `push rax`) for either:
+/// - a 5/6-byte `vmovups [base+index], ymm0` (`lea rax, [base+index]`), or
+/// - a 20/22-byte `2x vmovups [dst + 0/10h], xmm0` pair (`dst` = `rax` or `r8`).
+fn addr_to_rax(store: &[u8]) -> Option<Vec<u8>> {
+    if let Some(lea) = lea_of(store) {
+        return Some(lea.to_vec());
+    }
+    // Parse load 1: `vmovups xmm0, [src]` (no SIB, no RIP-relative).
+    let (src_ext, src_rm, mut pos) = match store {
+        [0xc5, 0xf8, 0x10, m, ..] if m & 0xf8 == 0 && !matches!(m & 7, 4 | 5) => (false, m & 7, 4),
+        [0xc4, 0xc1, 0x78, 0x10, m, ..] if m & 0xf8 == 0 && !matches!(m & 7, 4 | 5) => (true, m & 7, 5),
+        _ => return None,
+    };
+    // Parse store 1: `vmovups [rax], xmm0` or `vmovups [r8], xmm0`.
+    let dst_r8 = match &store[pos..] {
+        [0xc5, 0xf8, 0x11, 0x00, ..] => {
+            pos += 4;
+            false
+        }
+        [0xc4, 0xc1, 0x78, 0x11, 0x00, ..] => {
+            pos += 5;
+            true
+        }
+        _ => return None,
+    };
+    // Parse load 2: `vmovups xmm0, [src+10h]` with the same `src`.
+    if src_ext {
+        if store.get(pos..pos + 6) != Some(&[0xc4, 0xc1, 0x78, 0x10, 0x40 | src_rm, 0x10]) {
+            return None;
+        }
+        pos += 6;
+    } else {
+        if store.get(pos..pos + 5) != Some(&[0xc5, 0xf8, 0x10, 0x40 | src_rm, 0x10]) {
+            return None;
+        }
+        pos += 5;
+    }
+    // Parse store 2: `vmovups [dst+10h], xmm0` with the same `dst`.
+    if dst_r8 {
+        if store.get(pos..) != Some(&[0xc4, 0xc1, 0x78, 0x11, 0x40, 0x10]) {
+            return None;
+        }
+        // `mov rax, r8`
+        Some(vec![0x4c, 0x89, 0xc0])
+    } else {
+        if store.get(pos..) != Some(&[0xc5, 0xf8, 0x11, 0x40, 0x10]) {
+            return None;
+        }
+        // `rax` already holds the destination slot address.
+        Some(Vec::new())
+    }
+}
+
 /// The code at `to` for the store `store` at `at`: the store, the marks, back
 /// to `at + store.len()`.
 fn stub(store: &[u8], at: usize, to: usize, marks: usize) -> Option<Vec<u8>> {
-    let lea = lea_of(store)?;
+    let load_addr = addr_to_rax(store)?;
     let mut out = store.to_vec();
     out.push(0x50); // push rax
-    out.extend(lea); // lea rax, [base+index]
+    out.extend(load_addr); // place destination address in rax
     out.extend([0x52, 0x51]); // push rdx ; push rcx
     out.extend([0x48, 0xba]); // mov rdx, marks
     out.extend((marks as u64).to_le_bytes());
@@ -141,14 +207,17 @@ pub unsafe fn apply(base: usize, size: usize, marks: usize, sites: &[Site]) -> V
                 return Hooked::Differs;
             }
             let at = window + site.store;
-            if room.is_none() {
+            let store = &site.bytes[site.store..site.store + site.len];
+            if room.is_none_or(|(place, used)| {
+                used + store.len() + 64 > crate::console_insn::STUBS_LEN
+                    || crate::console_insn::jump(at, place + used).is_none()
+            }) {
                 room = crate::console_insn::near(at).map(|place| (place, 0));
             }
             let Some((place, used)) = room.as_mut() else {
                 return Hooked::Failed("no room for code near the title's");
             };
             let to = *place + *used;
-            let store = &site.bytes[site.store..site.store + site.len];
             let (Some(body), Some(jump)) = (stub(store, at, to, marks), crate::console_insn::jump(at, to)) else {
                 return Hooked::Failed("not a store of the expected form, or out of reach");
             };
@@ -189,25 +258,35 @@ mod tests {
 
     #[test]
     fn the_sites_lea_their_stores_address() {
-        let leas: Vec<[u8; 4]> = SITES.iter().map(|s| lea_of(&s.bytes[s.store..s.store + s.len]).unwrap()).collect();
+        let leas: Vec<[u8; 4]> = SITES[..6].iter().map(|s| lea_of(&s.bytes[s.store..s.store + s.len]).unwrap()).collect();
         assert_eq!(leas[0], [0x48, 0x8d, 0x04, 0x31]); // lea rax, [rcx+rsi]
         assert_eq!(leas[1], [0x48, 0x8d, 0x04, 0x31]);
         assert_eq!(leas[2], [0x49, 0x8d, 0x04, 0x31]); // [r9+rsi]
         assert_eq!(leas[3], [0x4b, 0x8d, 0x04, 0x01]); // [r9+r8]
         assert_eq!(leas[4], [0x4a, 0x8d, 0x04, 0x07]); // [rdi+r8]
         assert_eq!(leas[5], [0x4b, 0x8d, 0x04, 0x02]); // [r10+r8]
-        // Each window: the store follows the record's load and is followed
-        // by a movzx and the cmp that sets the flags.
-        for s in &SITES {
+        // Each table-filler window: the store follows the record's load and is
+        // followed by a movzx and the cmp that sets the flags.
+        for s in &SITES[..6] {
             let after = &s.bytes[s.store + s.len..];
             let movzx = if after[0] == 0x0f { 0 } else { 1 };
             assert_eq!(&after[movzx..movzx + 2], &[0x0f, 0xb6]);
             assert_eq!(after[after.len() - 2], 0x39, "cmp");
         }
-        // A store with a displacement, of the stack, of another kind: not taken.
-        assert!(lea_of(&[0xc5, 0xfc, 0x11, 0x44, 0x31, 0x08]).is_none());
-        assert!(lea_of(&[0xc5, 0xfc, 0x11, 0x04, 0x24]).is_none());
-        assert!(lea_of(&[0xc5, 0xfc, 0x10, 0x04, 0x31]).is_none());
+        // Direct 2x128-bit descriptor helpers: rax -> [], r8 -> mov rax, r8.
+        let direct: Vec<Vec<u8>> = SITES[6..].iter().map(|s| addr_to_rax(&s.bytes[s.store..s.store + s.len]).unwrap()).collect();
+        assert_eq!(direct[0], Vec::<u8>::new()); // +0x4fd2b84: [rax]
+        assert_eq!(direct[1], vec![0x4c, 0x89, 0xc0]); // +0x4fd2c2b: [r8]
+        assert_eq!(direct[2], Vec::<u8>::new()); // +0x4fd2c94: [rax]
+        assert_eq!(direct[3], vec![0x4c, 0x89, 0xc0]); // +0x4e31cf0: [r8]
+        assert_eq!(direct[4], vec![0x4c, 0x89, 0xc0]); // +0x555ebb4: [r8]
+        // A store with a displacement, of the stack, of another kind, or mismatched 2x xmm: not taken.
+        assert!(addr_to_rax(&[0xc5, 0xfc, 0x11, 0x44, 0x31, 0x08]).is_none());
+        assert!(addr_to_rax(&[0xc5, 0xfc, 0x11, 0x04, 0x24]).is_none());
+        assert!(addr_to_rax(&[0xc5, 0xfc, 0x10, 0x04, 0x31]).is_none());
+        let mut broken = SITES[6].bytes[..SITES[6].len].to_vec();
+        broken[19] = 0x20; // [rax+20h] instead of [rax+10h]
+        assert!(addr_to_rax(&broken).is_none());
     }
 
     /// The marks `victory-gpu` keeps, for a test.
@@ -228,7 +307,7 @@ mod tests {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc};
         // mov to, from (64 bits)
         let mov = |to: u8, from: u8| [0x48 | (from >> 3) << 2 | (to >> 3), 0x89, 0xc0 | (from & 7) << 3 | (to & 7)];
-        for site in &SITES {
+        for site in &SITES[..6] {
             let store = &site.bytes[site.store..site.store + site.len];
             let lea = lea_of(store).unwrap();
             let base = lea[3] & 7 | (lea[0] & 1) << 3;
@@ -293,6 +372,90 @@ mod tests {
                 let below = heap.add(0x1000);
                 hooked(0x20, below, record.as_ptr(), scratch.as_ptr().cast_mut());
                 assert_eq!(std::slice::from_raw_parts(below.add(0x20), 32), &record);
+                assert!(slots.iter().chain(&chunks).all(|&b| b == 0));
+                drop(marks);
+            }
+        }
+    }
+
+    #[test]
+    fn direct_xmm_sites_store_32_bytes_and_mark_slots() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc};
+        let mov = |to: u8, from: u8| [0x48 | (from >> 3) << 2 | (to >> 3), 0x89, 0xc0 | (from & 7) << 3 | (to & 7)];
+        for site in &SITES[6..] {
+            let store = &site.bytes[site.store..site.store + site.len];
+            let load_rbx = store[0] == 0xc5; // +0x4e31cf0 loads [rbx], others load [r9]
+            let dst_rax = addr_to_rax(store).unwrap().is_empty();
+            let after = &site.bytes[site.store + site.len..];
+            // fn(dst: rcx, record: rdx, scratch: r8) -> u64
+            let mut code: Vec<u8> = vec![0x53]; // push rbx
+            // r10 = dst (rcx), r11 = record (rdx), rcx = scratch (r8)
+            code.extend(mov(10, 1));
+            code.extend(mov(11, 2));
+            code.extend(mov(1, 8));
+            if load_rbx {
+                code.extend(mov(3, 11)); // rbx = record
+            } else {
+                code.extend(mov(9, 11)); // r9 = record
+            }
+            // Canary in the non-dst register so clobbers of rax or r8 fail.
+            code.extend([0x48, 0xb8, 0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01]); // mov rax, 0x0123456789abcdef
+            code.extend(mov(8, 0)); // r8 = canary
+            if dst_rax {
+                code.extend(mov(0, 10)); // rax = dst
+            } else {
+                code.extend(mov(8, 10)); // r8 = dst
+            }
+            // Call `inner` right past the outer epilogue (`13` bytes ahead).
+            code.extend([0xe8, 0x0d, 0x00, 0x00, 0x00]); // call inner
+            // Outer epilogue (13 bytes): `add rax, r8 ; pop rbx ; vzeroupper ; ret`
+            code.extend([0x4c, 0x01, 0xc0, 0x5b, 0xc5, 0xf8, 0x77, 0xc3]);
+            code.extend([0x90, 0x90, 0x90, 0x90, 0x90]); // pad to 13 bytes
+            // `inner`:
+            if after == [0x48, 0x83, 0xc4, 0x28, 0xc3] {
+                code.extend([0x48, 0x83, 0xec, 0x28]); // sub rsp, 28h
+            } else if after == [0x48, 0x81, 0xc4, 0xa8, 0x00, 0x00, 0x00] {
+                code.extend([0x48, 0x81, 0xec, 0xa8, 0x00, 0x00, 0x00]); // sub rsp, 0a8h
+            }
+            let at = code.len();
+            code.extend(site.bytes);
+            if after.last() != Some(&0xc3) {
+                code.push(0xc3); // ret to outer epilogue
+            }
+            type F = unsafe extern "system" fn(*mut u8, *const u8, *mut u8) -> u64;
+            // SAFETY: fresh executable test buffer and isolated heap buffer.
+            unsafe {
+                let place = VirtualAlloc(std::ptr::null(), 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
+                assert_ne!(place, 0);
+                let (plain, hooked) = (place + 0x100 - at, place + 0x1100 - at);
+                std::ptr::copy_nonoverlapping(code.as_ptr(), plain as *mut u8, code.len());
+                std::ptr::copy_nonoverlapping(code.as_ptr(), hooked as *mut u8, code.len());
+                let heap = VirtualAlloc(std::ptr::null(), 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as *mut u8;
+                let mut scratch = [0u8; 64];
+                let (mut slots, mut chunks) = (vec![0u8; 0x8000 / 32], vec![0u8; 0x8000 / 32 / 128]);
+                let marks = Box::new(Marks { start: heap as u64 + 0x2000, len: 0x8000, slots: slots.as_mut_ptr(), chunks: chunks.as_mut_ptr() });
+                let mine = [Site { window: 0x1100, ..*site }];
+                assert_eq!(apply(place, 0x10000, &raw const *marks as usize, &mine), [Hooked::Done]);
+                assert_eq!(*((place + 0x1100 + site.store) as *const u8), 0xe9);
+                let (plain, hooked): (F, F) = (std::mem::transmute(plain), std::mem::transmute(hooked));
+                let record: [u8; 32] = std::array::from_fn(|k| (k as u8).wrapping_mul(7) ^ 0xa5);
+                let slot_idx = 0x55usize;
+                let dst_plain = heap.add(0x6000 + slot_idx * 32);
+                let dst_hooked = heap.add(0x2000 + slot_idx * 32);
+                let r1 = plain(dst_plain, record.as_ptr(), scratch.as_mut_ptr());
+                let r2 = hooked(dst_hooked, record.as_ptr(), scratch.as_mut_ptr());
+                assert_eq!(r1.wrapping_sub(0x4000), r2, "destination register preserved");
+                assert_eq!(std::slice::from_raw_parts(dst_plain, 32), &record);
+                assert_eq!(std::slice::from_raw_parts(dst_hooked, 32), &record);
+                assert_eq!(slots[slot_idx], 1);
+                assert_eq!(slots.iter().filter(|&&b| b != 0).count(), 1);
+                assert_eq!(chunks[slot_idx / 128], 1);
+                // Outside the heap: 32 bytes stored, zero marks written.
+                slots.fill(0);
+                chunks.fill(0);
+                let outside = heap.add(0x1040);
+                hooked(outside, record.as_ptr(), scratch.as_mut_ptr());
+                assert_eq!(std::slice::from_raw_parts(outside, 32), &record);
                 assert!(slots.iter().chain(&chunks).all(|&b| b == 0));
                 drop(marks);
             }

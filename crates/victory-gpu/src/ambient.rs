@@ -51,6 +51,9 @@ pub(crate) enum Role {
     /// Adds the lamps' light to what the air scatters (the last program
     /// that writes that volume before it is summed up along the view).
     Air,
+    /// Writes outdoor sky fallback for missed specular reflection rays
+    /// (`CS_RayMiss_*`, excluding volumetrics) before SSR is composited.
+    RayMiss,
 }
 
 /// The program's part in this, by its name in the container.
@@ -62,6 +65,8 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Radiance)
     } else if has(b"CS_AccumulateLocalLightInscatteringVolume") {
         Some(Role::Air)
+    } else if has(b"CS_RayMiss_") && !has(b"CS_RayMiss_Volumetrics") {
+        Some(Role::RayMiss)
     } else {
         None
     }
@@ -75,6 +80,8 @@ pub(crate) const DEPTH: (u8, u32) = (0, 464);
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
 /// Where the light the air scatters is.
 pub(crate) const AIR: (u8, u32) = (1, 32);
+/// Where `CS_RayMiss_*` writes missed specular reflection sky radiance.
+pub(crate) const RAY_MISS: (u8, u32) = (1, 104);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
@@ -198,8 +205,23 @@ fn shade() -> [f32; 2] {
     })
 }
 
+/// The most missed specular reflection rays (`CS_RayMiss_*`) may shine
+/// indoors, as a multiple of the light around (`VICTORY_AMBIENT_REFL`,
+/// default 2.0; 0: untouched). Prevents outdoor sky cubemaps from making
+/// character corneas glow white/blue in dark rooms while preserving SSR.
+fn refl() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        match std::env::var("VICTORY_AMBIENT_REFL").ok().as_deref().map(str::trim) {
+            Some("0" | "off") => 0.0,
+            Some(s) => s.parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(2.0),
+            None => 2.0,
+        }
+    })
+}
+
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=15, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
+#define RS "RootConstants(num32BitConstants=16, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -209,7 +231,7 @@ cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; uint probe;
-    float jump; float fresh; float dt;
+    float jump; float fresh; float dt; float refl;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -330,6 +352,26 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
 }
 #endif
 
+#ifdef REFL
+RWTexture2D<float4> reflected : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void clear_refl(uint3 at : SV_DispatchThreadID) {
+    uint w, h;
+    reflected.GetDimensions(w, h);
+    if (at.x >= w || at.y >= h) return;
+    uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY)), uint2(PX - 1, PY - 1));
+    uint at0 = (q.y * PX + q.x) * 3;
+    float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
+    float cap = refl * max(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA));
+    float4 c = reflected[at.xy];
+    float has = dot(c.rgb, LUMA);
+    if (cells[CELLS].a > 0.0 && has > cap && has > 1e-9) {
+        reflected[at.xy] = float4(c.rgb * (cap / has), c.a);
+    }
+}
+#endif
+
 #ifdef RAISE
 RWTexture2D<uint> light : register(u0);
 float3 unpack(uint v) {
@@ -353,26 +395,32 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float3 c = seen(p, size);
     float3 l = seen(p + int2(-1, 0), size), r = seen(p + int2(1, 0), size);
     float3 u = seen(p + int2(0, -1), size), d = seen(p + int2(0, 1), size);
-    float3 dx = abs(l.z - c.z) < abs(r.z - c.z) ? c - l : r - c;
-    float3 dy = abs(u.z - c.z) < abs(d.z - c.z) ? c - u : d - c;
+    float3 dx = p.x == 0 ? r - c : (p.x + 1 >= int(width) ? c - l : (abs(l.z - c.z) < abs(r.z - c.z) ? c - l : r - c));
+    float3 dy = p.y == 0 ? d - c : (p.y + 1 >= int(height) ? c - u : (abs(u.z - c.z) < abs(d.z - c.z) ? c - u : d - c));
     float3 n = normalize(cross(dy, dx) + float3(0, 0, -1e-9));
     if (dot(n, c) > 0.0) n = -n;
-    // How open it is (as in beloooo's cd9f78ce).
+    // How open it is (as in beloooo's cd9f78ce), skipping off-screen taps.
     float open = 1.0;
     float px = min(radius * size.y / (2.0 * tan_y * c.z), 128.0);
     float noise = frac(52.9829189 * frac(dot(float2(p), float2(0.06711056, 0.00583715))));
     if (strength > 0.0 && px >= 1.5 && c.z < 400.0) {
         float sum = 0.0;
+        int valid = 0;
         const int N = 12;
         for (int i = 0; i < N; i++) {
             float a = i * 2.399963 + noise * 6.2831853;
             float2 o = float2(cos(a), sin(a)) * (sqrt((i + 0.5) / N) * px);
-            float3 v = seen(p + int2(round(o)), size) - c;
+            int2 q = p + int2(round(o));
+            if (any(q < 0) || any(q >= int2(size))) continue;
+            valid += 1;
+            float3 v = seen(q, size) - c;
             float vv = dot(v, v);
             float over = dot(v, n) - 0.004 * c.z - 0.005;
             sum += max(over, 0.0) / sqrt(vv + 1e-6) * saturate(1.0 - vv / (radius * radius));
         }
-        open = saturate(1.0 - strength * 2.0 * sum / N);
+        if (valid > 0) {
+            open = saturate(1.0 - strength * 2.0 * sum / float(valid));
+        }
     }
     float3 found;
     if (constant > 0.0) {
@@ -404,19 +452,16 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     float3 was = unpack(light[p]);
     float left = dot(was, LUMA);
-    // What the program left counts as far as it can be true: the sky's light
-    // outdoors, not the blocks of other memory.
-    // For `fresh` seconds after the light around jumped (a new room) the
-    // title's leftover counts for no more than the estimate, then up to
-    // `most` times it again: its history holds the place before.
-    // When screen-space radiance is dark/unready, keep existing light instead
-    // of clamping it down to pitch-black silhouettes.
+    // Once radiance cells are initialized (`cells[CELLS].a > 0`), always bound
+    // `was` by `found_luma * bound` even inside concave creases (`open -> 0`),
+    // so recessed eye sockets clamp missed sky irradiance to dark shadow rather
+    // than skipping the clamp and passing raw outdoor sky onto the sclera.
     float found_luma = dot(found, LUMA);
-    if (found_luma > 1e-4) {
+    if (cells[CELLS].a > 0.0) {
         float bound = fresh > 0.0 ? lerp(1.0, most, saturate(cells[CELLS].a / fresh)) : most;
-        float top = max(found_luma * bound, 1e-6);
+        float top = max(found_luma * bound, 0.0);
         float has = dot(was, LUMA);
-        was *= min(1.0, top / max(has, 1e-6));
+        was *= min(1.0, top / max(has, 1e-9));
     }
     float3 written = max(was, found);
     light[p] = pack(written);
@@ -446,6 +491,7 @@ struct Pass {
     gather: ID3D12PipelineState,
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
+    refl: ID3D12PipelineState,
     cells: ID3D12Resource,
     points: ID3D12Resource,
     stats: ID3D12Resource,
@@ -478,6 +524,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
+    let refl = pipeline("REFL", s!("clear_refl"))?;
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
@@ -487,6 +534,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         gather,
         raise,
         air,
+        refl,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
         stats: made(256)?,
@@ -566,10 +614,13 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
+    if role == Role::RayMiss && (constant > 0.0 || refl() == 0.0) {
+        return false;
+    }
     static SAID: Mutex<u32> = Mutex::new(0);
     {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
-        if *said < 4 {
+        if *said < 6 {
             *said += 1;
             tracing::info!(?role, size = ?views.size, level, constant, "a stand-in for the indirect light");
         }
@@ -579,7 +630,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.stats);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 15];
+    let mut words = [0u32; 16];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -592,6 +643,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
     words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
     words[14] = (frame_ms(role) / 1000.0).to_bits();
+    words[15] = refl().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -599,7 +651,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 15, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -617,6 +669,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 KEPT.store(true, Ordering::Relaxed);
             }
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
+            Role::RayMiss => run(&pass.refl, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1),
             Role::Resolve => {
                 if constant == 0.0 {
                     run(&pass.place, 8, 9, 1);
@@ -648,6 +701,8 @@ mod tests {
         assert_eq!(role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."), Some(Role::Resolve));
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
+        assert_eq!(role(b"..CS_RayMiss_de6b91a6_Wrapped.."), Some(Role::RayMiss));
+        assert_eq!(role(b"..CS_RayMiss_Volumetrics_12345678.."), None);
         assert_eq!(role(b"CS_TemporalResolve"), None);
     }
 

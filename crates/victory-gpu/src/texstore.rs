@@ -31,9 +31,20 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 /// Least bytes of the smaller levels a key is made of.
 pub(crate) const MIN_PREFIX: u64 = 32 << 10;
-/// Bytes of levels kept in memory at most (the rest is read from the folder
-/// when asked).
-const KEPT: u64 = 4 << 30;
+
+/// Optional host-RAM blob cache cap in bytes (`VICTORY_TEXTURE_STORE_RAM_MB`,
+/// default 0 so NVMe + OS file cache serve hits without holding 2-4 GB of
+/// duplicate allocations inside the title's commit limit).
+fn ram_limit() -> u64 {
+    static BYTES: OnceLock<u64> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_STORE_RAM_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+            .saturating_mul(1 << 20)
+    })
+}
 
 /// A texture's shape: width, height, format, levels.
 pub(crate) type Shape = [u32; 4];
@@ -56,9 +67,10 @@ struct Entry {
 struct Store {
     folder: PathBuf,
     index: Mutex<HashMap<Key, Entry>>,
+    shapes: std::sync::RwLock<std::collections::HashSet<(Shape, u32)>>,
     kept: Mutex<HashMap<u128, Arc<Vec<u8>>>>,
     kept_bytes: AtomicU64,
-    jobs: Mutex<mpsc::Sender<Job>>,
+    jobs: mpsc::SyncSender<Job>,
     /// Contents given to it this run (digests of whole textures).
     seen: Mutex<std::collections::HashSet<u128>>,
 }
@@ -92,9 +104,10 @@ fn store() -> Option<&'static Store> {
             let folder = PathBuf::from(std::env::var_os("VICTORY_TEXTURE_STORE").filter(|v| !v.is_empty() && v != "0")?);
             std::fs::create_dir_all(&folder).ok()?;
             let mut index = HashMap::new();
+            let mut shapes = std::collections::HashSet::new();
             if let Ok(text) = std::fs::read_to_string(folder.join("index.txt")) {
                 for (key, entry) in text.lines().filter_map(parse_line) {
-                    // (A blob whose file is gone is no entry.)
+                    shapes.insert((key.shape, key.level));
                     index.insert(key, entry);
                 }
             }
@@ -102,9 +115,10 @@ fn store() -> Option<&'static Store> {
             tracing::info!(
                 folder = %folder.display(),
                 keys = index.len(),
+                ram_mb = ram_limit() >> 20,
                 "texture store: larger levels kept from earlier runs (VICTORY_TEXTURE_STORE)"
             );
-            let (send, receive) = mpsc::channel::<Job>();
+            let (send, receive) = mpsc::sync_channel::<Job>(8);
             let to = folder.clone();
             std::thread::Builder::new()
                 .name("texture store".into())
@@ -114,8 +128,8 @@ fn store() -> Option<&'static Store> {
                     else {
                         return;
                     };
+                    let mut unflushed = 0usize;
                     for job in receive {
-                        // (The store is made before this thread's first job.)
                         let Some(store) = store() else {
                             continue;
                         };
@@ -130,18 +144,25 @@ fn store() -> Option<&'static Store> {
                             }
                             STATS[5].fetch_add(bytes.len() as u64, Relaxed);
                         }
+                        drop(bytes);
                         let text: String = keys.iter().map(|(k, e)| line_of(k, e) + "\n").collect();
                         let _ = index.write_all(text.as_bytes());
-                        let _ = index.flush();
+                        unflushed += 1;
+                        if unflushed >= 16 {
+                            let _ = index.flush();
+                            unflushed = 0;
+                        }
                     }
+                    let _ = index.flush();
                 })
                 .ok()?;
             Some(Store {
                 folder,
                 index: Mutex::new(index),
+                shapes: std::sync::RwLock::new(shapes),
                 kept: Mutex::new(HashMap::new()),
                 kept_bytes: AtomicU64::new(0),
-                jobs: Mutex::new(send),
+                jobs: send,
                 seen: Mutex::new(std::collections::HashSet::new()),
             })
         })
@@ -167,20 +188,32 @@ pub(crate) fn key_levels(layout: &victory_formats::texture::Layout, mips: u32) -
         .collect()
 }
 
+/// Fast lock-free/RwLock reject before reading title memory on recording threads.
+pub(crate) fn may_have(shape: Shape, level: u32) -> bool {
+    let Some(store) = store() else {
+        return false;
+    };
+    store.shapes.read().unwrap_or_else(|e| e.into_inner()).contains(&(shape, level))
+}
+
 /// A texture of `shape` was read whole: `tiled` is its memory (all levels),
-/// `parts` where the host lays out each of its levels (offset, row pitch,
-/// rows). Detiled and kept on the store's thread, unless that content is
-/// known.
-pub(crate) fn keep(shape: Shape, layout: &victory_formats::texture::Layout, tiled: &[u8], parts: Vec<(u64, u32, u32)>) {
+/// `blob` its precomputed digest, `parts` where the host lays out each of its
+/// levels (offset, row pitch, rows). Detiled and kept on the store's thread,
+/// unless that content is known or the bounded queue is full.
+pub(crate) fn keep(shape: Shape, layout: &victory_formats::texture::Layout, tiled: &[u8], blob: u128, parts: Vec<(u64, u32, u32)>) {
     let Some(store) = store() else {
         return;
     };
-    let blob = crate::texture::digest(tiled).0;
-    if !store.seen.lock().unwrap_or_else(|e| e.into_inner()).insert(blob) {
-        return;
+    {
+        let mut seen = store.seen.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.contains(&blob) {
+            return;
+        }
+        let job = Job { shape, layout: layout.clone(), tiled: tiled.to_vec(), parts, blob };
+        if store.jobs.try_send(job).is_ok() {
+            seen.insert(blob);
+        }
     }
-    let job = Job { shape, layout: layout.clone(), tiled: tiled.to_vec(), parts, blob };
-    let _ = store.jobs.lock().unwrap_or_else(|e| e.into_inner()).send(job);
 }
 
 /// A texture to keep ([`keep`]).
@@ -221,11 +254,14 @@ fn kept(store: &Store, job: Job) -> Option<(u128, Arc<Vec<u8>>, Vec<(Key, Entry)
     let entries: Vec<(Key, Entry)> = made.into_iter().map(|k| (k, Entry { blob, levels: k.level })).collect();
     {
         let mut index = store.index.lock().unwrap_or_else(|e| e.into_inner());
+        let mut shapes = store.shapes.write().unwrap_or_else(|e| e.into_inner());
         for (k, e) in &entries {
             index.insert(*k, *e);
+            shapes.insert((k.shape, k.level));
         }
     }
-    if store.kept_bytes.load(Relaxed) + bytes.len() as u64 <= KEPT {
+    let cap = ram_limit();
+    if cap > 0 && store.kept_bytes.load(Relaxed) + bytes.len() as u64 <= cap {
         store.kept_bytes.fetch_add(bytes.len() as u64, Relaxed);
         store.kept.lock().unwrap_or_else(|e| e.into_inner()).insert(blob, bytes.clone());
     }
@@ -244,13 +280,18 @@ pub(crate) fn find(shape: Shape, level: u32, smaller: &[u8]) -> Option<Arc<Vec<u
     if entry.levels != level {
         return None;
     }
-    let kept = store.kept.lock().unwrap_or_else(|e| e.into_inner()).get(&entry.blob).cloned();
+    let cap = ram_limit();
+    let kept = if cap > 0 {
+        store.kept.lock().unwrap_or_else(|e| e.into_inner()).get(&entry.blob).cloned()
+    } else {
+        None
+    };
     let bytes = match kept {
         Some(bytes) => bytes,
         None => {
             let bytes = Arc::new(std::fs::read(store.folder.join(format!("{:032x}.lv", entry.blob))).ok()?);
             STATS[4].fetch_add(1, Relaxed);
-            if store.kept_bytes.load(Relaxed) + bytes.len() as u64 <= KEPT {
+            if cap > 0 && store.kept_bytes.load(Relaxed) + bytes.len() as u64 <= cap {
                 store.kept_bytes.fetch_add(bytes.len() as u64, Relaxed);
                 store.kept.lock().unwrap_or_else(|e| e.into_inner()).insert(entry.blob, bytes.clone());
             }

@@ -355,10 +355,16 @@ pub(crate) fn sync_heaps() {
             // calls marked, in place of the changed pages; and a few of the
             // pages the watch says were written, looked at whole.
             let phase = crate::timeline::span("the heaps' records: the marks taken (renderer port 2)");
+            let mut marked_ranges: Vec<(usize, usize)> = Vec::new();
             for (first, n) in crate::port_descriptors::take(start).unwrap_or_default() {
                 let from = start as usize + first as usize * step as usize;
-                parts.push((from, from + n as usize * step as usize, false));
+                let to = (from + n as usize * step as usize).min(end as usize);
+                if from < to {
+                    marked_ranges.push((from, to));
+                    parts.push((from, to, false));
+                }
             }
+            marked_ranges.sort_unstable_by_key(|&(from, _)| from);
             phase.end();
             if crate::port_descriptors::ask_due(frame) {
                 let began = std::time::Instant::now();
@@ -368,8 +374,36 @@ pub(crate) fn sync_heaps() {
                 spent[0] += since(began);
                 crate::port_descriptors::asked(&taken);
             }
+            let step_usize = step as usize;
             for page in crate::port_descriptors::to_check(frame) {
-                parts.push((page.max(start as usize), (page + crate::watch::PAGE).min(end as usize), true));
+                let p_from = page.max(start as usize);
+                let p_end = (page + crate::watch::PAGE).min(end as usize);
+                if p_from >= p_end {
+                    continue;
+                }
+                let s_first = ((p_from - start as usize) as u64).div_ceil(step);
+                let mut cur = (start + s_first * step) as usize;
+                let s_count = p_end.saturating_sub(cur) / step_usize;
+                let page_end = cur + s_count * step_usize;
+                if cur >= page_end {
+                    continue;
+                }
+                let idx = marked_ranges.partition_point(|&(_, m_to)| m_to <= cur);
+                for &(m_from, m_to) in &marked_ranges[idx..] {
+                    if m_from >= page_end {
+                        break;
+                    }
+                    if cur < m_from {
+                        parts.push((cur, m_from, true));
+                    }
+                    cur = cur.max(m_to);
+                    if cur >= page_end {
+                        break;
+                    }
+                }
+                if cur < page_end {
+                    parts.push((cur, page_end, true));
+                }
             }
         } else {
             let began = std::time::Instant::now();
@@ -785,13 +819,16 @@ pub(crate) fn with_heap<T>(heap: usize, f: impl FnOnce(&Heap) -> T) -> Option<T>
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
+pub(crate) fn release_dynamic_many(heap: usize, ranges: &[(u32, u32)]) {
+    if ranges.is_empty() {
+        return;
+    }
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
-        host.release(first, n);
+        host.release_many(ranges);
     }
 }
 

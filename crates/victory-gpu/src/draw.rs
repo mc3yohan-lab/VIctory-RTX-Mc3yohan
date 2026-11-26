@@ -569,6 +569,9 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
+    /// Current per-list 64-slot slab `(title heap, next_slot, remaining)`
+    /// for small dynamic table sub-allocations (`n <= 32`).
+    dynamic_slab: Option<(usize, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -585,13 +588,63 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
-        }
+        self.release_all_dynamic();
     }
 }
 
 impl State {
+    fn release_all_dynamic(&mut self) {
+        self.dynamic_slab = None;
+        if self.dynamic.is_empty() {
+            return;
+        }
+        let mut ranges: Vec<(u32, u32)> = Vec::with_capacity(self.dynamic.len());
+        let mut current_heap = self.dynamic[0].0;
+        for (heap, first, n) in self.dynamic.drain(..) {
+            if heap != current_heap {
+                crate::descriptor::release_dynamic_many(current_heap, &ranges);
+                ranges.clear();
+                current_heap = heap;
+            }
+            ranges.push((first, n));
+        }
+        if !ranges.is_empty() {
+            crate::descriptor::release_dynamic_many(current_heap, &ranges);
+        }
+    }
+
+    /// Allocates `n` consecutive dynamic descriptor slots in `host` (behind
+    /// `heap_key`), sub-allocating small requests (`n <= 32`) from a per-list
+    /// 64-slot slab to avoid locking `host.next` on every draw.
+    fn alloc_dynamic(
+        &mut self,
+        heap_key: usize,
+        host: &crate::descriptor::host::HostHeap,
+        n: u32,
+    ) -> Option<u32> {
+        const SLAB: u32 = 64;
+        if n == 0 {
+            return None;
+        }
+        if n <= 32 && !self.dynamic.is_empty() {
+            if let Some((slab_heap, cur, rem)) = self.dynamic_slab
+                && slab_heap == heap_key
+                && rem >= n
+            {
+                self.dynamic_slab = (rem > n).then_some((slab_heap, cur + n, rem - n));
+                return Some(cur);
+            }
+            if let Some(base) = host.dynamic_try(SLAB) {
+                self.dynamic.push((heap_key, base, SLAB));
+                self.dynamic_slab = Some((heap_key, base + n, SLAB - n));
+                return Some(base);
+            }
+        }
+        let first = host.dynamic(n)?;
+        self.dynamic.push((heap_key, first, n));
+        Some(first)
+    }
+
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
     /// until the title resets the list. A frame of the opening cutscene
@@ -601,15 +654,14 @@ impl State {
     /// reads slots others may have taken (logged once).
     pub(crate) fn tables_done(&mut self) {
         if self.tables_gone && self.dynamic.is_empty() {
+            self.dynamic_slab = None;
             return;
         }
         if self.tables_gone {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
         }
-        for (heap, first, n) in self.dynamic.drain(..) {
-            crate::descriptor::release_dynamic(heap, first, n);
-        }
+        self.release_all_dynamic();
         self.fresh_tables.clear();
         self.recording = 0;
         self.root_srv_slots.clear();
@@ -871,7 +923,7 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
-const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
+const RECHECK_FRAMES: [u64; 2] = [4, 24];
 
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
@@ -1994,12 +2046,14 @@ impl State {
             }
             Some(s)
         };
+        #[cfg(feature = "diagnostics")]
+        let pipeline = self.pipeline;
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
             if writes {
                 #[cfg(feature = "diagnostics")]
-                crate::host::wide_write(a, len, self.pipeline);
+                crate::host::wide_write(a, len, pipeline);
                 s.gpu_writes(list, a, len);
             }
         };
@@ -2036,10 +2090,9 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = self.alloc_dynamic(key.0, host, 1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
@@ -2107,10 +2160,9 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = self.alloc_dynamic(key.0, host, 1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
@@ -2261,7 +2313,7 @@ impl State {
             return;
         }
         let bake = bake_ms > 0
-            && (bake_tables(p).is_some()
+            && ((bake_sources_mode().0 != BakeMode::Off && bake_tables(p).is_some())
                 || p.stages.iter().any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str())));
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         // The milliseconds this frame's bake draws have taken so far: a
@@ -3283,7 +3335,7 @@ impl State {
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, Views};
+        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, RAY_MISS, Role, Views};
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -3292,20 +3344,25 @@ impl State {
             Role::Resolve => LIGHT,
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
+            Role::RayMiss => RAY_MISS,
         };
         let image = entry(ResourceType::Uav, at);
         let depth = match role {
             Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air => image,
+            Role::Radiance | Role::Air | Role::RayMiss => image,
         };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
             return false;
         };
-        // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
-        let format = if role == Role::Resolve { 42 } else { 26 };
+        // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT or R16G16B16A16_FLOAT for RayMiss.)
+        let format_ok = match role {
+            Role::Resolve => of.Format.0 == 42,
+            Role::RayMiss => matches!(of.Format.0, 10 | 26),
+            Role::Radiance | Role::Air => of.Format.0 == 26,
+        };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-        if of.Format.0 != format || (seen.Width, seen.Height) != (of.Width, of.Height) || volume != (role == Role::Air) {
+        if !format_ok || (seen.Width, seen.Height) != (of.Width, of.Height) || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
             return false;
         }
@@ -3989,15 +4046,14 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let heap_key = std::ptr::from_ref(heap) as usize;
+            let Some(first) = self.alloc_dynamic(heap_key, host, n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
                 continue;
             };
             self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
@@ -4618,6 +4674,16 @@ impl State {
         }
         if kind == DISPATCH {
             self.buffers_written();
+            if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+                && crate::ambient::on()
+                && self.ambient(list, p, role)
+            {
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+            }
+            if p.stages.first().is_some_and(|s| s.shader.probe.is_some()) {
+                self.light_probe(list, p, true);
+            }
         } else {
             self.drew(list, Some(p));
         }

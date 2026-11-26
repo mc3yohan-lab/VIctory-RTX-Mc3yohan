@@ -22,8 +22,8 @@
 #   scripts\play-nvidia.ps1 -Scale 0.75            # Series X 1440p @ 75% internal + temporal upscaler
 #   scripts\play-nvidia.ps1 -SmoothMotion          # Launches victory_sm.exe for NVIDIA App Smooth Motion (2x visual FPS)
 #   scripts\play-nvidia.ps1 -WaitTextures          # Sets VICTORY_TEXTURE_NO_WAIT=0 (slower streaming, avoids partial BCn blocks)
-#   scripts\play-nvidia.ps1 -KeepRtShaders         # Diagnostic: do not skip rt_off_hashes.txt when -RayTracing is off
-#   scripts\play-nvidia.ps1 -PortDescriptors       # Experimental Patch 2 (OFF by default: missed 78K-137K views on title)
+#   scripts\play-nvidia.ps1 -SkipRtHashes          # Diagnostic only: skips 1,034 rt_off_hashes (kills indoor voxel bounce GI)
+#   scripts\play-nvidia.ps1 -PortDescriptors       # Renderer Patch 2 (11/11 title descriptor store sites hooked + race fixed)
 #   scripts\play-nvidia.ps1 -NoPortConstants       # Disable Renderer Patch 1 (VICTORY_PORT_CONSTANTS)
 #   scripts\play-nvidia.ps1 -UpQueue               # Experimental dedicated D3D12 copy queue + joined barriers
 #   scripts\play-nvidia.ps1 -SweepPerHeap          # Coolfox per-heap buffer pass (VICTORY_SWEEP_PER_HEAP=1)
@@ -43,8 +43,8 @@ param(
     [switch]$Full4K,
     [switch]$WaitTextures,
     [switch]$TexStore,
-    [switch]$KeepRtShaders,
     [switch]$SkipRtHashes,
+    [switch]$LaneCore,
     [switch]$NoAmbient,
     [switch]$NoPortConstants,
     [switch]$PortDescriptors,
@@ -89,7 +89,9 @@ $settings = @{
     # NO_WAIT=1 keeps texture streaming at ~0.6-1.4 ms/frame (NO_WAIT=0 caused 50-377 ms stalls);
     # SHOW_NEW_LATER=1 + FAIR_DUE=1 prevent pooled-slot corruption without stalling the stream.
     VICTORY_TEXTURE_NO_WAIT     = $(if ($WaitTextures) { '0' } else { '1' })
-    VICTORY_TEXTURE_STAGE_MS    = '40'
+    VICTORY_TEXTURE_STAGE_MS    = '8'
+    VICTORY_TEXTURE_CATCHUP     = '0'
+    VICTORY_EARLY_TEXTURES_MS   = '3'
     VICTORY_BAKE_EXACT          = '1'
     VICTORY_BAKE_SOURCES        = '1'
     VICTORY_FAIR_DUE            = '1'
@@ -100,15 +102,19 @@ $settings = @{
     VICTORY_RELAY               = '2'
     VICTORY_CARD_STEPS          = '2'
     VICTORY_WIDE_BACK           = '1'
+    VICTORY_WIDE_SPIN           = '80'
     VICTORY_CARD_REHASH_RUNS    = '1'
     VICTORY_JOIN_COPIES         = '1'
+    VICTORY_JOIN_BARRIERS       = '1'
     VICTORY_INDIRECT_WINDOW     = '1'
     VICTORY_RELAY_COPY          = '1'
     VICTORY_INDIRECT_BATCH      = '2'
     VICTORY_INDIRECT_REST       = '0'
     VICTORY_LAND_SKIP           = '1'
-    VICTORY_LAND_THREADS        = '6'
-    VICTORY_LANE_CORE           = '1'
+    VICTORY_LAND_THREADS        = '4'
+    VICTORY_ASK_NORESET         = '1'
+    VICTORY_ASK_SPREAD          = '1'
+    VICTORY_SYNC_FINE           = '1'
     VICTORY_MAP_THREADS         = '1'
     VICTORY_TITLE_PRIORITIES    = '0'
     VICTORY_CARD_AWAKE          = '1'
@@ -172,8 +178,11 @@ if ($Safe) {
     $settings.Remove('VICTORY_UPLOAD_AHEAD')
 } else {
     $settings.VICTORY_THIN         = '1'
-    $settings.VICTORY_THIN_THREADS = '10'
+    $settings.VICTORY_THIN_THREADS = '8'
     $settings.VICTORY_JOIN_PARTS   = '8'
+    if ($LaneCore) {
+        $settings.VICTORY_LANE_CORE = '1'
+    }
 }
 
 if ($Quality) {
@@ -186,6 +195,7 @@ if (-not $NoAmbient -and -not $RayTracing) {
     $settings.VICTORY_AMBIENT      = '0.8'
     $settings.VICTORY_AMBIENT_AIR  = '1.5'
     $settings.VICTORY_AMBIENT_MOST = '2'
+    $settings.VICTORY_AMBIENT_REFL = '2.0'
 }
 
 if ($RayTracing) {
@@ -193,7 +203,7 @@ if ($RayTracing) {
     $settings.VICTORY_SKIP_PIPELINES = 'none'
 } else {
     $settings.VICTORY_BVH_NO_HIT     = '1'
-    if (-not $KeepRtShaders) {
+    if ($SkipRtHashes) {
         $rtHashesPath = Join-Path $PSScriptRoot 'rt_off_hashes.txt'
         if (Test-Path -LiteralPath $rtHashesPath) {
             $settings.VICTORY_SKIP_PIPELINES = (Get-Content -LiteralPath $rtHashesPath -Raw).Trim()

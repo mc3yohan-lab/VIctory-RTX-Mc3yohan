@@ -1388,7 +1388,7 @@ impl Staging {
                 last.hash = Some(hash);
                 found_blind(last);
                 self.detile(tiled);
-                self.keep_whole(tiled);
+                self.keep_whole(tiled, hash.0);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
                 size
@@ -1406,7 +1406,7 @@ impl Staging {
         last.hash = Some(hash);
         found_blind(last);
         self.detile(tiled);
-        self.keep_whole(tiled);
+        self.keep_whole(tiled, hash.0);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
@@ -1429,7 +1429,7 @@ impl Staging {
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
                 self.detile(read);
-                self.keep_whole(read);
+                self.keep_whole(read, hash.0);
             }
             true
         });
@@ -1489,7 +1489,7 @@ impl Staging {
     /// level 0 is given to the store (`crate::texstore`), detiled again
     /// into memory of ours (the staging buffer is the card's to read, slow
     /// for the processor).
-    fn keep_whole(&self, tiled: &[u8]) {
+    fn keep_whole(&self, tiled: &[u8], blob: u128) {
         if !crate::texstore::on()
             || self.first != 0
             || self.level0 != 0
@@ -1500,15 +1500,13 @@ impl Staging {
         {
             return;
         }
-        // (The detiling, digests and writing on the store's thread: here
-        // only a copy of the memory, once per content.)
         let parts: Vec<(u64, u32, u32)> = self
             .footprints
             .iter()
             .zip(&self.rows)
             .map(|(f, &rows)| (f.Offset, f.Footprint.RowPitch, rows * f.Footprint.Depth))
             .collect();
-        crate::texstore::keep(self.shape, &self.layout, tiled, parts);
+        crate::texstore::keep(self.shape, &self.layout, tiled, blob, parts);
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
