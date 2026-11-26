@@ -1,7 +1,7 @@
 # VIctory-RTX (NVIDIA RTX / Wave32 Fork)
 
 An NVIDIA-focused fork of [VIctory](https://github.com/Marvisak/VIctory) built on top of
-[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX) (`9576c45`),
+[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX) (`c9c932c`),
 a compatibility and porting layer that runs an Xbox Series title natively on Windows 11
 from files supplied by the user, translating D3D12.X and GFX10 shaders to Direct3D 12
 Shader Model 6.6 on **Wave32 NVIDIA GPUs** (tuned on RTX 4090 + hybrid Intel Core i9).
@@ -26,34 +26,50 @@ Wave32 ray tracing (`-RayTracing`).
 
 Reference test hardware: **Windows 11, Intel Core i9-12900KF (8P/16T + 8E/8T), 64 GB RAM,
 NVIDIA GeForce RTX 4090 (24 GB GDDR6X, 32 GiB Resizable BAR, Wave32, 1M view heap)**,
-Series X profile (`2560x1440` internal, ray tracing off).
+Series X profile (ray tracing off).
 
 | Metric | Measured Status |
 |---|---|
 | **Menu / UI** | **60 FPS** (`16.7 ms/frame`) with native 60 FPS unlock (`-Fps 60`, game clock stays `1.00x`) |
-| **In-game / Cutscenes (pre-ReBAR baseline)** | **~16–17 FPS** (`57–62 ms/frame`, `4,900–5,045 draws/frame`) at `2560x1440` internal (`92–99% 3D` at only `54 °C` due to L0/PCIe starvation — addressed in commit `805ea6a`, live re-test pending) |
+| **Series X 1440p (`2560x1440` internal, pre-Ports 5–7)** | **18–21 FPS** (`47.7–55.5 ms/frame`), `victory-submit` cut `56.6 → 38.9 ms`, `MakeResident` stalls cut `44,600 → ~4,400`, `PORT_DESCRIPTORS` 12B diff at **`99.9993%`** accuracy (`0.08` misses/frame) |
+| **Series X `VICTORY_OUTPUT=1920x1080` + Ports 1, 2, 5, 6, 7** | Merged from upstream `c9c932c` (`-16 ms` GPU at 1080p output, `-4.7 ms` Port 5 CBV, `-2 ms` Port 6 Guard, `-1 to -3 ms` Port 7 Journal) — live RTX 4090 validation ready |
 | **Wave32 Shader Coverage** | **`25,784` shaders translated to Wave32 (`99.98%`)** — only **`6`** Wave64-only shaders remain (195 unsupported GS containers) |
-| **Pre-warmed D3D12 Pipeline Library** | **`2,543` verified PSOs in `host-pipelines.bin` (`1.02 GB`)**, **`0` driver refusals (`0x80070057`)** — including `2da4beb386509b77` (`CS_AlphTransmissionPrefilterMip`) |
+| **Pre-warmed D3D12 Pipeline Library** | **`host-pipelines.bin` pre-warmed with `VICTORY_PORT_CBV=1`** and **`0` driver refusals (`0x80070057`)** |
 | **RTX 4090 `CARD_COMPARE` Microbenchmark** | **`17.31 ms → 14.40 ms` (`+20.3%`, `705 → 848 GB/s`)** via 6-step parallel tree reduction + VRAM `differs_gpu` |
-| **Visual Quality** | Faces animate, `x=0` dotted border fixed, cornea/sclera sky-leak fixed (`Role::RayMiss` + crease clamp), indoor/outdoor ambient settles by wall clock (`VICTORY_AMBIENT_SETTLE`), zero indirect draw drops (`0 indirect`) |
+| **Visual Quality** | Faces animate, `x=0` dotted border fixed, cornea/sclera sky-leak fixed (`Role::RayMiss` + crease clamp), D3D12 errors `538` & `646` fixed, Wave32 LDS atomic ordering fixed, zero indirect draw drops |
 | **Memory** | `~15–17 GB` dedicated VRAM, `~40–46 GB` private commit (**64 GB RAM strongly recommended** for now) |
 
 ---
 
 ## What Has Been Implemented in This Fork
 
-### 1. NVIDIA Wave32 Shader Translator & Pipeline Stability
-- **Wave32 guarded joins & active-loop lowering** (ported from `codec-d/cool_fox`):
+### 1. Renderer Ports 1, 2, 5, 6, 7 & Native Output Scaling (Merged from `avatarmanz@c9c932c`)
+
+| Switch | What it does |
+|---|---|
+| `VICTORY_PORT_CONSTANTS=1` | The title's constants heap is read by the card in place: no uploads, no fills (`0` forgotten regions) |
+| `VICTORY_PORT_DESCRIPTORS=1` | 11 byte-verified Scarlett descriptor stores report written slots directly + 12-byte key diff (`changed_key12`) & `copy_simple` mark ordering (**`99.9993%` hit rate**, `0.08` misses/frame) |
+| `VICTORY_PORT_CBV=1` | Translated shaders read constant buffers in place as raw bytes (`~22,000` fills/frame → `0`; `-4.7 ms`) |
+| `VICTORY_PORT_GUARD=1` | Shared write-guard lock with per-64 KiB block claims + parallel per-list refresh planning + coalesced `VirtualProtect` (`-2 ms`) |
+| `VICTORY_PORT_JOURNAL=1` | Early heap sync triggered at title submit + 64-sharded journal locks (`-1 to -3 ms`) |
+| `VICTORY_OUTPUT=1920x1080` | Native title output scaling on Series X (jumps backbuffer pool `int3`, saves `~16 ms` GPU; `-Full1440p` / `-Full4K` available) |
+| `VICTORY_UPSCALER=6` | Forces the title's own temporal upscaler instead of FidelityFX (avoids unpatched FidelityFX descriptor writes under Port 2) |
+
+### 2. NVIDIA Wave32 Shader Translator & Pipeline Stability
+- **Wave32 guarded joins, active-loop lowering & LDS atomic ordering** (ported from `codec-d/cool_fox`):
   per-instruction `lanes.guards` tracking in `victory-shader/src/resource.rs`,
   `DIVERGENT_MASK_EXCHANGE` / `scc_some`, `active_loop_only` single-latch loop widening,
-  and clean pre-driver rejection of `wave == Some(64)` shaders on Wave32 hosts.
-  Recovers `2da4beb386509b77` (`CS_AlphTransmissionPrefilterMip`) as a native D3D12 PSO
-  and eliminates `0x80070057` driver rejections.
+  commuting-only LDS atomic region check (`lds_meetings`), and clean pre-driver rejection of
+  `wave == Some(64)` shaders on Wave32 hosts.
 - **Wave32 RT / BVH / tiled cascade shadows** + `VICTORY_BVH_NO_HIT=1` + `VICTORY_WAVE_WIDE=last`
-  + `VICTORY_NAN_SCRUB=1` + `MED3|LEGACY` portable float paths.
+  + `VICTORY_NAN_SCRUB=1` + `MED3|LEGACY` portable float paths + Tier-A pure-BVH auto-skip.
+- **D3D12 correctness fixes** (ported from `trustno1-coder/VIctory-NVIDIA` & `cool_fox`):
+  separate `Compare` submission for `COMMON` state decay (D3D12 error `538`),
+  strict `Role::Resolve` depth SRV binding & dimension match (D3D12 error `646`),
+  `TextureQueue::reschedule` & `sweep_batch` wrap-around.
 - **Offline pre-translation & pipeline library warming** (`victory shaders` + `victory warm --used --save-library`).
   *Critical:* translator env vars (`VICTORY_SHADER_OPT=63`, `VICTORY_WAVE_WIDE=last`,
-  `VICTORY_NAN_SCRUB=1`, `VICTORY_BVH_NO_HIT=1`) must match between `shaders`/`warm` and live runs.
+  `VICTORY_NAN_SCRUB=1`, `VICTORY_BVH_NO_HIT=1`, `VICTORY_PORT_CBV=1`) must match between `shaders`/`warm` and live runs.
 
 ### 2. GPU Bandwidth, Shared-Memory Reduction & Synchronization
 - **Resizable BAR VRAM Windows (`VICTORY_WINDOWS_BAR_MB=4096`, `VICTORY_WINDOW_KB=256`):**
