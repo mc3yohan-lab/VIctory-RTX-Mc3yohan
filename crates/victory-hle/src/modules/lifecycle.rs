@@ -276,6 +276,19 @@ extern "system" fn window_proc(
         end_title("window closed", Box::new(|| {}));
         return 0;
     }
+    // A close that is no system command: a WM_CLOSE posted directly to the
+    // window (launcher/tool/taskbar), or window destruction, which otherwise
+    // destroyed the HWND while the title ran headless with audio for 60s+
+    // (ported from VIctory-RTX3090).
+    if matches!(message, wm::WM_CLOSE | wm::WM_DESTROY) && shown_top_level(hwnd) {
+        end_title(
+            if message == wm::WM_CLOSE { "window closed (WM_CLOSE)" } else { "window destroyed" },
+            Box::new(|| {}),
+        );
+        if message == wm::WM_CLOSE {
+            return 0;
+        }
+    }
     // Alt or F10 puts a window into menu mode: the system runs a modal menu
     // loop on the thread that owns the window, which is the title's. The
     // title then stops (no frames, no input) until a key ends the loop, and
@@ -293,6 +306,15 @@ extern "system" fn window_proc(
         }
         let title = std::mem::transmute::<*mut c_void, wm::WNDPROC>(title);
         wm::CallWindowProcW(title, hwnd, message, wparam, lparam)
+    }
+}
+
+/// Whether `hwnd` is a visible top-level window of the title (not a child or hidden).
+fn shown_top_level(hwnd: HWND) -> bool {
+    // SAFETY: plain queries on a window owned by this thread.
+    unsafe {
+        let style = wm::GetWindowLongPtrW(hwnd, wm::GWL_STYLE) as u32;
+        style & wm::WS_CHILD == 0 && wm::IsWindowVisible(hwnd) != 0
     }
 }
 

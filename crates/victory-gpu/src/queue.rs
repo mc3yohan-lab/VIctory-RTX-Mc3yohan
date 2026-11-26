@@ -901,7 +901,8 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "diagnostics")]
+/// Frames presented so far (used both by diagnostics and by
+/// `VICTORY_SMALL_RECHECK` budgeting).
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }

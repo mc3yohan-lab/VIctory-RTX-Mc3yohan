@@ -279,6 +279,26 @@ fn wait_once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_ONCE").is_none_or(|v| v != "0"))
 }
 
+/// Shared wall-clock deadline per frame so concurrent recording threads wait
+/// together within one frame budget instead of starving each other (ported
+/// from VIctory-RTX3090).
+struct FrameDeadline(Option<(u64, Instant)>);
+
+impl FrameDeadline {
+    fn remaining(&mut self, frame: u64, budget: Duration, now: Instant) -> Duration {
+        match self.0 {
+            Some((previous, _)) if frame < previous => Duration::ZERO,
+            Some((previous, started)) if frame == previous => {
+                budget.saturating_sub(now.saturating_duration_since(started))
+            }
+            _ => {
+                self.0 = Some((frame, now));
+                budget
+            }
+        }
+    }
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
@@ -295,27 +315,29 @@ fn wait(p: &Pending, frame: u64) {
     } else {
         Duration::MAX
     };
-    // The frame the budget belongs to, and what was waited of it (or is
-    // taken by a thread waiting now); of the passes over the screen too.
+    // The frame the budget belongs to and what its callers have waited.
     static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
+    static DEADLINES: [Mutex<FrameDeadline>; 2] = [const { Mutex::new(FrameDeadline(None)) }; 2];
     let spent_of = &SPENT[usize::from(screen)];
     let shared = shared_budget();
-    let left = {
+    let started = Instant::now();
+    let left = if shared {
+        DEADLINES[usize::from(screen)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remaining(frame, budget, started)
+            .min(own)
+    } else {
         let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
-        let left = budget.saturating_sub(spent.1).min(own);
-        if shared {
-            spent.1 += left;
-        }
-        left
+        budget.saturating_sub(spent.1).min(own)
     };
     if left.is_zero() {
         return;
     }
     let waiting = crate::timeline::span("pipeline: first use waits for a host pipeline");
-    let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
@@ -339,15 +361,11 @@ fn wait(p: &Pending, frame: u64) {
             "a pass over the screen was waited for (VICTORY_SCREEN_WAIT_MS=0: dropped past half a second a frame)"
         );
     }
-    {
+    if !shared {
         let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
         if spent.0 == frame {
-            if shared {
-                spent.1 = spent.1.saturating_sub(left - waited);
-            } else {
-                spent.1 += waited;
-            }
+            spent.1 += waited;
         }
     }
     #[cfg(feature = "diagnostics")]
@@ -699,5 +717,19 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &slow_req));
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &early_fast));
         assert!(queue.pop(false, 1).is_none());
+    }
+
+    #[test]
+    fn concurrent_pipeline_waits_share_the_frame_deadline() {
+        let mut deadline = FrameDeadline(None);
+        let budget = Duration::from_millis(500);
+        let now = Instant::now();
+        assert_eq!(deadline.remaining(11, budget, now), budget);
+        let later = now + Duration::from_millis(200);
+        assert_eq!(deadline.remaining(11, budget, later), Duration::from_millis(300));
+        let expired = now + budget;
+        assert_eq!(deadline.remaining(11, budget, expired), Duration::ZERO);
+        assert_eq!(deadline.remaining(12, budget, expired), budget);
+        assert_eq!(deadline.remaining(11, budget, expired), Duration::ZERO);
     }
 }

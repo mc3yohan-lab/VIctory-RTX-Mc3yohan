@@ -399,6 +399,11 @@ pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] =
 pub(crate) static PLANES: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+/// Depth planes drawn from their twins in the list that wrote them, before
+/// a use there (`HostList::planes_now`), of those counted in `PLANES[0]`.
+#[cfg(windows)]
+pub(crate) static PLANES_NOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The colour twin of title texture `this`, if it has one.
 #[cfg(windows)]
 pub(crate) fn twin(this: This) -> Option<std::sync::Arc<Twin>> {
@@ -1265,6 +1270,56 @@ pub(crate) fn first_mip(view: &[u32]) -> u32 {
     }
 }
 
+/// Top levels left out of host copies of textures the title places and
+/// fills (`VICTORY_TEXTURE_MIP_DROP=0..3`, 0 if unset: none). Opt-in VRAM
+/// saver for lower-VRAM GPUs (ported from WASDeKeys/victory-gtx1660 by
+/// Impre-visible, after antikohza ztrx PR #84).
+#[cfg(windows)]
+pub(crate) fn texture_mip_drop() -> u32 {
+    static DROP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *DROP.get_or_init(|| {
+        let drop = std::env::var("VICTORY_TEXTURE_MIP_DROP")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(3);
+        if drop > 0 {
+            tracing::info!(
+                mip_drop = drop,
+                min_size = mip_drop_min_size(),
+                levels_on_demand = crate::tiles::wanted(),
+                held_levels = held_only(),
+                "texture mip drop: host copies of placed textures start that many levels down"
+            );
+        }
+        drop
+    })
+}
+
+#[cfg(windows)]
+fn mip_drop_min_size() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MIP_DROP_MIN_SIZE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(1024)
+    })
+}
+
+#[cfg(windows)]
+fn mip_drop_base(desc: &ResourceDesc) -> u32 {
+    mip_drop_base_with(desc, texture_mip_drop(), mip_drop_min_size())
+}
+
+#[cfg(windows)]
+fn mip_drop_base_with(desc: &ResourceDesc, drop: u32, min_size: u64) -> u32 {
+    if drop == 0 || desc.width < min_size || u64::from(desc.height) < min_size {
+        return 0;
+    }
+    base_level(desc, drop.min(u32::from(desc.mip_levels).saturating_sub(2)))
+}
+
 /// The level from which on a texture of layout `layout` is read for a view
 /// that starts at `first`: the smallest levels share a block and are read
 /// together; 0 where the larger ones lie between the smaller ones.
@@ -1401,7 +1456,8 @@ pub(crate) fn want_level(this: This, first: u32) {
         r.host.wanted.fetch_min(first, Relaxed);
         return;
     };
-    if host.base == 0 || host.base <= base_level(&r.desc, first) {
+    // Never below the levels `VICTORY_TEXTURE_MIP_DROP` leaves out.
+    if host.base == 0 || host.base <= base_level(&r.desc, first).max(mip_drop_base(&r.desc)) {
         return;
     }
     r.host.wanted.store(first, Relaxed);
@@ -1599,7 +1655,12 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             && r.desc.depth_or_array_size == 1
             && r.desc.mip_levels > 1
             && r.desc.sample_count <= 1;
-        if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
+        let dropped = if shape_fits && r.host.placed.load(Relaxed) && alias_of(this).is_none() {
+            mip_drop_base(&r.desc)
+        } else {
+            0
+        };
+        if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() && dropped == 0 {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
             // What the upload can read: a console layout, no XOR mode
@@ -1623,18 +1684,21 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             }
         }
         // The levels views show ([`held_only`]), those of the slots shaders
-        // pick by index among them.
-        let mut base = 0;
+        // pick by index among them. Skip when a tiled reserved texture was
+        // already created (`texture.is_some()`), so its full mip 0 chain is
+        // never given a non-zero `host.base` (fix from Belobug).
+        let mut base = if texture.is_none() { dropped } else { 0 };
         let mut prefill = None;
-        if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
+        if texture.is_none() && shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
             if first != u32::MAX {
-                base = base_level(&r.desc, first);
+                base = base.max(base_level(&r.desc, first));
             }
             // The store has its larger levels: made whole at once.
             if base > 0
+                && dropped == 0
                 && tiled.is_none()
                 && let Some(found) = stored_levels(r, first)
             {
@@ -2645,6 +2709,7 @@ pub(crate) fn first_shown(this: This) -> Option<u32> {
 /// A host copy made without memory of its own (`crate::tiles`), as a
 /// submission-time step of a list holds it.
 #[cfg(windows)]
+#[derive(Clone)]
 pub(crate) struct OnDemand(std::sync::Arc<HostTexture>);
 
 // SAFETY: the host texture is named only in queue calls, which any thread

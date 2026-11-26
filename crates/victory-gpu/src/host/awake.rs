@@ -11,6 +11,11 @@
 //! card is never idle. Nothing is sent once no submission has gone out for
 //! a quarter of a second (a title that stands still; not a menu, which goes on
 //! drawing: the system's counter shows the compute queue at 100 % there too).
+//!
+//! `VICTORY_CARD_AWAKE=idle` (from Impre-visible): only while the drawing queue
+//! has nothing of ours to run (the card clock's idle stretches, [`card_idle`]),
+//! with a shorter ~0.25 ms count, one on the way at a time, so it keeps clocks
+//! up during idle gaps without competing with active frames.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -34,6 +39,29 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
+/// About 0.25 ms at full clocks (`VICTORY_CARD_AWAKE=idle`): short enough that
+/// an incoming submission waits at most a quarter of a millisecond.
+const COUNT_SHORT: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer sum : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint x = id.x;
+    [loop] for (uint i = 0; i < 50000u; i++) x = x * 1664525u + 1013904223u;
+    sum.Store(id.x * 4u, x);
+}
+"#;
+
+/// Whether the drawing queue has run everything of ours sent to it.
+static IDLE: AtomicBool = AtomicBool::new(false);
+
+/// The card clock: the drawing queue ran all that was sent (`true`), or lists
+/// were just sent (`false`).
+pub(super) fn card_idle(idle: bool) {
+    IDLE.store(idle, Ordering::Relaxed);
+}
+
 /// Quiet this long after the last submission.
 const QUIET_MS: u64 = 250;
 
@@ -47,7 +75,13 @@ static LAST: AtomicU64 = AtomicU64::new(0);
 
 fn wanted() -> bool {
     let (last, now) = (LAST.load(Ordering::Relaxed), now_ms());
-    last != 0 && now + 1 < last + QUIET_MS && (mode() != Mode::ByTurns || now / TURN_MS % 2 == 1)
+    last != 0
+        && now + 1 < last + QUIET_MS
+        && match mode() {
+            Mode::ByTurns => now / TURN_MS % 2 == 1,
+            Mode::Idle => IDLE.load(Ordering::Relaxed),
+            _ => true,
+        }
 }
 
 /// With `VICTORY_CARD_AWAKE=turns`: this long on, this long off.
@@ -59,6 +93,8 @@ enum Mode {
     On,
     /// On and off by turns, to compare the two in one run (the log says when).
     ByTurns,
+    /// Only while the drawing queue has nothing of ours (`idle`).
+    Idle,
 }
 
 fn mode() -> Mode {
@@ -66,6 +102,7 @@ fn mode() -> Mode {
     *MODE.get_or_init(|| match std::env::var("VICTORY_CARD_AWAKE").as_deref() {
         Ok("1") => Mode::On,
         Ok("turns") => Mode::ByTurns,
+        Ok("idle") => Mode::Idle,
         _ => Mode::Off,
     })
 }
@@ -121,7 +158,11 @@ pub(crate) fn start(device: &ID3D12Device, wanted: impl Fn() -> bool + Send + 's
 }
 
 fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> windows::core::Result<()> {
-    let code = super::compile(COUNT, windows::core::s!("main"), windows::core::s!("cs_5_1"))?;
+    let idle = mode() == Mode::Idle;
+    let code = super::compile(if idle { COUNT_SHORT } else { COUNT }, windows::core::s!("main"), windows::core::s!("cs_5_1"))?;
+    // On the way at once: one while the queue is idle, so that a submission
+    // sent meanwhile waits a quarter of a millisecond at most.
+    let most: u64 = if idle { 1 } else { 2 };
     // SAFETY: plain object creation; the code lives through the calls, the
     // root signature is inside it. Two closed lists, sent in turn, whose
     // objects live until what was sent last has run.
@@ -180,12 +221,12 @@ fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> w
         let mut result = Ok(());
         while !stop.load(Ordering::Relaxed) && result.is_ok() {
             if !wanted() {
-                std::thread::sleep(Duration::from_millis(2));
+                std::thread::sleep(if idle { Duration::from_micros(250) } else { Duration::from_millis(2) });
                 continue;
             }
-            // Never more than two on the way.
-            if value >= 2 && fence.GetCompletedValue() + 2 <= value {
-                result = fence.SetEventOnCompletion(value - 1, event);
+            // Never more than two on the way (one with `idle`).
+            if value >= most && fence.GetCompletedValue() + most <= value {
+                result = fence.SetEventOnCompletion(value + 1 - most, event);
                 if result.is_ok() {
                     WaitForSingleObject(event, 1000);
                     result = device.GetDeviceRemovedReason();

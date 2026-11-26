@@ -33,15 +33,14 @@ Series X profile (ray tracing off).
 | Metric | Measured Status |
 |---|---|
 | **Menu / UI** | **60 FPS** (`16.7 ms/frame`) with native 60 FPS unlock (`-Fps 60`, game clock stays `1.00x`) |
-| **Series X `VICTORY_OUTPUT=1920x1080` + Ports 1, 2, 5 (NVIDIA in-place), 6, 7** | **22.6 FPS median (`44.3 ms/frame`, `31.5 ms` preparing), 26.8 FPS peak (`37.3 ms/frame`)** in real 3D gameplay (up from `16–17 FPS`, **`+60%` FPS**) |
-| **Exclusive NVIDIA 1M-Heap Port 5 (`VICTORY_PORT_CBV=1` in-place)** | **`16,750` table CBVs/frame (`6.7 MB/frame`) read in place** by the GPU (`0` unaligned fallbacks), slashing `card_steps` fills from `~12,000` → **`~175/frame`** |
+| **Series X `VICTORY_OUTPUT=1920x1080` + Ports 1, 2, 5 (NVIDIA in-place), 6, 7** | **22.6 FPS median (`44.3 ms/frame`), 26.8 FPS peak (`37.3 ms/frame`)** measured before the ThinLTO + BatchCull local-waves + ReBAR `SLOT_STRIDES` + `PreludeUpload` wave (re-benchmarking next toward **30+ FPS stable**) |
+| **Exclusive NVIDIA 1M-Heap Port 5 (`VICTORY_PORT_CBV=1` in-place)** | **`16,750` table CBVs/frame (`6.7 MB/frame`) read in place** (`0` unaligned fallbacks), slashing `card_steps` fills from `~12,000` → **`~175/frame`**; now with `own.between` SRV L1TEX state barrier + aligned `raw_dwords` (`SHADER_OPT=63`) + collapsed `smem` dispatch |
+| **Top 3 Compute Shaders (`7.42 ms` / 22% GPU time)** | Verified `3/3` with `dxil.dll` + RTX 4090 PSO: `CS_Tree_BatchCull` (`3.47 ms`) & `CS_Tree_BatchCull_ImposterOnly` (`1.55 ms`) promoted from `WAVE64-WIDE` → **`local waves (idiom)`** via disjoint commuting LDS atomics; `CS_Prop_BatchCull` (`2.40 ms`) keeps native early-outs |
 | **Port 2 (`12B` diff) + Port 6 (Guard) + Port 7 (Journal)** | Port 2 **`99.9993%`** accuracy (`0.50–1.48` misses/frame across `70K` slots/frame); Port 6 fault wait **`0.42–0.88 ms`**; Port 7 heap-sync wait **`0.19–0.31 ms`** & journal lock wait **`0.09 ms`** |
-| **RTX 4090 `-GpuTiming` Breakdown (`diag` build)** | **`33.7 ms`** noted GPU commands (`dispatch 17.5 ms`, `indirect 11.8 ms`, `mesh 2.3 ms`, `alias 1.2 ms`), **`10.3 ms`** preludes (`65` lists), **`4.0 ms`** compares (`20` lists) — top 3 compute passes alone take **`7.42 ms`** (`55679a0547649d0b` `3.47 ms`, `17af15c4015cb4b6` `2.40 ms`, `89d08e561897d4e5` `1.55 ms`) |
-| **Wave32 Shader Coverage** | **`25,784` shaders translated to Wave32 (`99.98%`)** — only **`6`** Wave64-only shaders remain (195 unsupported GS containers) |
-| **Pre-warmed D3D12 Pipeline Library** | **`host-pipelines.bin` (`1.34 GB`, `2,564` PSOs) pre-warmed with NVIDIA in-place `VICTORY_PORT_CBV=1`**, **`0` driver refusals (`0x80070057`)** |
+| **Wave32 Shader Coverage (`TRANSLATOR_VERSION = 2`)** | **`25,784` shaders translated to Wave32 (`99.98%`)** — only **`6`** Wave64-only shaders remain (195 unsupported GS containers) |
 | **RTX 4090 `CARD_COMPARE` Microbenchmark** | **`17.31 ms → 14.40 ms` (`+20.3%`, `705 → 848 GB/s`)** via 6-step parallel tree reduction + VRAM `differs_gpu` |
-| **Visual Quality & Active Issue** | Faces animate, `x=0` dotted border fixed, cornea/sclera sky-leak fixed (`Role::RayMiss` + crease clamp), D3D12 errors `538` & `646` fixed, Wave32 LDS atomic ordering fixed, zero indirect draw drops. **Open issue:** very dark interior/cutscene lighting under the new Ports 1–7 + 1080p stack (investigating next — test `-NoPortCbv` to isolate) |
-| **Memory** | `~15–17 GB` dedicated VRAM, `~40–46 GB` private commit (**64 GB RAM strongly recommended** for now) |
+| **Visual Quality & UX Upgrades** | Fixed Port 5 dark interior/cutscene SRV state + `raw_dwords` alignment; zero-frame-latency `PreludeUpload` textures; mid-list `planes_now` depth-plane pass (fixes square shadows); `VICTORY_SMALL_RECHECK` (fixes color-grading LUT banding); D3D12 errors `538`/`646` + mip-clamp fixes; clean `WM_CLOSE`/`WM_DESTROY` exit; **Release-mode F3 telemetry HUD** (1% Low, frametime graph, VRAM breakdown, per-core CPU); native PC **FidelityFX FSR 3.1.x / 4.x bridge**; **`--nvidia-preset`** for `AmericasLauncher` |
+| **Memory Hygiene** | `STAGING` upload pool capped at `512 MiB` (fixes 4 GiB idle RAM leak under <85% VRAM), `PRELUDE_IDLE` recycling (`VICTORY_MAX_PRELUDES=64`, saves ~4 GB commit), ReBAR `WindowsBarMb=8192` (auto-capped at 80% VRAM) + `SLOT_STRIDES` in ReBAR VRAM, opt-in `VICTORY_TEXTURE_MIP_DROP=0..3` for 6–8 GB cards |
 
 ---
 
@@ -153,33 +152,28 @@ cargo build --locked --profile diag -p victory --features diagnostics
 ```
 
 ### 2. Pre-Translate Shaders & Warm Pipeline Library (Once per Translator / Driver Update)
-Use the **exact** translator switches that `scripts\play-nvidia.ps1` uses so the cache key matches 100%:
+Pass `--nvidia-preset` so `shaders`, `warm`, and `run` share the exact same translator keys (`VICTORY_SHADER_OPT=63`, `VICTORY_WAVE_WIDE=last`, `VICTORY_NAN_SCRUB=1`, `VICTORY_BVH_NO_HIT=1`, `VICTORY_PORT_CBV=1`):
 ```powershell
-$env:VICTORY_SHADER_OPT = '63'
-$env:VICTORY_WAVE_WIDE  = 'last'
-$env:VICTORY_NAN_SCRUB  = '1'
-$env:VICTORY_BVH_NO_HIT = '1'
-$env:VICTORY_PORT_CBV   = '1'
-
-target\release\victory.exe shaders --jobs 16 <path\to\your\dump>
-target\release\victory.exe warm --used --jobs 16 --save-library
+target\release\victory.exe shaders --nvidia-preset --jobs 16 <path\to\your\dump>
+target\release\victory.exe warm --nvidia-preset --used --jobs 16 --save-library
 ```
 
 ### 3. Run via `scripts\play-nvidia.ps1` (Normal, Non-Elevated PowerShell)
-`play-nvidia.ps1` auto-detects the executable from `victory.toml` (or pass `-Exe <path>`):
+`play-nvidia.ps1` auto-detects the executable from `victory.toml` (or pass `-Exe <path>`). Press **`F3`** anytime (even in ThinLTO `--release` builds!) to toggle the live telemetry HUD:
 
 ```powershell
-# Series X 1080p output + Ports 1, 2, 5, 6, 7 + ReBAR 4 GB VRAM windows + 60 FPS unlock (recommended)
+# Series X 1080p output + Ports 1, 2, 5, 6, 7 + ReBAR 8 GB VRAM windows (recommended)
 .\scripts\play-nvidia.ps1
 
-# Series X 1080p native internal (scale 1.0) + Ports 1, 2, 5, 6, 7
-.\scripts\play-nvidia.ps1 -Scale 1.0
+# Series X 1080p + dedicated COPY queue upload offload (A/B test for lower submit/GPU stall)
+.\scripts\play-nvidia.ps1 -UpQueue
 
-# Series X 1440p output (1706x960 internal -> 2560x1440) + Ports 1, 2, 5, 6, 7
+# Series X 1080p native internal (scale 1.0) or 1440p output
+.\scripts\play-nvidia.ps1 -Scale 1.0
 .\scripts\play-nvidia.ps1 -Full1440p
 
-# Series X 4K output (2560x1440 internal, original baseline resolution)
-.\scripts\play-nvidia.ps1 -Full4K
+# Native PC FidelityFX 4K upscaling (FSR 3.1.x on NVIDIA RTX / FSR 4.x on RDNA 4; requires fidelityfx_dir)
+.\scripts\play-nvidia.ps1 -Fsr4K performance
 
 # Series X 1080p + NVIDIA Smooth Motion (2x visual FPS)
 .\scripts\play-nvidia.ps1 -SmoothMotion
@@ -191,7 +185,25 @@ target\release\victory.exe warm --used --jobs 16 --save-library
 .\scripts\play-nvidia.ps1 -Safe
 ```
 
-*(Other useful switches: `-SendBar`, `-TexStore`, `-SeriesS`, `-RayTracing`, `-Panel`, `-NoPortCbv`, `-NoPortDescriptors`, `-NoPortGuard`, `-NoPortJournal`, `-NoPortConstants`, `-Residency`.)*
+*(Other useful switches: `-Panel`, `-SendBar`, `-TexStore`, `-SeriesS`, `-RayTracing`, `-NoPortCbv`, `-NoPortDescriptors`, `-NoPortGuard`, `-NoPortJournal`, `-NoPortConstants`, `-Residency`.)*
+
+### 4. Integration with `AmericasLauncher` (`Data\runners.json`)
+`victory.exe` supports `--nvidia-preset` on `shaders`, `warm`, and `run` so launchers without a per-runner environment block (such as [isaac-btw/AmericasLauncher](https://github.com/isaac-btw/AmericasLauncher)) get full RTX optimization while preserving the Series X / Series S console selector:
+```json
+{
+  "id": "victory-rtx-mc3yohan",
+  "name": "VIctory-RTX-Mc3yohan (NVIDIA RTX)",
+  "gitUrl": "https://github.com/Mc3yohan/VIctory-RTX-Mc3yohan.git",
+  "buildCommands": [
+    "rustup show active-toolchain || rustup toolchain install",
+    "cargo build --locked --release -p victory"
+  ],
+  "exe": "target\\release\\victory.exe",
+  "preLaunchArgs": ["shaders --nvidia-preset \"{gameFolder}\""],
+  "launchArgs": "run \"{gameExe}\" --execute --nvidia-preset",
+  "notes": "Best with Nvidia (RTX / Wave32 / ReBAR / Ports 1-7)"
+}
+```
 
 ### Verification Before Committing
 ```powershell
@@ -214,9 +226,12 @@ history and authors are preserved). Each project's specific contributions integr
 | **[codec-d/cool_fox](https://github.com/codec-d/cool_fox)** *(and `Davidjc13` / `Rubenpannen`)* | Wave32 guarded joins (`lanes.guards`) & single-latch active-loop lowering (`DIVERGENT_MASK_EXCHANGE`), Wave32 commuting-atomic LDS ordering (`lds_meetings`), immediate table release, `WaitOnAddress` fence waits, skin-bake upload drain (`ahead::drain`), `TextureQueue::reschedule`, `sweep_batch` wrap-around, and VRAM residency budgets. |
 | **[trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA)** | D3D12 error `538` fix (separate `Compare` submission for `COMMON` state decay), D3D12 error `646` fix (strict `Role::Resolve` depth SRV binding & dimension check), `VICTORY_NAN_SCRUB=1`, `rt_off_hashes.txt`, `VICTORY_FAIR_DUE=1`, `VICTORY_VIDEO_PLANES=1`, `VICTORY_TABLES_EARLY=1`, and Smooth Motion copy workflow. |
 | **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** | Face animation (16-bit typed integer views), legacy FMA reflection fix, 32-bit int typed views, `VICTORY_TARGET_VARIANTS=1`, `SLOT_STRIDE_CONSTANT`, texture read-back, and `xgamesave` resilience. |
+| **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)** & **[DexNom/VIctory](https://github.com/DexNom/VIctory)** | Release ThinLTO + `codegen-units=1`, zero-latency deferred `PreludeUpload` texture uploads, `from_base` mip clamping + `TEXTURE2DARRAY` SRVs, tiled `texture.is_none()` guard, `by_address` VRAM `USED` leak fix, `SPARE_BATCH` pool + `BATCHES=32`, release-mode rich `F3` telemetry HUD (`panel.rs` + `buffers.uploaded` barrier fix), and PC FidelityFX DX12 bridge (`external.rs`, `fidelityfx.rs`, `fsr_4k.rs`, adapted here for NVIDIA FSR 3.1.x + RDNA 4 FSR 4.x). |
+| **VIctory-RTX3090** | Mid-list depth-plane materialization (`planes_now` / `VICTORY_PLANES_NOW` + 8,192-view ring, adapted for our `fallback_heaps=false` heap rebind), `VICTORY_SMALL_RECHECK` continuous whole-texture LUT/grading rechecks (`16 MiB / 60 ms` budget), clean `WM_CLOSE`/`WM_DESTROY` exit fix (`lifecycle.rs`), and shared wall-clock `FrameDeadline` pipeline waits. |
+| **WASDeKeys/victory-gtx1660 (`Impre-visible`, `antikohza`)** | `STAGING` upload pool 4 GiB idle RAM leak fix (`VICTORY_STAGING_KEPT`), `COMMIT_SCARCE_BYTES` cache shedding, `PRELUDE_IDLE` prelude recycling (`VICTORY_MAX_PRELUDES=64`), `VICTORY_CARD_AWAKE=idle` zero-contention GPU keep-awake, and opt-in `VICTORY_TEXTURE_MIP_DROP=0..3` (off by default). |
 | **ZigZagBoi1/ScarlettPort & vitutu1/victory-perf** | `crates/victory-loader/src/hooks.rs` (title watchdog disarm `VICTORY_NO_WATCHDOG=1` and render-scale hooks). |
-| **DexNom/VIctory, Korinocho, Belobug/VIctory-Belobug-AMD, FQY55kai/ZJOU-VICTORY, myokex/victory-amd, Geckomacabre, cxy0072019-sketch, romainhedouin** | Cube-map gradient LOD, Wave32/RT/BVH/tiled-cascade-shadow fixes, and ecosystem diagnostics/research incorporated via upstream & community PRs. |
-| **Mc3yohan (`VIctory-RTX-Mc3yohan`, this fork)** | **NVIDIA 1M-heap in-place Port 5** (`VICTORY_PORT_CBV=1` with `raw_views=0`, `16,750` zero-copy CBVs/frame without 4M twin heaps + D3D12 unit test), **ReBAR 4 GB VRAM loose windows** (`WindowKb=4096`) + **plain OS-RAM `Card::staging`** (`~1.1 GB` shared GPU memory saved), **6-step VRAM `CARD_COMPARE` tree reduction + `differs_gpu`** (`+20.3%` on RTX 4090), **12-byte `PORT_DESCRIPTORS` key diff (`changed_key12`) + `copy_simple` ordering** (`99.9993%` hit rate) + 11 Scarlett descriptor store hooks, **`DIRTY_CARDED` O(dirty)**, `writes_with_kind`, `!flying()` `mapped()` gating, coalesced `VirtualProtect`, **Tier-A pure-BVH auto-skip**, `-GpuTiming` under `DRED=light` fix, **`Role::RayMiss` indoor eye-glow fix + `ambient.rs` corner clamp & `x=0` border fix**, `hooks.rs`/`resolution.rs` harmonization, and the unified NVIDIA launcher (`scripts/play-nvidia.ps1`). |
+| **Korinocho, FQY55kai/ZJOU-VICTORY, myokex/victory-amd, Geckomacabre, cxy0072019-sketch, romainhedouin** | Cube-map gradient LOD, Wave32/RT/BVH/tiled-cascade-shadow fixes, and ecosystem diagnostics/research incorporated via upstream & community PRs. |
+| **Mc3yohan (`VIctory-RTX-Mc3yohan`, this fork)** | **NVIDIA 1M-heap in-place Port 5** (`VICTORY_PORT_CBV=1` with `raw_views=0`, `16,750` zero-copy CBVs/frame + `card_steps` `own.between` SRV L1TEX state fix + `raw_dwords` dword alignment & `SHADER_OPT=63` wide-load guard + collapsed `smem` dispatch), **BatchCull Wave32 local-waves unlock** (`CS_Tree_BatchCull` / `ImposterOnly` disjoint commuting LDS atomics + `CS_Prop_BatchCull` barrier-free early-outs), **ReBAR `SLOT_STRIDES` & 8 GB VRAM loose windows** + **plain OS-RAM `Card::staging`**, **6-step VRAM `CARD_COMPARE` tree reduction + `differs_gpu`** (`+20.3%`), **12-byte `PORT_DESCRIPTORS` key diff** + 11 Scarlett hooks, **`DIRTY_CARDED` O(dirty)**, **NVIDIA FSR 3.1.x provider adaptation**, **`--nvidia-preset` for `AmericasLauncher`**, `Role::RayMiss` indoor eye-glow fix + `ambient.rs` corner clamp & `x=0` border fix, and `scripts/play-nvidia.ps1`. |
 
 ## License
 

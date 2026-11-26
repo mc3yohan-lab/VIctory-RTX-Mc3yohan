@@ -505,6 +505,12 @@ fn argument_copies(first: &std::sync::Arc<crate::shadow::Shadow>) -> Vec<(u64, I
     live.iter().map(|s| (s.id(), s.buffer.clone())).collect()
 }
 
+/// The render target and depth views a host list was given ([`State::restore`]).
+type HostViews = (
+    Vec<(Option<ID3D12Resource>, Option<D3D12_RENDER_TARGET_VIEW_DESC>)>,
+    Option<(ID3D12Resource, Option<D3D12_DEPTH_STENCIL_VIEW_DESC>)>,
+);
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -538,6 +544,9 @@ pub(crate) struct State {
     /// it has any ([`State::set_targets`]): per view the host texture (0:
     /// a null view) and what its descriptor says.
     host_targets: Option<(Vec<TargetKey>, Option<TargetKey>)>,
+    /// Underlying resources and descriptions for [`State::restore`] after a
+    /// mid-list `planes_now` pass.
+    host_views: Option<HostViews>,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
@@ -923,6 +932,34 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
+/// Frames between rechecks of a small texture picked by index once
+/// [`RECHECK_FRAMES`] completes (`VICTORY_SMALL_RECHECK`, from VIctory-RTX3090).
+const SMALL_RECHECK_FRAMES: u64 = 30;
+
+/// Since the last frame-rate line: late looks at small index-picked textures,
+/// those found changed, bytes read, and looks deferred by the shared budget.
+pub(crate) static SMALL_RECHECKS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+const SMALL_RECHECK_BUDGET: u64 = 16 << 20;
+const SMALL_RECHECK_WINDOW: std::time::Duration = std::time::Duration::from_millis(60);
+static SMALL_RECHECK_SPENT: std::sync::Mutex<Option<(std::time::Instant, u64)>> = std::sync::Mutex::new(None);
+
+/// Shared wall-clock budget (`16 MiB / 60 ms`) for continuous small-texture
+/// rechecks across both index-picked textures and table-bound textures.
+pub(crate) fn small_recheck_fits(len: u64) -> bool {
+    let now = std::time::Instant::now();
+    let mut guard = SMALL_RECHECK_SPENT.lock().unwrap_or_else(|e| e.into_inner());
+    let spent = guard.get_or_insert((now, 0));
+    if now.duration_since(spent.0) >= SMALL_RECHECK_WINDOW {
+        *spent = (now, 0);
+    }
+    if spent.1 > 0 && spent.1 + len > SMALL_RECHECK_BUDGET {
+        return false;
+    }
+    spent.1 += len;
+    true
+}
+
 const RECHECK_FRAMES: [u64; 2] = [4, 24];
 
 /// Looks at uploaded textures picked by index that found the memory as it
@@ -1372,6 +1409,10 @@ impl State {
             return;
         }
         self.host_targets = Some(now);
+        self.host_views = Some((
+            views.iter().map(|(texture, desc)| (texture.cloned(), *desc)).collect(),
+            dsv.as_ref().map(|(texture, record)| ((*texture).clone(), record.depth_desc())),
+        ));
         let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
         let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
         // SAFETY: an open list; the views were just made.
@@ -1452,6 +1493,7 @@ impl State {
             self.set_topology(list, self.topology);
         }
         self.host_targets = None;
+        self.host_views = None;
         if self.targets_set {
             let handles = std::mem::take(&mut self.target_handles);
             self.set_targets(list, &handles, self.depth_handle);
@@ -1472,6 +1514,54 @@ impl State {
         if let Some([min, max]) = self.depth_bounds {
             crate::draw::depth_bounds(list, min, max);
         }
+    }
+
+    /// Re-binds state overwritten by an internal mid-list pass
+    /// (`HostList::planes_now`, ported from VIctory-RTX3090).
+    /// Resets `host_heaps` to `[0; 2]` too so `bind()` always rebinds the
+    /// title's 1M descriptor heap even when `fallback_heaps()` is off.
+    fn restore(&mut self, list: &HostList) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [0; 2];
+        self.host_heaps_set = false;
+        if self.topology_set {
+            self.set_topology(list, self.topology);
+        }
+        if let Some(host) = crate::host::host() {
+            let (rtvs, dsv): (Vec<D3D12_CPU_DESCRIPTOR_HANDLE>, Option<D3D12_CPU_DESCRIPTOR_HANDLE>) = match &self.host_views {
+                Some((views, depth)) => (
+                    views.iter().map(|(texture, desc)| host.rtv(texture.as_ref(), desc.as_ref())).collect(),
+                    depth.as_ref().map(|(texture, desc)| host.dsv(texture, desc.as_ref())),
+                ),
+                None => (Vec::new(), None),
+            };
+            // SAFETY: an open list; the views were just made.
+            unsafe {
+                list.list.OMSetRenderTargets(
+                    rtvs.len() as u32,
+                    (!rtvs.is_empty()).then_some(rtvs.as_ptr()),
+                    false,
+                    dsv.as_ref().map(std::ptr::from_ref),
+                )
+            };
+        }
+        if !self.viewports.is_empty() {
+            crate::draw::viewports(list, &self.viewports);
+        }
+        if !self.scissors.is_empty() {
+            let rects = std::mem::take(&mut self.scissors);
+            self.set_scissors(list, &rects);
+        }
+    }
+
+    /// A host compute library (e.g. PC FidelityFX) bound its own pipeline,
+    /// root signature and descriptor heaps.
+    pub(crate) fn external_compute(&mut self) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [usize::MAX; 2];
+        self.host_heaps_set = false;
     }
 
     /// The user-data value of a root argument, as translated shaders read
@@ -1731,6 +1821,12 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        // Depth planes whose twins this list wrote: materialize before this
+        // draw/dispatch reads them, and restore title list state if we ran.
+        list.planes_now();
+        if list.take_restore() {
+            self.restore(list);
+        }
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
@@ -2876,15 +2972,56 @@ impl State {
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
+                let small = crate::texture::small_recheck(len);
+                let late_look = small && usize::from(looks) + 1 >= RECHECK_FRAMES.len();
+                let spread = u64::from(index) % SMALL_RECHECK_FRAMES;
+                if late_look {
+                    if !small_recheck_fits(len) {
+                        SMALL_RECHECKS[3].fetch_add(1, Ordering::Relaxed);
+                        host.texture_slot_recheck(
+                            index,
+                            write,
+                            frame + SMALL_RECHECK_FRAMES + spread,
+                            (at, len),
+                            print,
+                            looks,
+                            uploaded,
+                        );
+                        continue;
+                    }
+                    SMALL_RECHECKS[0].fetch_add(1, Ordering::Relaxed);
+                    SMALL_RECHECKS[2].fetch_add(len, Ordering::Relaxed);
+                }
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
                             host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
                         }
+                        None if small => host.texture_slot_recheck(
+                            index,
+                            write,
+                            frame + SMALL_RECHECK_FRAMES + spread,
+                            (at, len),
+                            print,
+                            looks,
+                            uploaded,
+                        ),
                         None => host.texture_slot_done(index, write, None),
                     }
                     continue;
+                }
+                if late_look {
+                    let n = SMALL_RECHECKS[1].fetch_add(1, Ordering::Relaxed);
+                    if n < 50 || n.is_multiple_of(1000) {
+                        tracing::info!(
+                            slot = index,
+                            address = format_args!("{at:#x}"),
+                            bytes = len,
+                            frames_after_upload = frame.saturating_sub(uploaded),
+                            "a small texture picked by index changed after its scheduled looks: uploaded again (VICTORY_SMALL_RECHECK)"
+                        );
+                    }
                 }
                 if recheck_soon() {
                     again_in = 1;

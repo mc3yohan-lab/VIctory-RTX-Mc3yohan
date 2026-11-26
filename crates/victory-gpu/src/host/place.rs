@@ -141,8 +141,8 @@ pub(super) fn read_by(runs: &[&HostList], written: &[(usize, usize)]) -> bool {
                 _ if ranges.is_empty() => (false, 0),
                 &Step::Copy(_, src, len) => (touches(&ranges, src, src + len), 1),
                 &Step::Fill(_, src, len, _) => (touches(&ranges, src, src + len), 2),
-                Step::Texture(staging) => {
-                    let (at, len) = staging.memory();
+                Step::Texture(upload) => {
+                    let (at, len) = upload.staging.memory();
                     (touches(&ranges, at, at + len), 3)
                 }
                 Step::Host(_, (from, to)) => (touches(&ranges, *from, *to), 4),

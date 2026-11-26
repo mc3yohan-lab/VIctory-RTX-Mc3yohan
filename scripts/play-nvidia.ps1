@@ -73,6 +73,7 @@ param(
     [int]$DynamicSlots = 393216,
     [switch]$RecordPipelines,
     [switch]$Panel,
+    [ValidateSet('', 'quality', 'balanced', 'performance')][string]$Fsr4K = '',
     [string]$WindowMax = '',
     [switch]$NoLog,
     [ValidateSet('release', 'diag')][string]$Build = 'release',
@@ -81,8 +82,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-if (($Panel -or $GpuTiming) -and $Build -eq 'release') {
-    Write-Host "Note: -Panel / -GpuTiming require the 'diag' build; switching Build -> diag."
+if ($GpuTiming -and $Build -eq 'release') {
+    Write-Host "Note: -GpuTiming requires the 'diag' build; switching Build -> diag."
     $Build = 'diag'
 }
 
@@ -126,7 +127,7 @@ $settings = @{
     VICTORY_LAND_THREADS        = '6'
     VICTORY_MAP_THREADS         = '1'
     VICTORY_TITLE_PRIORITIES    = '0'
-    VICTORY_CARD_AWAKE          = '1'
+    VICTORY_CARD_AWAKE          = 'idle'
     VICTORY_D3D12_DRED          = 'light'
     VICTORY_D3D12_BACKGROUND    = '0'
     VICTORY_MEMORY_MAP          = '0'
@@ -263,7 +264,10 @@ if ($RayTracing) {
     }
 }
 
-if ($SeriesS) {
+if ($Fsr4K) {
+    # Native PC FidelityFX bridge (FSR 3.1.x on RTX 4090 / FSR 4.x on RDNA 4, 4K output).
+    $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant()
+} elseif ($SeriesS) {
     $settings.VICTORY_PLANES   = '1'
     $settings.VICTORY_UPSCALER = $(if ($FidelityFx) { '7' } else { '6' })
     # Series S at scale 1.0 hits a title breakpoint on start (trustno1-coder 033be27f); default to 720p internal (0.667).

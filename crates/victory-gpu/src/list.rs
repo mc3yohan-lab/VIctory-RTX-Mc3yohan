@@ -149,7 +149,7 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
-fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -934,6 +934,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
                 crate::texture::upload(list, src, from);
             }
             // Depth textures shaders also write: what they wrote, first.
+            list.planes_now();
             list.twin_use(dst, false, true);
             list.twin_use(src, false, false);
             // A destination made level by level gets its levels' memory
@@ -1092,6 +1093,7 @@ extern "system" fn copy_texture_region(
                 && src.kind != FOOTPRINT
                 && dst.kind != FOOTPRINT
                 && src.footprint.offset as u32 == dst.footprint.offset as u32;
+            list.planes_now();
             list.twin_use(src.resource, false, false);
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
@@ -1103,6 +1105,7 @@ extern "system" fn copy_texture_region(
         }
         // A depth texture shaders also write: what they wrote, first (the
         // source above too).
+        list.planes_now();
         list.twin_use(dst.resource, false, true);
         // The first copy into a texture of the title's: what it does not
         // write is zeros, as in a texture that was an allocation of its own
@@ -1227,6 +1230,7 @@ fn read_back(
     let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
     // As a texture source of any copy: what shaders wrote to a depth twin
     // and what the title wrote itself first, then the state.
+    list.planes_now();
     list.twin_use(src.resource, false, false);
     if crate::texture::title_written(texture) {
         crate::texture::upload(list, src.resource, texture);
@@ -1297,6 +1301,7 @@ extern "system" fn resolve(
             return;
         }
         // Depth textures shaders also write: what they wrote, first.
+        list.planes_now();
         list.twin_use(dst, false, true);
         list.twin_use(src, false, false);
         // As for a copy (`crate::tiles`).
@@ -1424,6 +1429,7 @@ extern "system" fn clear_dsv(
         const DEPTH_WRITE: u32 = 0x10;
         // A depth texture shaders also write: what they wrote, first (the
         // clear may be of one slice or of some rectangles).
+        list.planes_now();
         list.twin_use(record.resource, false, true);
         ensure_state(list, record.resource, DEPTH_WRITE);
         if crate::resource::depth_and_unordered(record.resource) {

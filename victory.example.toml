@@ -7,6 +7,11 @@
 # Your own dump of the title.     env: VICTORY_GAME_DIR
 game_dir = 'D:\victory-data\game'
 
+# Optional: folder containing AMD's signed amd_fidelityfx_upscaler_dx12.dll
+# for -Fsr4K (FSR 3.1.x on NVIDIA RTX / RDNA 3, FSR 4.x on RDNA 4).
+# env: VICTORY_FIDELITYFX_DIR
+# fidelityfx_dir = 'D:\victory-data\fidelityfx'
+
 # Derived data. Default: %LOCALAPPDATA%\victory\cache.   env: VICTORY_CACHE_DIR
 # cache_dir = 'D:\victory-data\cache'
 

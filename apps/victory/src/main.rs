@@ -116,6 +116,11 @@ enum Command {
         /// one line each: hash, where it was found, why.
         #[arg(long)]
         list: Option<PathBuf>,
+        /// Apply the VIctory-RTX-Mc3yohan NVIDIA preset defaults for unset
+        /// `VICTORY_*` variables (matches `scripts/play-nvidia.ps1` and
+        /// `AmericasLauncher` `runners.json`).
+        #[arg(long)]
+        nvidia_preset: bool,
     },
     /// Make the host pipelines of every pipeline the title ever created
     /// (runs with `VICTORY_PIPELINE_BOOK=1` write them down), so that the
@@ -139,6 +144,10 @@ enum Command {
         /// `host-pipelines.bin` in-process for all non-bad matching pipelines.
         #[arg(long)]
         save_library: bool,
+        /// Apply the VIctory-RTX-Mc3yohan NVIDIA preset shader cache defaults
+        /// for unset `VICTORY_*` variables.
+        #[arg(long)]
+        nvidia_preset: bool,
         /// (What the processes it starts are given.)
         #[arg(long, hide = true)]
         these: Option<String>,
@@ -158,6 +167,11 @@ enum Command {
         /// The console model the title sees (device type, memory).
         #[arg(long, value_enum, default_value_t = Console::SeriesX)]
         console: Console,
+        /// Apply the VIctory-RTX-Mc3yohan NVIDIA preset defaults (Ports 1-2-5-6-7,
+        /// ReBAR, Wave32, 1080p output on Series X) for any unset `VICTORY_*`
+        /// variables so external launchers (`AmericasLauncher`) get full RTX tuning.
+        #[arg(long)]
+        nvidia_preset: bool,
         /// Arguments for the title, after `--` (it reads the whole command
         /// line; a title that relaunches itself passes some).
         #[arg(last = true)]
@@ -230,7 +244,17 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs, wave)
         }
-        Command::Shaders { paths, jobs, list } => translate::precompile(paths, jobs, list),
+        Command::Shaders {
+            paths,
+            jobs,
+            list,
+            nvidia_preset,
+        } => {
+            if nvidia_preset {
+                apply_nvidia_preset(None);
+            }
+            translate::precompile(paths, jobs, list)
+        }
         #[cfg(windows)]
         Command::Warm {
             jobs,
@@ -238,16 +262,26 @@ fn main() -> Result<()> {
             again,
             used,
             save_library,
+            nvidia_preset,
             these,
-        } => warm::run(jobs, limit, again, used, save_library, these),
+        } => {
+            if nvidia_preset {
+                apply_nvidia_preset(None);
+            }
+            warm::run(jobs, limit, again, used, save_library, these)
+        }
         Command::Run {
             exe,
             unimplemented,
             strict,
             execute,
             console,
+            nvidia_preset,
             title_args,
         } => {
+            if nvidia_preset {
+                apply_nvidia_preset(Some(console));
+            }
             victory_hle::runtime::set_title_args(title_args);
             run::run(&exe, unimplemented, strict, execute, console)
         }
@@ -301,4 +335,93 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see victory.example.toml)"
     );
     Ok(all)
+}
+
+/// Applies the `VIctory-RTX-Mc3yohan` NVIDIA RTX defaults for any unset
+/// `VICTORY_*` environment variables so launchers without an env block
+/// (such as `AmericasLauncher`) get identical shader-cache keys and runtime
+/// tuning as `scripts/play-nvidia.ps1`, while still honoring user overrides.
+fn apply_nvidia_preset(run_console: Option<Console>) {
+    let set_default = |k: &str, v: &str| {
+        if std::env::var_os(k).is_none() {
+            // SAFETY: called on the main thread during CLI startup before any
+            // worker threads or title code exist.
+            unsafe { std::env::set_var(k, v) };
+        }
+    };
+    let rt_on = std::env::var("VICTORY_BVH_BUILDER").is_ok_and(|v| v == "1");
+    // Shader-cache keys (shared by `shaders`, `warm`, and `run`).
+    set_default("VICTORY_SHADER_OPT", "63");
+    set_default("VICTORY_WAVE_WIDE", "last");
+    set_default("VICTORY_NAN_SCRUB", "1");
+    set_default("VICTORY_PORT_CBV", "1");
+    if !rt_on {
+        set_default("VICTORY_BVH_NO_HIT", "1");
+    }
+    let Some(console) = run_console else {
+        return;
+    };
+    for (k, v) in [
+        ("VICTORY_TEXTURE_NO_WAIT", "1"),
+        ("VICTORY_TEXTURE_STAGE_MS", "25"),
+        ("VICTORY_TEXTURE_CATCHUP", "1"),
+        ("VICTORY_EARLY_TEXTURES_MS", "12"),
+        ("VICTORY_BAKE_EXACT", "1"),
+        ("VICTORY_BAKE_SOURCES", "1"),
+        ("VICTORY_FAIR_DUE", "1"),
+        ("VICTORY_SHOW_NEW_LATER", "1"),
+        ("VICTORY_UPLOAD_AHEAD", "1"),
+        ("VICTORY_SHOW_AFTER", "1"),
+        ("VICTORY_VIDEO_PLANES", "1"),
+        ("VICTORY_RELAY", "2"),
+        ("VICTORY_CARD_STEPS", "2"),
+        ("VICTORY_WIDE_BACK", "1"),
+        ("VICTORY_CARD_REHASH_RUNS", "1"),
+        ("VICTORY_JOIN_COPIES", "1"),
+        ("VICTORY_JOIN_BARRIERS", "1"),
+        ("VICTORY_INDIRECT_WINDOW", "1"),
+        ("VICTORY_RELAY_COPY", "1"),
+        ("VICTORY_INDIRECT_BATCH", "2"),
+        ("VICTORY_INDIRECT_REST", "0"),
+        ("VICTORY_LAND_SKIP", "1"),
+        ("VICTORY_LAND_THREADS", "6"),
+        ("VICTORY_MAP_THREADS", "1"),
+        ("VICTORY_TITLE_PRIORITIES", "0"),
+        ("VICTORY_CARD_AWAKE", "idle"),
+        ("VICTORY_D3D12_DRED", "light"),
+        ("VICTORY_D3D12_BACKGROUND", "0"),
+        ("VICTORY_MEMORY_MAP", "0"),
+        ("VICTORY_TABLES_EARLY", "1"),
+        ("VICTORY_DYNAMIC_SLOTS", "393216"),
+        ("VICTORY_PIPELINE_LOWEST", "0"),
+        ("VICTORY_PIPELINE_WORKERS", "8"),
+        ("VICTORY_PIPELINE_WAIT_ONCE", "1"),
+        ("VICTORY_TARGET_VARIANTS", "1"),
+        ("VICTORY_NO_WATCHDOG", "1"),
+        ("VICTORY_XMA_REFILL", "1"),
+        ("VICTORY_PORT_CONSTANTS", "1"),
+        ("VICTORY_PORT_DESCRIPTORS", "1"),
+        ("VICTORY_PORT_GUARD", "1"),
+        ("VICTORY_PORT_JOURNAL", "1"),
+        ("VICTORY_CARD_BUFFERS_MIN_KB", "64"),
+        ("VICTORY_WINDOWS_BAR_MB", "8192"),
+        ("VICTORY_WINDOW_KB", "4096"),
+        ("VICTORY_THIN", "1"),
+        ("VICTORY_THIN_THREADS", "8"),
+        ("VICTORY_JOIN_PARTS", "8"),
+    ] {
+        set_default(k, v);
+    }
+    if !rt_on {
+        set_default("VICTORY_AMBIENT", "1.0");
+        set_default("VICTORY_AMBIENT_AIR", "1.5");
+        set_default("VICTORY_AMBIENT_MOST", "3.0");
+        set_default("VICTORY_AMBIENT_SHADE", "0.7,0.5");
+        set_default("VICTORY_AMBIENT_REFL", "2.0");
+    }
+    let fsr_on = std::env::var("VICTORY_FSR_4K").is_ok_and(|v| !v.is_empty() && v != "0");
+    if matches!(console, Console::SeriesX) && !fsr_on {
+        set_default("VICTORY_OUTPUT", "1920x1080");
+        set_default("VICTORY_DISPLAY_MODE", "1920x1080");
+    }
 }
