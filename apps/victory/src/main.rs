@@ -404,8 +404,9 @@ fn apply_nvidia_preset(run_console: Option<Console>) {
         ("VICTORY_PORT_GUARD", "1"),
         ("VICTORY_PORT_JOURNAL", "1"),
         ("VICTORY_CARD_BUFFERS_MIN_KB", "64"),
-        ("VICTORY_WINDOWS_BAR_MB", "8192"),
+        ("VICTORY_WINDOWS_BAR_MB", "4096"),
         ("VICTORY_WINDOW_KB", "4096"),
+        ("VICTORY_SMALL_RECHECK", "0"),
         ("VICTORY_THIN", "1"),
         ("VICTORY_THIN_THREADS", "8"),
         ("VICTORY_JOIN_PARTS", "8"),
@@ -420,6 +421,9 @@ fn apply_nvidia_preset(run_console: Option<Console>) {
         set_default("VICTORY_AMBIENT_REFL", "2.0");
     }
     let fsr_on = std::env::var("VICTORY_FSR_4K").is_ok_and(|v| !v.is_empty() && v != "0");
+    if !fsr_on {
+        set_default("VICTORY_UPSCALER", "6");
+    }
     if matches!(console, Console::SeriesX) && !fsr_on {
         set_default("VICTORY_OUTPUT", "1920x1080");
         set_default("VICTORY_DISPLAY_MODE", "1920x1080");

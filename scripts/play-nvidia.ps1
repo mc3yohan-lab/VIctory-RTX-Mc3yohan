@@ -39,6 +39,7 @@
 param(
     [string]$Exe = '',
     [switch]$SeriesS,
+    [switch]$SeriesX,
     [double]$Scale = 0.0,
     [double]$Fps = 60.0,
     [switch]$Full1440p,
@@ -67,7 +68,8 @@ param(
     [switch]$RayTracing,
     [switch]$SmoothMotion,
     [switch]$WideShaderOpt,
-    [int]$WindowsBarMb = 8192,
+    [int]$WindowsBarMb = -1,
+    [int]$MipDrop = -1,
     [int]$WindowKb = 4096,
     [int]$CardBuffersMinKb = 64,
     [int]$DynamicSlots = 393216,
@@ -85,6 +87,53 @@ $ErrorActionPreference = 'Stop'
 if ($GpuTiming -and $Build -eq 'release') {
     Write-Host "Note: -GpuTiming requires the 'diag' build; switching Build -> diag."
     $Build = 'diag'
+}
+
+# Pre-flight NVIDIA GPU probe: detect VRAM tier for auto-tuning (24GB / 16GB / 12GB / 8GB)
+# and warn if another CUDA/AI process is occupying VRAM before launch.
+$gpuName = 'NVIDIA RTX'
+$gpuTotalMb = 0
+try {
+    $gpuCsv = (& nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,power.draw --format=csv,noheader,nounits 2>$null | Select-Object -First 1)
+    if ($gpuCsv) {
+        $parts = $gpuCsv.Split(',') | ForEach-Object { $_.Trim() }
+        $gpuName = $parts[0]
+        $util = [double]$parts[1]
+        $usedMb = [double]$parts[2]
+        $gpuTotalMb = [int][double]$parts[3]
+        $watts = $parts[4]
+        if ($util -ge 25 -or $usedMb -ge 3072) {
+            Write-Warning ("{0} is already busy before launch: {1:0}% GPU, {2:0}/{3:0} MiB VRAM, {4} W. Close heavy GPU/browser apps to avoid PCIe VRAM spill." -f $gpuName, $util, $usedMb, $gpuTotalMb, $watts)
+        }
+    }
+} catch {}
+
+# Auto VRAM tier tuning (always overridable via -WindowsBarMb, -MipDrop, -SeriesS/-SeriesX, -More).
+$autoCardBuffersMb = 0
+$vramTier = '24GB+'
+if ($gpuTotalMb -gt 0 -and $gpuTotalMb -lt 10000) {
+    $vramTier = '8GB'
+    if ($WindowsBarMb -lt 0) { $WindowsBarMb = 1536 }
+    if ($MipDrop -lt 0)      { $MipDrop = 2 }
+    if (-not $SeriesX -and -not $Full1440p -and -not $Full4K -and -not $Fsr4K) {
+        $SeriesS = $true
+    }
+} elseif ($gpuTotalMb -ge 10000 -and $gpuTotalMb -lt 14000) {
+    $vramTier = '12GB'
+    if ($WindowsBarMb -lt 0) { $WindowsBarMb = 2048 }
+    if ($MipDrop -lt 0)      { $MipDrop = 1 }
+    $autoCardBuffersMb = 2560
+} elseif ($gpuTotalMb -ge 14000 -and $gpuTotalMb -lt 20000) {
+    $vramTier = '16GB'
+    if ($WindowsBarMb -lt 0) { $WindowsBarMb = 3584 }
+    if ($MipDrop -lt 0)      { $MipDrop = 1 }
+    $autoCardBuffersMb = 4096
+} else {
+    if ($WindowsBarMb -lt 0) { $WindowsBarMb = 4096 }
+    if ($MipDrop -lt 0)      { $MipDrop = 0 }
+}
+if ($gpuTotalMb -gt 0) {
+    Write-Host ("GPU auto-tier: {0} ({1} MiB VRAM) -> {2} (WindowsBarMb={3}, MipDrop={4})" -f $gpuName, $gpuTotalMb, $vramTier, $WindowsBarMb, $MipDrop)
 }
 
 # Check commit memory headroom before starting (world gameplay uses 40-46 GB private commit).
@@ -149,6 +198,7 @@ $settings = @{
     VICTORY_SHADER_OPT          = $(if ($WideShaderOpt) { '127' } else { '63' })
     VICTORY_WAVE_WIDE           = 'last'
     VICTORY_NAN_SCRUB           = '1'
+    VICTORY_SMALL_RECHECK       = '0'
 }
 
 if (-not $NoPortConstants -and -not $Safe) {
@@ -179,6 +229,12 @@ if ($TexStore) {
 }
 if ($CardBuffersMinKb -gt 0) {
     $settings.VICTORY_CARD_BUFFERS_MIN_KB = "$CardBuffersMinKb"
+}
+if ($autoCardBuffersMb -gt 0 -and -not $Safe) {
+    $settings.VICTORY_CARD_BUFFERS_MB = "$autoCardBuffersMb"
+}
+if ($MipDrop -gt 0) {
+    $settings.VICTORY_TEXTURE_MIP_DROP = "$MipDrop"
 }
 if ($WindowsBarMb -gt 0 -and -not $Safe) {
     # Resizable BAR (D3D12_HEAP_TYPE_GPU_UPLOAD): moves loose vertex/index/mesh windows
@@ -265,8 +321,12 @@ if ($RayTracing) {
 }
 
 if ($Fsr4K) {
-    # Native PC FidelityFX bridge (FSR 3.1.x on RTX 4090 / FSR 4.x on RDNA 4, 4K output).
+    # Native PC FidelityFX bridge (FSR 3.1.x on NVIDIA RTX / FSR 4.x on RDNA 4, 4K output).
     $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant()
+    $defaultFfxDir = Join-Path $env:LOCALAPPDATA 'victory\fidelityfx'
+    if (-not $env:VICTORY_FIDELITYFX_DIR -and (Test-Path -LiteralPath (Join-Path $defaultFfxDir 'amd_fidelityfx_upscaler_dx12.dll'))) {
+        $settings.VICTORY_FIDELITYFX_DIR = $defaultFfxDir
+    }
 } elseif ($SeriesS) {
     $settings.VICTORY_PLANES   = '1'
     $settings.VICTORY_UPSCALER = $(if ($FidelityFx) { '7' } else { '6' })
@@ -334,21 +394,6 @@ if (-not $Exe -or -not (Test-Path -LiteralPath $Exe)) {
     throw "No title executable found. Pass -Exe <path\to\executable.exe> or set game_dir in victory.toml (copy victory.example.toml -> victory.toml)."
 }
 
-# Read-only pre-flight GPU check: warn if another CUDA/AI job is occupying the RTX 4090.
-try {
-    $gpuCsv = (& nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,power.draw --format=csv,noheader,nounits 2>$null | Select-Object -First 1)
-    if ($gpuCsv) {
-        $parts = $gpuCsv.Split(',') | ForEach-Object { $_.Trim() }
-        $util = [double]$parts[0]
-        $usedMb = [double]$parts[1]
-        $totalMb = [double]$parts[2]
-        $watts = $parts[3]
-        if ($util -ge 25 -or $usedMb -ge 4096) {
-            Write-Warning ("RTX 4090 is already busy before launch: {0:0}% GPU, {1:0}/{2:0} MiB VRAM, {3} W. Another CUDA/AI process may cut FPS and cause VRAM paging." -f $util, $usedMb, $totalMb, $watts)
-        }
-    }
-} catch {}
-
 if ($SmoothMotion) {
     $smCopy = Join-Path (Split-Path $victory -Parent) 'victory_sm.exe'
     Copy-Item -LiteralPath $victory -Destination $smCopy -Force
@@ -356,7 +401,7 @@ if ($SmoothMotion) {
     Write-Host "Smooth Motion copy ready: $victory (enable Smooth Motion for victory_sm.exe in NVIDIA App)"
 }
 
-$keep = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR'
+$keep = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_FIDELITYFX_DIR'
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -notin $keep } |
     ForEach-Object { Remove-Item "Env:$($_.Name)" }
@@ -367,10 +412,10 @@ foreach ($k in $settings.Keys) {
 
 $Exe = (Resolve-Path -LiteralPath $Exe).Path
 $consoleArg = if ($SeriesS) { 'series-s' } else { 'series-x' }
-$mode = if ($SeriesS) { 'Series S 1080p+4K HUD' } elseif ($Full4K) { 'Series X 3840x2160' } elseif ($Full1440p) { 'Series X 2560x1440' } else { 'Series X 1920x1080' }
+$mode = if ($Fsr4K) { "Series X 4K PC FSR ($Fsr4K)" } elseif ($SeriesS) { 'Series S 1080p+4K HUD' } elseif ($Full4K) { 'Series X 3840x2160' } elseif ($Full1440p) { 'Series X 2560x1440' } else { 'Series X 1920x1080' }
 if ($Scale -gt 0.0) { $mode += " @ scale $($settings.VICTORY_RENDER_SCALE)" }
 if ($Fps -gt 0.0) { $mode += ", cap ${Fps} FPS" }
-Write-Host "Starting VIctory-RTX-Mc3yohan ($Build, $mode) on NVIDIA RTX 4090 with $($settings.Count) switches..."
+Write-Host "Starting VIctory-RTX-Mc3yohan ($Build, $mode) on $gpuName [$vramTier] with $($settings.Count) switches..."
 
 $runArgs = @('run', $Exe, '--console', $consoleArg, '--execute')
 

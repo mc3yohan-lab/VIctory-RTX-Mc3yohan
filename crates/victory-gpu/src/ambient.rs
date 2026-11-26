@@ -220,8 +220,24 @@ fn refl() -> f32 {
     })
 }
 
+/// Minimum warm indoor indirect light floor (`VICTORY_AMBIENT_FLOOR`, default
+/// `0.06`; `0` or `off` disables). Prevents dim interiors and downward camera
+/// angles (where no sky or bright lamps fill the viewport) from collapsing into
+/// a zero-radiance feedback loop while leaving sunlit and well-lit scenes
+/// untouched.
+fn floor() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        match std::env::var("VICTORY_AMBIENT_FLOOR").ok().as_deref().map(str::trim) {
+            Some("0" | "off") => 0.0,
+            Some(s) => s.parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(0.06),
+            None => 0.06,
+        }
+    })
+}
+
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=16, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
+#define RS "RootConstants(num32BitConstants=17, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -232,6 +248,7 @@ cbuffer Set : register(b0) {
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; uint probe;
     float jump; float fresh; float dt; float refl;
+    float floor_level;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -275,11 +292,14 @@ void mean() {
     float3 sum = 0;
     for (uint i = 0; i < CELLS; i++) sum += cells[i].rgb;
     float4 was = cells[CELLS];
-    float3 now = sum / CELLS;
-    // (`jump` > 0: a change of more than that factor either way is
-    // followed at once, as a new room is.)
+    float3 floor_rgb = float3(1.0, 0.98, 0.94) * floor_level;
+    float3 now = max(sum / CELLS, floor_rgb);
+    // (`jump` > 0: an upward brightness jump of more than that factor is
+    // followed at once when emerging into bright light; downward drops decay
+    // smoothly with `follow` so looking down at dark surfaces or entering dim
+    // rooms never collapses indirect light to black in a single frame.)
     float a = max(dot(now, LUMA), 1e-5), b = max(dot(was.rgb, LUMA), 1e-5);
-    bool jumped = jump > 0.0 && max(a / b, b / a) > jump;
+    bool jumped = jump > 0.0 && (a / b) > jump;
     // Its fourth part: seconds since the light around last jumped (from
     // 0.001; 0: nothing kept yet).
     float age = was.a > 0.0 && !jumped ? was.a + dt : 0.001;
@@ -450,18 +470,20 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    float3 floor_light = float3(1.0, 0.98, 0.94) * floor_level * level * open;
+    found = max(found, floor_light);
     float3 was = unpack(light[p]);
     float left = dot(was, LUMA);
     // Once radiance cells are initialized (`cells[CELLS].a > 0`), always bound
     // `was` even inside concave creases (`open -> 0`), while flooring the upper
-    // cap base at 15% of room radiance so indoor corners/bunks keep soft
-    // shading without collapsing to pitch black, and recessed eye sockets still
-    // clamp raw outdoor sky leaks (>10x room) cleanly.
+    // cap base at 15% of room radiance or the indoor ambient floor so dim
+    // interiors and dark corners keep soft shading without collapsing to pitch
+    // black, while recessed eye sockets still clamp raw outdoor sky leaks.
     float found_luma = dot(found, LUMA);
     if (cells[CELLS].a > 0.0) {
         float bound = fresh > 0.0 ? lerp(1.0, most, saturate(cells[CELLS].a / fresh)) : most;
         float room_luma = dot(cells[CELLS].rgb, LUMA);
-        float cap_base = max(found_luma, 0.15 * level * room_luma);
+        float cap_base = max(found_luma, max(0.15 * level * room_luma, dot(floor_light, LUMA)));
         float top = max(cap_base * bound, 0.0);
         float has = dot(was, LUMA);
         was *= min(1.0, top / max(has, 1e-9));
@@ -646,7 +668,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.stats);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 16];
+    let mut words = [0u32; 17];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -660,6 +682,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
     words[14] = (frame_ms(role) / 1000.0).to_bits();
     words[15] = refl().to_bits();
+    words[16] = floor().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -667,7 +690,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l, None);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 17, words.as_ptr().cast(), 0);
         if let Some(depth) = views.depth {
             l.SetComputeRootDescriptorTable(1, depth);
         }

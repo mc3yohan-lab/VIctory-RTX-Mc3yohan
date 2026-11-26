@@ -1633,11 +1633,13 @@ fn small_recheck_bytes() -> u64 {
 }
 
 /// Whether a small texture (`<= small_recheck_bytes()`) is fingerprinted whole
-/// and rechecked continuously (`VICTORY_SMALL_RECHECK=0` disables).
+/// and rechecked continuously (`VICTORY_SMALL_RECHECK=1` enables; off by
+/// default because hashing ~1,000 small textures / ~35 MB per frame costs
+/// ~3-5 ms of CPU time on RTX 4090 for ~0.04 actual changes per frame).
 pub(crate) fn small_recheck(len: u64) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     len <= small_recheck_bytes()
-        && *ON.get_or_init(|| std::env::var_os("VICTORY_SMALL_RECHECK").is_none_or(|v| v != "0"))
+        && *ON.get_or_init(|| std::env::var_os("VICTORY_SMALL_RECHECK").is_some_and(|v| v == "1"))
 }
 
 /// A fingerprint of the title memory `[at, at + len)`, never 0: of all of
