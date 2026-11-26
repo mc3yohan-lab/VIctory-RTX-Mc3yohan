@@ -14,19 +14,22 @@
 #   coalesced VirtualProtect, warm host-pipelines.bin.
 #
 # Usage:
-#   scripts\play-nvidia.ps1                        # Series X 1440p + Renderer Patches 1+2 (clean textures, ambient, RT-off)
+#   scripts\play-nvidia.ps1                        # Series X 1440p + Patch 1 (fast textures, ambient settle, 0 indirect drops)
 #   scripts\play-nvidia.ps1 -Fps 60                # Unlock 30 FPS cap to 60 FPS (game clock stays 1.00x)
-#   scripts\play-nvidia.ps1 -RayTracing            # Test real Wave32 NVIDIA Ray Tracing + exact cascade shadows!
-#   scripts\play-nvidia.ps1 -UpQueue               # Dedicated D3D12 copy queue + joined barriers
+#   scripts\play-nvidia.ps1 -TexStore              # Enable disk cache of sharp mip levels (faster texture streaming on revisits)
+#   scripts\play-nvidia.ps1 -RayTracing            # Test real Wave32 NVIDIA Ray Tracing + exact cascade shadows
 #   scripts\play-nvidia.ps1 -SeriesS               # Series S 1080p + 4K sharp HUD @ 720p internal (0.667)
 #   scripts\play-nvidia.ps1 -Scale 0.75            # Series X 1440p @ 75% internal + temporal upscaler
-#   scripts\play-nvidia.ps1 -NoPortPatches         # A/B test without VICTORY_PORT_CONSTANTS / VICTORY_PORT_DESCRIPTORS
 #   scripts\play-nvidia.ps1 -SmoothMotion          # Launches victory_sm.exe for NVIDIA App Smooth Motion (2x visual FPS)
-#   scripts\play-nvidia.ps1 -FastTextures          # Sets VICTORY_TEXTURE_NO_WAIT=1 (faster, may cause rainbow textures)
+#   scripts\play-nvidia.ps1 -WaitTextures          # Sets VICTORY_TEXTURE_NO_WAIT=0 (slower streaming, avoids partial BCn blocks)
+#   scripts\play-nvidia.ps1 -SkipRtHashes          # Opt-in: skip 1,034 rt_off_hashes (use only if white indoor haze appears)
+#   scripts\play-nvidia.ps1 -PortDescriptors       # Experimental Patch 2 (OFF by default: missed 78K-137K views on title)
+#   scripts\play-nvidia.ps1 -NoPortConstants       # Disable Renderer Patch 1 (VICTORY_PORT_CONSTANTS)
+#   scripts\play-nvidia.ps1 -UpQueue               # Experimental dedicated D3D12 copy queue + joined barriers
 #   scripts\play-nvidia.ps1 -SweepPerHeap          # Coolfox per-heap buffer pass (VICTORY_SWEEP_PER_HEAP=1)
 #   scripts\play-nvidia.ps1 -NoAmbient             # Disables indirect light stand-in
 #   scripts\play-nvidia.ps1 -Panel                 # Live diagnostics overlay (auto-switches to diag build)
-#   scripts\play-nvidia.ps1 -Quality               # Conservative sync (RELAY=1, CARD_STEPS=0)
+#   scripts\play-nvidia.ps1 -Quality               # Conservative sync (RELAY=1, CARD_STEPS=0, NO_WAIT=0)
 #   scripts\play-nvidia.ps1 -Safe                  # Safe fallback path (disables port patches and thin lists)
 #   scripts\play-nvidia.ps1 -Full4K                # Series X 3840x2160 native output
 #   scripts\play-nvidia.ps1 -NoLog                 # Disable automatic log capture
@@ -38,9 +41,12 @@ param(
     [double]$Scale = 0.0,
     [double]$Fps = 0.0,
     [switch]$Full4K,
-    [switch]$FastTextures,
+    [switch]$WaitTextures,
+    [switch]$TexStore,
+    [switch]$SkipRtHashes,
     [switch]$NoAmbient,
-    [switch]$NoPortPatches,
+    [switch]$NoPortConstants,
+    [switch]$PortDescriptors,
     [switch]$UpQueue,
     [switch]$SweepPerHeap,
     [switch]$XmaRefill,
@@ -79,7 +85,9 @@ try {
 
 $settings = @{
     # --- Core fast path (avatarmanz latest + Korinocho perf set) ---
-    VICTORY_TEXTURE_NO_WAIT     = $(if ($FastTextures) { '1' } else { '0' })
+    # NO_WAIT=1 keeps texture streaming at ~0.6-1.4 ms/frame (NO_WAIT=0 caused 50-377 ms stalls);
+    # SHOW_NEW_LATER=1 + FAIR_DUE=1 prevent pooled-slot corruption without stalling the stream.
+    VICTORY_TEXTURE_NO_WAIT     = $(if ($WaitTextures) { '0' } else { '1' })
     VICTORY_TEXTURE_STAGE_MS    = '40'
     VICTORY_FAIR_DUE            = '1'
     VICTORY_SHOW_NEW_LATER      = '1'
@@ -120,11 +128,18 @@ $settings = @{
     VICTORY_NAN_SCRUB           = '1'
 }
 
-if (-not $NoPortPatches -and -not $Safe) {
-    # Renderer Patches 1+2 (avatarmanz origin/main): in-place 174 MB constants heap + hooked descriptor writes.
-    # Both are byte-checked and fall back cleanly per region / per frame if a store is missed.
-    $settings.VICTORY_PORT_CONSTANTS   = '1'
+if (-not $NoPortConstants -and -not $Safe) {
+    # Renderer Patch 1 (avatarmanz): in-place 185 MB constants heap (verified 0 forgotten regions, saves ~10,800 fills/frame).
+    $settings.VICTORY_PORT_CONSTANTS = '1'
+}
+if ($PortDescriptors -and -not $Safe) {
+    # Renderer Patch 2: opt-in only (missed 78K-137K view records from unpatched title memcpy/writers in prologue).
     $settings.VICTORY_PORT_DESCRIPTORS = '1'
+}
+if ($TexStore) {
+    $texStoreDir = Join-Path $env:LOCALAPPDATA 'victory\cache\textures'
+    New-Item -ItemType Directory -Force -Path $texStoreDir | Out-Null
+    $settings.VICTORY_TEXTURE_STORE = $texStoreDir
 }
 if ($CardBuffersMinKb -gt 0) {
     $settings.VICTORY_CARD_BUFFERS_MIN_KB = "$CardBuffersMinKb"
@@ -171,9 +186,13 @@ if ($RayTracing) {
     $settings.VICTORY_SKIP_PIPELINES = 'none'
 } else {
     $settings.VICTORY_BVH_NO_HIT     = '1'
-    $rtHashesPath = Join-Path $PSScriptRoot 'rt_off_hashes.txt'
-    if (Test-Path -LiteralPath $rtHashesPath) {
-        $settings.VICTORY_SKIP_PIPELINES = (Get-Content -LiteralPath $rtHashesPath -Raw).Trim()
+    if ($SkipRtHashes) {
+        $rtHashesPath = Join-Path $PSScriptRoot 'rt_off_hashes.txt'
+        if (Test-Path -LiteralPath $rtHashesPath) {
+            $settings.VICTORY_SKIP_PIPELINES = (Get-Content -LiteralPath $rtHashesPath -Raw).Trim()
+        } else {
+            $settings.VICTORY_SKIP_PIPELINES = 'none'
+        }
     } else {
         $settings.VICTORY_SKIP_PIPELINES = 'none'
     }
