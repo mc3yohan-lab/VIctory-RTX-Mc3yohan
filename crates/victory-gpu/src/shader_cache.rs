@@ -150,6 +150,9 @@ fn build() -> [u8; 32] {
     for value in victory_shader::emit::host_settings() {
         hash.update(&value.to_le_bytes());
     }
+    if victory_shader::emit::constants_raw() && victory_shader::emit::raw_views() == 0 {
+        hash.update(b"cbv-inplace");
+    }
     *hash.finalize().as_bytes()
 }
 

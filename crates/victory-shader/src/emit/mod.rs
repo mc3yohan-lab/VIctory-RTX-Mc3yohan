@@ -2563,6 +2563,63 @@ mod tests {
             let got = out.iter().find(|o| o[..5].iter().any(|&w| w != 0)).map(|o| o[..5].to_vec());
             assert_eq!(got.as_deref(), Some(&want[..]), "switch {raw}: {out:x?}");
         }
+        // NVIDIA 1M view heap path (`raw_views() == 0`, no raw twins): the raw SRV sits in place at slot 0.
+        super::shader::CONSTANTS_RAW_HERE.set(Some(true));
+        super::shader::RAW_VIEWS_HERE.set(Some(0));
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let in_place = super::lower::lower(&super::lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .unwrap();
+        super::shader::CONSTANTS_RAW_HERE.set(None);
+        super::shader::RAW_VIEWS_HERE.set(None);
+        let mut dxil = in_place.dxil;
+        if let Ok(mut v) = super::validator::Validator::load(super::validator::Validator::default_path().as_deref()) {
+            v.validate(&mut dxil).unwrap();
+        }
+        if let Ok(host) = super::host::Host::new(true) {
+            let cs = super::HostShader {
+                stage: super::HwStage::Cs,
+                dxil,
+                user_data: in_place.user_data,
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: in_place.root_cbvs,
+                root_srvs: in_place.root_srvs,
+                root_uavs: in_place.root_uavs,
+                root_indexed_views: Vec::new(),
+                half_views: in_place.half_views,
+            };
+            let (root, pso) = host.compute_pipeline(&cs).unwrap();
+            let views = vec![
+                super::host::View::Buffer { data: &data, stride: super::host::Stride::Raw },
+                super::host::View::RawUav(8),
+            ];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &super::host::Dispatch {
+                        roots: vec![(0, super::host::Root::Constants(vec![s0, 0, 0, 0, 0]))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            assert_eq!(&out[0][..5], &want[..], "in-place raw CBV (raw_views=0): {out:x?}");
+        }
     }
 
     #[test]

@@ -6905,9 +6905,10 @@ impl<'a> Lower<'a> {
                 None => self.s.m.cmp(self.cur, pred::EQ, stride, zero),
             };
             let at = self.begin_guarded(Some(other));
-            // (Renderer port 5: the twin of a constant buffer's slot is a
-            // raw view of its bytes, read as one.)
-            let as_raw = super::shader::constants_raw() && super::shader::raw_views() != 0;
+            // (Renderer port 5: read a constant buffer's slot as raw bytes,
+            // through its raw twin when raw_views() != 0 or in place on
+            // capped 1M heaps where raw_views() == 0.)
+            let as_raw = super::shader::constants_raw();
             let h = if as_raw {
                 self.handle(site, src, false, (11, 0))?
             } else {
@@ -7523,9 +7524,9 @@ impl<'a> Lower<'a> {
             }
             return Ok(None);
         }
-        if super::shader::raw_views() == 0 {
-            return Ok(None);
-        }
+        // When `raw_views() != 0` (AMD 4M heap), `self.handle(..., (11, 0))`
+        // indexes the raw twin (`slot + raw_views()`); when `raw_views() == 0`
+        // (NVIDIA 1M heap), it reads the raw SRV placed directly in `slot`.
         let x = self.x;
         let scalar = &self.scalar;
         let through_heap = src.leaves().iter().all(|leaf| match leaf {
