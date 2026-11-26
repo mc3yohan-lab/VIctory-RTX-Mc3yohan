@@ -692,7 +692,8 @@ fn clamp_into(
     ahead: bool,
 ) -> bool {
     let before = list.indirect_state(dst);
-    let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
+    let need_uav = list.list.uav_dirty();
+    let recorded = record_clamp_impl(c, &list.list, Some(&list.list), need_uav, (dst, before), budget, src, count, spec, ahead);
     if recorded {
         list.indirect_readable(dst);
     }
@@ -708,6 +709,22 @@ fn clamp_into(
 fn record_clamp_as(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
+    (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    budget: u64,
+    (src, src_offset): (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    (kind, stride, records): (u32, u32, u32),
+    ahead: bool,
+) -> bool {
+    record_clamp_impl(c, l, None, true, (dst, before), budget, (src, src_offset), count, (kind, stride, records), ahead)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_impl(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    rec: Option<&crate::host::rec::Rec>,
+    need_uav: bool,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
     budget: u64,
     (src, src_offset): (&ID3D12Resource, u64),
@@ -763,43 +780,57 @@ fn record_clamp_as(
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
     // transitions `before -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`. Moving
-    // it out of `INDIRECT_ARGUMENT` orders this clamp's writes after every
-    // earlier execution's reads of the scratch buffer; nothing else writes it.
-    // Diagnostics: counted; `VICTORY_BARRIER_TEST=indirect` leaves the two
-    // waits for every earlier shader write out (the state changes stay).
+    // `dst` into `INDIRECT_ARGUMENT` already orders the clamp's writes to
+    // `dst` before `ExecuteIndirect`, so no post-dispatch global `UAV(NULL)`
+    // is needed (same invariant as `indirect/batch.rs`). Before the clamp,
+    // when `uav_dirty` is true, we emit resource-specific UAV barriers on
+    // `src` (and `count` if distinct) instead of stalling all 128 SMs.
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
     #[cfg(feature = "diagnostics")]
-    let waits = crate::copystat::barrier_test() & 2 == 0;
+    let waits = need_uav && crate::copystat::barrier_test() & 2 == 0;
     #[cfg(not(feature = "diagnostics"))]
-    let waits = true;
-    let first = [
-        uav_barrier(),
-        transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-    ];
-    let second = [
-        uav_barrier(),
-        transition(
-            dst,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-        ),
-    ];
-    let skip = usize::from(!waits);
-    unsafe {
-        // Earlier shader writes (the title's argument and count passes) first.
-        l.ResourceBarrier(&first[skip..]);
-        if records > 0 {
-            l.SetComputeRootSignature(&c.root);
-            l.SetPipelineState(&c.pso);
-            l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-            l.SetComputeRootShaderResourceView(1, src_gpu);
-            l.SetComputeRootShaderResourceView(2, count_gpu);
-            l.SetComputeRootUnorderedAccessView(3, dst_gpu);
-            l.SetComputeRootUnorderedAccessView(4, budget);
-            l.Dispatch(records.div_ceil(64), 1, 1);
+    let waits = need_uav;
+    let mut first: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(3);
+    if waits {
+        first.push(uav_barrier_for(src));
+        if let Some((count_buf, _)) = count
+            && windows::core::Interface::as_raw(count_buf) != windows::core::Interface::as_raw(src)
+        {
+            first.push(uav_barrier_for(count_buf));
         }
-        l.ResourceBarrier(&second[skip..]);
+    }
+    first.push(transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+    let second = [transition(
+        dst,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+    )];
+    unsafe {
+        if let Some(rec) = rec {
+            rec.barriers(&first);
+        } else {
+            l.ResourceBarrier(&first);
+        }
+        if records > 0 {
+            let cmd: &ID3D12GraphicsCommandList = match rec {
+                Some(r) => r,
+                None => l,
+            };
+            cmd.SetComputeRootSignature(&c.root);
+            cmd.SetPipelineState(&c.pso);
+            cmd.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            cmd.SetComputeRootShaderResourceView(1, src_gpu);
+            cmd.SetComputeRootShaderResourceView(2, count_gpu);
+            cmd.SetComputeRootUnorderedAccessView(3, dst_gpu);
+            cmd.SetComputeRootUnorderedAccessView(4, budget);
+            cmd.Dispatch(records.div_ceil(64), 1, 1);
+        }
+        if let Some(rec) = rec {
+            rec.barriers(&second);
+        } else {
+            l.ResourceBarrier(&second);
+        }
     }
     true
 }
@@ -843,6 +874,8 @@ pub(crate) fn open_batch(
     // A source there is none of is the first again, which no job names.
     let mut ids = [0u64; batch::SOURCES];
     let mut sources = [gpu(source.1)?; batch::SOURCES];
+    let mut src_res: Vec<&ID3D12Resource> = Vec::with_capacity(batch::SOURCES);
+    src_res.push(source.1);
     ids[0] = source.0;
     let others = recent.iter().filter(|r| r.0 != source.0).take(batch::SOURCES - 1);
     for (i, (id, buffer)) in others.enumerate() {
@@ -851,11 +884,14 @@ pub(crate) fn open_batch(
             // copies draws read (`Shadow::refresh`).
             list.keep(buffer);
             (ids[i + 1], sources[i + 1]) = (*id, at);
+            if !src_res.iter().any(|b| windows::core::Interface::as_raw(*b) == windows::core::Interface::as_raw(buffer)) {
+                src_res.push(buffer);
+            }
         }
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
-    batch::record(c, &list.list, (&dst, before), budget, sources, jobs);
+    batch::record_on_rec(c, &list.list, (&dst, before), budget, sources, &src_res, jobs);
     // SAFETY: the list's own upload memory of that many bytes, 256-byte
     // aligned, until it is reset.
     Some((unsafe { batch::Table::new(at, base, ids) }, dst))
@@ -875,6 +911,22 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
             UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
                 pResource: std::mem::ManuallyDrop::new(None),
+            }),
+        },
+    }
+}
+
+/// Resource-specific UAV barrier on `res` (borrowed handle kept alive by caller
+/// across the barrier call; avoids full-GPU SM stall on unrelated resources).
+fn uav_barrier_for(res: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
+    // SAFETY: borrowed COM handle wrapped in `ManuallyDrop` (never released).
+    let borrowed: ID3D12Resource = unsafe { std::mem::transmute_copy(res) };
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: std::mem::ManuallyDrop::new(Some(borrowed)),
             }),
         },
     }

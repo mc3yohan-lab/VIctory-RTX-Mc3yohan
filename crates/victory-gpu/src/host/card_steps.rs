@@ -565,16 +565,30 @@ fn record(
     // its call) and are promoted by their first use.
     unsafe {
         if first {
-            // What earlier lists' shaders wrote, first.
-            list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                        pResource: std::mem::ManuallyDrop::new(None),
-                    }),
-                },
-            }]);
+            // What earlier lists' shaders wrote to the source/dest buffers of
+            // these card steps, first (resource-specific instead of global
+            // `UAV(NULL)` so unrelated SMs and render targets are not stalled).
+            let mut uavs: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(sources.len() + dests.len());
+            for &b in sources.iter().chain(dests.iter()) {
+                if !uavs.iter().any(|u| {
+                    u.Anonymous.UAV.pResource.as_ref().is_some_and(|r| r.as_raw() == b.as_raw())
+                }) {
+                    // SAFETY: borrowed handle kept alive for this barrier call.
+                    let borrowed: ID3D12Resource = std::mem::transmute_copy(b);
+                    uavs.push(D3D12_RESOURCE_BARRIER {
+                        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                                pResource: std::mem::ManuallyDrop::new(Some(borrowed)),
+                            }),
+                        },
+                    });
+                }
+            }
+            if !uavs.is_empty() {
+                list.ResourceBarrier(&uavs);
+            }
         } else {
             list.ResourceBarrier(&[transition(between, constants, dest)]);
         }

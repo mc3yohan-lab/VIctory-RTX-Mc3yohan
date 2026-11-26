@@ -139,11 +139,14 @@ std::arch::global_asm!(
     ".globl victory_safe_changed_after",
     ".globl victory_safe_changed_failed",
     // rcx title memory, rdx what was last seen there, r8 records of 32
-    // bytes, r9 a bit per record (zeroed by the caller): each record of
-    // title memory is read once; where it differs from the one last seen it
-    // goes over that one, and then its bit is set. eax: whether all could
-    // be read (where one could not, those before it are done).
+    // bytes, r9 a bit per record (zeroed by the caller), [rsp+40] 32-bit byte
+    // comparison mask (e.g. 0xffff_ffff for all 32 bytes, 0x0fff for the
+    // 12-byte descriptor header `[VIEW_TAG, index, generation]`): each record
+    // of title memory is read once; where any masked byte differs from the
+    // one last seen it goes over that one, and then its bit is set. eax:
+    // whether all could be read (where one could not, those before it are done).
     "victory_safe_changed:",
+    "mov r11d, dword ptr [rsp + 40]",
     "xor r10d, r10d",
     "test r8, r8",
     "jz 3f",
@@ -153,7 +156,8 @@ std::arch::global_asm!(
     "victory_safe_changed_after:",
     "vpcmpeqb ymm1, ymm0, ymmword ptr [rdx]",
     "vpmovmskb eax, ymm1",
-    "cmp eax, -1",
+    "and eax, r11d",
+    "cmp eax, r11d",
     "je 4f",
     "vmovdqu ymmword ptr [rdx], ymm0",
     "bts qword ptr [r9], r10",
@@ -186,7 +190,7 @@ unsafe extern "system" {
     fn victory_safe_merge_at();
     fn victory_safe_merge_after();
     fn victory_safe_merge_failed();
-    fn victory_safe_changed(title: *const u8, seen: *mut u8, records: usize, bits: *mut u64) -> u32;
+    fn victory_safe_changed(title: *const u8, seen: *mut u8, records: usize, bits: *mut u64, mask: u32) -> u32;
     fn victory_safe_changed_at();
     fn victory_safe_changed_after();
     fn victory_safe_changed_failed();
@@ -206,7 +210,20 @@ pub(crate) unsafe fn changed(title: *const u8, seen: *mut u8, records: usize, bi
     assert!(bits.len() >= records.div_ceil(64));
     // SAFETY: a fault reading title memory leaves through the failing exit
     // ([`failing_exit`]); the rest is the caller's.
-    unsafe { victory_safe_changed(title, seen, records, bits.as_mut_ptr()) != 0 }
+    unsafe { victory_safe_changed(title, seen, records, bits.as_mut_ptr(), u32::MAX) != 0 }
+}
+
+/// As [`changed`], comparing only the first 12 bytes of each 32-byte record
+/// (`[VIEW_TAG, index, generation]`) so non-descriptor overwrites in unused
+/// trailing padding bytes `12..31` do not trigger false descriptor changes.
+///
+/// # Safety
+/// Same as [`changed`].
+pub(crate) unsafe fn changed_key12(title: *const u8, seen: *mut u8, records: usize, bits: &mut [u64]) -> bool {
+    assert!(bits.len() >= records.div_ceil(64));
+    // SAFETY: a fault reading title memory leaves through the failing exit
+    // ([`failing_exit`]); the rest is the caller's.
+    unsafe { victory_safe_changed(title, seen, records, bits.as_mut_ptr(), 0x0fff) != 0 }
 }
 
 /// What [`merge`] did.
@@ -511,6 +528,31 @@ mod tests {
         assert_eq!(found, [0]);
         assert_eq!(seen[..32], title[..32]);
         assert_ne!(seen[200 * 32..201 * 32], title[200 * 32..201 * 32]);
+    }
+
+    #[test]
+    fn changed_key12_ignores_trailing_padding() {
+        assert!(on());
+        let pages = Pages::new(4096);
+        pages.fill();
+        let records: usize = 4096 / 32;
+        // SAFETY: inside the allocation.
+        let title = unsafe { std::slice::from_raw_parts(pages.0, pages.1) }.to_vec();
+        let mut seen = title.clone();
+        // Mutate bytes 12..31 on slots 3 and 70 (must be ignored).
+        seen[3 * 32 + 12] ^= 0xff;
+        seen[3 * 32 + 24] ^= 0x55;
+        seen[70 * 32 + 16] ^= 0xaa;
+        // Mutate bytes 0..11 on slots 5 and 99 (must be detected).
+        seen[5 * 32 + 4] ^= 0x33;
+        seen[99 * 32 + 11] ^= 0x77;
+        let mut bits = vec![0u64; records.div_ceil(64)];
+        // SAFETY: inside the allocation; `seen` and `bits` are ours.
+        assert!(unsafe { changed_key12(pages.0, seen.as_mut_ptr(), records, &mut bits) });
+        let found: Vec<usize> = (0..records).filter(|n| bits[n / 64] >> (n % 64) & 1 != 0).collect();
+        assert_eq!(found, [5, 99]);
+        assert_eq!(&seen[5 * 32..6 * 32], &title[5 * 32..6 * 32]);
+        assert_eq!(&seen[99 * 32..100 * 32], &title[99 * 32..100 * 32]);
     }
 
     /// The dwords that changed are stored, and no byte of any other, at

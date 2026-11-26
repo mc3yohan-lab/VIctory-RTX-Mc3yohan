@@ -503,8 +503,19 @@ pub(crate) fn sync_heaps() {
                             .map_or(0, u32::from_le_bytes)
                     };
                     if check {
-                        // Renderer port #2's fallback: what no mark told of.
-                        crate::port_descriptors::missed(index, start + u64::from(index) * step, !samplers && word(0) == VIEW_TAG, host.copied_tabled(index, frame));
+                        // Renderer port #2's fallback: only flag a live, valid
+                        // view record that no mark told of (8-byte-aligned
+                        // non-descriptor overwrites at +8 can clobber
+                        // `generation` while leaving stale `VIEW_TAG` in 0..4).
+                        let live_view = !samplers
+                            && word(0) == VIEW_TAG
+                            && view_at(word(1), word(2)).is_some();
+                        crate::port_descriptors::missed(
+                            index,
+                            start + u64::from(index) * step,
+                            live_view,
+                            host.copied_tabled(index, frame),
+                        );
                     }
                     if !samplers && word(0) == VIEW_TAG {
                         // A draw's own table: the draw makes what it
@@ -1588,8 +1599,16 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
             std::ptr::copy(src as *const u8, dst as *mut u8, len as usize)
         };
         #[cfg(windows)]
-        for i in 0..u64::from(count) {
-            mirror(dst + i * step);
+        {
+            // Mark every destination slot *before* entering the slower
+            // `host.mirror` loop so a concurrent `sync_heaps` never observes
+            // newly written bytes in slots 1..count-1 before they are marked.
+            for i in 0..u64::from(count) {
+                crate::port_descriptors::mark(dst + i * step);
+            }
+            for i in 0..u64::from(count) {
+                mirror(dst + i * step);
+            }
         }
     }
 }

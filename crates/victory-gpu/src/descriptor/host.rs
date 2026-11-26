@@ -4982,13 +4982,13 @@ impl Copied<'_> {
         }
         // SAFETY: within the records held; the caller's slots alone.
         let last = unsafe { std::slice::from_raw_parts_mut(self.at.add(at), end - at) };
-        changed_records(last, &records[..end - at], self.step, first, out);
+        changed_records_key(last, &records[..end - at], self.step, 12.min(self.step), first, out);
     }
 
     /// As [`Copied::changes`] for the `count` records of title memory at
     /// `title` (slot `first` on), 32 bytes each, read where they are, each
-    /// once ([`crate::safecopy::changed`]); `bits` is room. False when a page
-    /// of them could not be read: those before it are done, the others
+    /// once ([`crate::safecopy::changed_key12`]); `bits` is room. False when a
+    /// page of them could not be read: those before it are done, the others
     /// stay as last seen.
     ///
     /// # Safety
@@ -5003,7 +5003,7 @@ impl Copied<'_> {
         bits.clear();
         bits.resize(count.div_ceil(64), 0);
         // SAFETY: within the records held; the caller's slots alone.
-        let whole = unsafe { crate::safecopy::changed(title, self.at.add(at), count, bits) };
+        let whole = unsafe { crate::safecopy::changed_key12(title, self.at.add(at), count, bits) };
         for (n, &word) in bits.iter().enumerate() {
             let mut word = word;
             while word != 0 {
@@ -5032,15 +5032,24 @@ impl Copied<'_> {
 /// between `last` and `records` (of one length) go into `out` and `last`.
 /// Most of a changed page is as it was: it is looked at sixteen records at a
 /// time.
+#[cfg(test)]
 fn changed_records(last: &mut [u8], records: &[u8], step: usize, first: u32, out: &mut Vec<u32>) {
+    changed_records_key(last, records, step, step, first, out);
+}
+
+/// As `changed_records`, comparing only the first `key_len` bytes of each
+/// `step`-byte record (12 bytes `[VIEW_TAG, index, generation]` for VIctory
+/// descriptor heaps, ignoring non-descriptor writes into trailing padding).
+fn changed_records_key(last: &mut [u8], records: &[u8], step: usize, key_len: usize, first: u32, out: &mut Vec<u32>) {
     const AT_A_TIME: usize = 16;
     let block = AT_A_TIME * step;
+    let key_len = key_len.min(step);
     for (b, (old, new)) in last.chunks_mut(block).zip(records.chunks(block)).enumerate() {
         if old == new {
             continue;
         }
         for (n, (old, new)) in old.chunks_exact_mut(step).zip(new.chunks_exact(step)).enumerate() {
-            if old != new {
+            if old[..key_len] != new[..key_len] {
                 old.copy_from_slice(new);
                 out.push(first + (b * AT_A_TIME + n) as u32);
             }

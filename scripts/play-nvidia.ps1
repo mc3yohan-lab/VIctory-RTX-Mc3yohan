@@ -47,6 +47,7 @@ param(
     [switch]$WaitTextures,
     [switch]$TexStore,
     [switch]$SkipRtHashes,
+    [switch]$SkipRtAggressive,
     [switch]$LaneCore,
     [switch]$NoAmbient,
     [switch]$NoPortConstants,
@@ -63,7 +64,7 @@ param(
     [switch]$SmoothMotion,
     [switch]$WideShaderOpt,
     [int]$WindowsBarMb = 4096,
-    [int]$WindowKb = 256,
+    [int]$WindowKb = 4096,
     [int]$CardBuffersMinKb = 64,
     [int]$DynamicSlots = 393216,
     [switch]$RecordPipelines,
@@ -118,7 +119,7 @@ $settings = @{
     VICTORY_INDIRECT_BATCH      = '2'
     VICTORY_INDIRECT_REST       = '0'
     VICTORY_LAND_SKIP           = '1'
-    VICTORY_LAND_THREADS        = '4'
+    VICTORY_LAND_THREADS        = '6'
     VICTORY_MAP_THREADS         = '1'
     VICTORY_TITLE_PRIORITIES    = '0'
     VICTORY_CARD_AWAKE          = '1'
@@ -150,7 +151,8 @@ if (-not $NoPortConstants -and -not $Safe) {
     $settings.VICTORY_PORT_CONSTANTS = '1'
 }
 if ($PortDescriptors -and -not $Safe) {
-    # Renderer Patch 2: opt-in only (missed 78K-137K view records from unpatched title memcpy/writers in prologue).
+    # Renderer Patch 2: 12-byte descriptor header diff + copy_simple mark ordering fixed.
+    # Saves ~10-11 ms/frame CPU in sync_heaps when verified at 0 missed live views.
     $settings.VICTORY_PORT_DESCRIPTORS = '1'
 }
 if ($TexStore) {
@@ -225,8 +227,14 @@ if (-not $NoAmbient -and -not $RayTracing) {
 if ($RayTracing) {
     $settings.VICTORY_BVH_BUILDER    = '1'
     $settings.VICTORY_SKIP_PIPELINES = 'none'
+    $settings.VICTORY_SKIP_PREFIXES  = 'none'
 } else {
     $settings.VICTORY_BVH_NO_HIT     = '1'
+    if ($SkipRtAggressive) {
+        # Tier B RT skip (adds ray-binning + RaytracingResolve on top of auto Tier-A pure-BVH skips;
+        # ambient.rs hooks CS_ScreenProbes_TemporalResolve / CS_RayMiss remain immune in pipeline.rs).
+        $settings.VICTORY_SKIP_PREFIXES = 'CS_RaytracingResolve,CS_RayBudgeting_,CS_RaytraceVBuffer_,CS_ScreenProbes_TraceRays_,CS_GenerateRayCoords,CS_GenerateRayBins,CS_GenerateRayBinOffsets,CS_ClassifyRayTiles,CS_SortRayTiles,CS_ResetRayTileArgs,CS_ClearRayBins,CS_ClearRayCounts'
+    }
     if ($SkipRtHashes) {
         $rtHashesPath = Join-Path $PSScriptRoot 'rt_off_hashes.txt'
         if (Test-Path -LiteralPath $rtHashesPath) {

@@ -262,7 +262,9 @@ unsafe impl Send for Aside {}
 /// path: a tenth of a millisecond to some.
 pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
     static ASIDE: Mutex<Option<Aside>> = Mutex::new(None);
-    if !wait_resident() {
+    // Only needed when at least one submission is already in flight on the GPU
+    // and could race with a live bindless descriptor slot pointing to new memory.
+    if !wait_resident() || !flying() {
         return Ok(());
     }
     let started = std::time::Instant::now();
@@ -4400,9 +4402,9 @@ impl Host {
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
         const RESULTS: u64 = 1 << 20;
-        let differs_gpu = self.uav_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
+        let differs_gpu = self.uav_buffer_internal(RESULTS).ok_or_else(windows::core::Error::empty)?;
         name(&differs_gpu, || "card compare results (VRAM)".into());
-        let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
+        let (differs, data) = self.shared_buffer_internal(RESULTS).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
         // SAFETY: the blob's own bytes; the root signature is inside the
         // shader.
@@ -4480,7 +4482,7 @@ impl Host {
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
         for shadow in declared.iter().map(|d| &d.0).chain(looked.iter().map(|l| &l.0)) {
             if shadow.card_make_before(|size| {
-                let before = self.uav_buffer(crate::shadow::card_hash_bytes(size))?;
+                let before = self.uav_buffer_internal(crate::shadow::card_hash_bytes(size))?;
                 name(&before, || "title buffer on the card, hashes of its pieces".into());
                 Some(before)
             }) {
@@ -4717,16 +4719,30 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    // What the submission's shaders wrote, first.
-                    list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                        Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                                pResource: std::mem::ManuallyDrop::new(None),
-                            }),
-                        },
-                    }]);
+                    // What the submission's shaders wrote to the compared
+                    // buffers, first (resource-specific UAV barriers instead
+                    // of stalling the whole GPU on unrelated targets).
+                    let mut uavs: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
+                    for r in plan.ranges.iter().filter(|r| r.compared) {
+                        let raw = r.shadow.buffer.as_raw();
+                        if !uavs.iter().any(|u| {
+                            u.Anonymous.UAV.pResource.as_ref().is_some_and(|res| res.as_raw() == raw)
+                        }) {
+                            let borrowed: ID3D12Resource = std::mem::transmute_copy(&r.shadow.buffer);
+                            uavs.push(D3D12_RESOURCE_BARRIER {
+                                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                                        pResource: std::mem::ManuallyDrop::new(Some(borrowed)),
+                                    }),
+                                },
+                            });
+                        }
+                    }
+                    if !uavs.is_empty() {
+                        list.ResourceBarrier(&uavs);
+                    }
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs_gpu.GetGPUVirtualAddress());
@@ -6660,6 +6676,7 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        self.list.reset_uav_dirty();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
@@ -7051,7 +7068,9 @@ impl HostList {
 
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
-        if !dred_on() {
+        let dred = dred_on();
+        let timed = timing();
+        if !dred && !timed {
             crate::capture::op(std::ptr::from_ref(self) as usize, what);
             return;
         }
@@ -7064,12 +7083,14 @@ impl HostList {
             }
             let what = what();
             crate::capture::op(std::ptr::from_ref(self) as usize, || what.clone());
-            let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
-            const UNICODE: u32 = 0;
-            // SAFETY: an open list; the marker is copied when recorded.
-            unsafe {
-                self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
-            };
+            if dred {
+                let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
+                const UNICODE: u32 = 0;
+                // SAFETY: an open list; the marker is copied when recorded.
+                unsafe {
+                    self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
+                };
+            }
             self.notes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -7251,8 +7272,9 @@ impl HostList {
     ///
     /// shortcut: one buffer per copy; pool them once uploads are frequent.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        // With [`card_steps`] the card may be the one that fills it.
-        let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
+        // With [`card_steps`] the card may be the one that fills it; never
+        // exposed in a live bindless descriptor heap read by earlier flights.
+        let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer_internal(size)? } else { host.upload_buffer(size)? };
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);
         Some((buffer, data))
@@ -7610,7 +7632,7 @@ impl HostList {
                         copies += 1;
                     }
                     batch.fill();
-                    batch.title_written();
+                    batch.title_written_range(dst, len);
                     crate::port::copied(dst, src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
@@ -7642,7 +7664,7 @@ impl HostList {
                     let free = !touches(air, p.src, p.src + p.len) && !touches(air, p.dst, p.dst + p.len);
                     batch.fill();
                     if free {
-                        batch.title_written();
+                        batch.title_written_range(p.dst, p.len);
                     }
                     if let Some(bytes) = p.prepare(free) {
                         batch.placed.push((p.shadow.clone(), p.dst, bytes));
@@ -8239,12 +8261,24 @@ impl Batch {
         self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
     }
 
-    /// Before a step that writes title memory: pending refreshes are done
-    /// first, and textures are checked again after it.
+    /// Before a step that writes arbitrary title memory: pending refreshes are
+    /// done first, and all cached ahead-refreshes and textures are cleared.
     fn title_written(&mut self) {
         self.flush();
         self.ahead.clear();
         self.textures.clear();
+    }
+
+    /// Before a step that writes only `[dst, dst + len)` of title memory:
+    /// pending refreshes finish first, then only ahead-refreshes overlapping
+    /// `[dst, dst + len)` are evicted instead of throwing away the whole cache.
+    fn title_written_range(&mut self, dst: usize, len: usize) {
+        self.flush();
+        if len > 0 {
+            let end = dst.saturating_add(len);
+            self.ahead.retain(|_, &mut (from, to)| to <= dst || from >= end);
+            self.textures.clear();
+        }
     }
 
     /// Before the steps of `runs` ([`refresh_front`]), a new part of the
@@ -9842,7 +9876,19 @@ impl Host {
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
+    /// A CPU-visible read/write buffer in shared memory, waiting for GPUVM
+    /// page-table residency when flights are active (safe for live bindless heaps).
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.shared_buffer_with_wait(size, true)
+    }
+
+    /// As [`shared_buffer`], for internal scratch/upload/fetch buffers that are
+    /// never exposed in a live bindless heap read by earlier flights.
+    pub(crate) fn shared_buffer_internal(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.shared_buffer_with_wait(size, false)
+    }
+
+    fn shared_buffer_with_wait(&self, size: u64, wait: bool) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -9881,7 +9927,9 @@ impl Host {
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
                     resident(&self.device, b)?;
-                    mapped(&self.device)?;
+                    if wait {
+                        mapped(&self.device)?;
+                    }
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -9986,6 +10034,16 @@ impl Host {
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.uav_buffer_with_wait(size, true)
+    }
+
+    /// As [`uav_buffer`], for internal helper/hash/scratch buffers never
+    /// exposed in a live bindless heap read by earlier flights.
+    pub(crate) fn uav_buffer_internal(&self, size: u64) -> Option<ID3D12Resource> {
+        self.uav_buffer_with_wait(size, false)
+    }
+
+    fn uav_buffer_with_wait(&self, size: u64, wait: bool) -> Option<ID3D12Resource> {
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -10022,7 +10080,9 @@ impl Host {
         if let Some(b) = &buffer {
             crate::book::made(b, || "an unordered access buffer".into());
         }
-        let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device));
+        let made = made
+            .and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b)))
+            .and_then(|()| if wait { mapped(&self.device) } else { Ok(()) });
         match made {
             Ok(()) => buffer,
             Err(e) => {

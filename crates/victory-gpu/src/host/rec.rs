@@ -36,22 +36,58 @@ struct Held(Vec<D3D12_RESOURCE_BARRIER>);
 // SAFETY: borrowed interface pointers of free-threaded objects.
 unsafe impl Send for Held {}
 
-/// Since the last frame-rate line: barrier calls asked for while held, and
-/// calls made of them.
-pub(crate) static STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// Since the last frame-rate line: barrier calls asked for while held,
+/// calls made of them, and redundant global UAV barriers skipped.
+pub(crate) static STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 pub(crate) struct Rec {
     list: ID3D12GraphicsCommandList,
     any: AtomicBool,
+    /// Whether any shader/helper command on this list (or an earlier list on
+    /// the queue before reset) may have written a UAV since the last global
+    /// `UAV(NULL)` barrier. Starts `true` on creation and `reset` so cross-list
+    /// UAV writes are always ordered safely.
+    uav_dirty: AtomicBool,
     held: Mutex<Held>,
 }
 
 impl Rec {
     pub(crate) fn new(list: ID3D12GraphicsCommandList) -> Self {
-        Self { list, any: AtomicBool::new(false), held: Mutex::new(Held(Vec::new())) }
+        Self {
+            list,
+            any: AtomicBool::new(false),
+            uav_dirty: AtomicBool::new(true),
+            held: Mutex::new(Held(Vec::new())),
+        }
+    }
+
+    /// Marks that a GPU command on this list may have written a UAV (buffer or
+    /// texture image store/atomic).
+    #[inline]
+    pub(crate) fn mark_uav_dirty(&self) {
+        if !self.uav_dirty.load(Relaxed) {
+            self.uav_dirty.store(true, Relaxed);
+        }
+    }
+
+    /// Resets UAV dirty tracking on command-list reset: starts `true` so a
+    /// preceding list's unsynced UAV writes are still ordered by this list's
+    /// first barrier or indirect clamp.
+    #[inline]
+    pub(crate) fn reset_uav_dirty(&self) {
+        self.uav_dirty.store(true, Relaxed);
+    }
+
+    /// Whether a shader/helper may have written an unsynced UAV since the last
+    /// global `UAV(NULL)` barrier on this list.
+    #[inline]
+    pub(crate) fn uav_dirty(&self) -> bool {
+        self.uav_dirty.load(Relaxed)
     }
 
     /// Records `barriers` now, or holds them for the next use of the list.
+    /// Redundant global `UAV(NULL)` barriers when `!uav_dirty` (or already
+    /// queued in `held`) are elided to avoid full-GPU SM flushes.
     ///
     /// # Safety
     /// As `ResourceBarrier`'s: an open list, live resources.
@@ -64,11 +100,34 @@ impl Rec {
             if self.any.load(Relaxed) {
                 self.flush();
             }
+            if barriers.iter().any(is_global_uav) {
+                let mut filtered = Vec::with_capacity(barriers.len());
+                for b in barriers {
+                    if is_global_uav(b) {
+                        if self.uav_dirty.swap(false, Relaxed) {
+                            // SAFETY: plain copy of borrowed descriptor.
+                            filtered.push(unsafe { std::ptr::read(b) });
+                        } else {
+                            STATS[2].fetch_add(1, Relaxed);
+                        }
+                    } else {
+                        // SAFETY: plain copy of borrowed descriptor.
+                        filtered.push(unsafe { std::ptr::read(b) });
+                    }
+                }
+                if !filtered.is_empty() {
+                    // SAFETY: the caller's.
+                    unsafe { self.list.ResourceBarrier(&filtered) };
+                }
+                return;
+            }
             // SAFETY: the caller's.
             unsafe { self.list.ResourceBarrier(barriers) };
             return;
         }
         let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pushed = false;
+        let mut flushed_for_conflict = false;
         // A resource whose state changes again: what is held goes first, so
         // that no call holds two changes of one resource.
         if barriers.iter().filter_map(named).any(|r| held.0.iter().filter_map(named).any(|h| h == r)) {
@@ -76,12 +135,26 @@ impl Rec {
             unsafe { self.list.ResourceBarrier(&held.0) };
             held.0.clear();
             STATS[1].fetch_add(1, Relaxed);
+            flushed_for_conflict = true;
         }
-        // SAFETY: a plain copy of the descriptions; nothing is released
-        // through them (their pointers are borrowed, `ManuallyDrop`).
-        held.0.extend(barriers.iter().map(|b| unsafe { std::ptr::read(b) }));
-        STATS[0].fetch_add(1, Relaxed);
-        self.any.store(true, Relaxed);
+        let _ = flushed_for_conflict;
+        for b in barriers {
+            if is_global_uav(b) {
+                if !self.uav_dirty.load(Relaxed) || held.0.iter().any(is_global_uav) {
+                    STATS[2].fetch_add(1, Relaxed);
+                    continue;
+                }
+                self.uav_dirty.store(false, Relaxed);
+            }
+            // SAFETY: a plain copy of the descriptions; nothing is released
+            // through them (their pointers are borrowed, `ManuallyDrop`).
+            held.0.push(unsafe { std::ptr::read(b) });
+            pushed = true;
+        }
+        if pushed {
+            STATS[0].fetch_add(1, Relaxed);
+            self.any.store(true, Relaxed);
+        }
     }
 
     /// What is held goes to the list, in one call.
@@ -97,6 +170,13 @@ impl Rec {
         held.0.clear();
         STATS[1].fetch_add(1, Relaxed);
     }
+}
+
+/// Whether `b` is a global UAV barrier (`pResource == NULL`) waiting for every
+/// earlier shader write across the entire GPU.
+fn is_global_uav(b: &D3D12_RESOURCE_BARRIER) -> bool {
+    // SAFETY: `UAV` union field is valid when `Type == UAV`.
+    b.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV && unsafe { b.Anonymous.UAV.pResource.is_none() }
 }
 
 /// The resource a state change or aliasing names (its interface pointer).
@@ -126,10 +206,10 @@ impl std::ops::Deref for Rec {
 
 /// For the frame-rate line.
 pub(crate) fn line(frames: f64) {
-    let [asked, made] = [0, 1].map(|i| STATS[i].swap(0, Relaxed) as f64 / frames);
-    if asked > 0.0 {
+    let [asked, made, skipped] = [0, 1, 2].map(|i| STATS[i].swap(0, Relaxed) as f64 / frames);
+    if asked > 0.0 || skipped > 0.0 {
         tracing::info!(
-            "barrier calls per frame (VICTORY_JOIN_BARRIERS): {asked:.0} asked for, {made:.0} made of them"
+            "barrier calls per frame (VICTORY_JOIN_BARRIERS): {asked:.0} asked for, {made:.0} made of them ({skipped:.0} redundant global UAV waits skipped)"
         );
     }
 }

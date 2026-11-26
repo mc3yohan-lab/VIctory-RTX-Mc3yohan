@@ -424,22 +424,27 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
 
 /// [`ask_ahead`]; `held`: the caller holds everything ([`Asking::hold_all`]).
 fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
+    // The submission's one asking stands ([`ask_once`]): check *before*
+    // filtering and sorting thousands of ranges on every flush.
+    if journal().kept {
+        return;
+    }
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
-        // Not view memory known by its bits: the kernel would refuse the
-        // asking (and, asked together with others, theirs).
-        .filter(|r| r.0 < r.1 && !published(r.0, r.1))
+        // Not view memory known by its bits or protected by our guards:
+        // the kernel would refuse the asking (and, asked together with others,
+        // force recursive bisection).
+        .filter(|r| {
+            r.0 < r.1
+                && !published(r.0, r.1)
+                && !(light() && PROTECTED.any(r.0 / PAGE, r.1.div_ceil(PAGE)))
+        })
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
     if pieces.len() < 2 {
         return;
     }
     pieces.sort_unstable();
-    // The submission's one asking stands ([`ask_once`]): what it does not
-    // hold is left to `writes`.
-    if journal().kept {
-        return;
-    }
     let _all = (!held).then(Asking::hold_all);
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut runs = Vec::new();
@@ -843,10 +848,17 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_with_kind(start, end, guarded).map(|(now, pages, _)| (now, pages))
+}
+
+/// As [`writes`], also returning `true` when the range was answered via view
+/// guards/published bits rather than `GetWriteWatch`, so callers never
+/// misclassify view memory with resting blocks or holes as write-watched.
+pub(crate) fn writes_with_kind(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>, bool)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
     // Asked ahead with the submission's other ranges: the journal has it.
-    let ahead = |j: &Journal| j.ahead.holds(first, last).then(|| (j.ahead_asked, of(j)));
+    let ahead = |j: &Journal| j.ahead.holds(first, last).then(|| (j.ahead_asked, of(j), false));
     if let Some(known) = ahead(&journal()) {
         return Some(known);
     }
@@ -858,7 +870,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             crate::faultbook::note(crate::faultbook::What::Known, first, last, 0);
         }
         let j = journal();
-        return Some((next_asking(), of(&j)));
+        return Some((next_asking(), of(&j), true));
     }
     // Asked, and the answer noted, with the range held: nothing else asks
     // about any of it in between.
@@ -896,7 +908,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     if pages.is_empty() {
         // Nothing to note: the others may go on reading.
         let j = journal();
-        return Some((next_asking(), of(&j)));
+        return Some((next_asking(), of(&j), guards_asked));
     }
     let answer = {
         let mut j = journal_mut();
@@ -904,7 +916,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         for &(page, parts) in &pages {
             j.note(page, parts, now);
         }
-        (now, of(&j))
+        (now, of(&j), guards_asked)
     };
     // Noted: what the guards made clean of it is known by its bits from
     // now on. (The range is still held: no other asking of any of it came

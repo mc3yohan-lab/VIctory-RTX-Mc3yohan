@@ -67,6 +67,11 @@ pub(crate) struct Shader {
     /// Its part in the light probe (`crate::lightprobe`).
     #[cfg(windows)]
     pub(crate) probe: Option<crate::lightprobe::Role>,
+    /// Whether this shader's embedded name matched `VICTORY_SKIP_PREFIXES`
+    /// (or automatic pure-BVH skips under `VICTORY_BVH_NO_HIT=1`). Never true
+    /// for shaders with an `ambient::Role` so interior lighting hooks stay safe.
+    #[cfg(windows)]
+    skip_name: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -113,14 +118,20 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(windows)]
+            let ambient = (stage == "compute").then(|| crate::ambient::role(bytes)).flatten();
+            #[cfg(windows)]
+            let skip_name = ambient.is_none() && matches_skip_prefix(bytes);
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
-                ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
+                ambient,
                 #[cfg(windows)]
                 probe: crate::lightprobe::on().then(|| crate::lightprobe::role(bytes)).flatten(),
+                #[cfg(windows)]
+                skip_name,
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
@@ -139,6 +150,10 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether the shader's code can store to *any* UAV (buffer, image/texture
+    /// `Mimg`, scalar, flat, or global store/atomic). Used by command-list
+    /// `uav_dirty` tracking so image-only UAV writers are always ordered.
+    pub(crate) stores_uav: bool,
     /// Whether it can store through raw addresses ([`stores_by_address`]).
     pub(crate) stores_by_address: bool,
     /// Whether it stores through a view it picks from the heap by an index,
@@ -216,6 +231,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let stores_uav = stores || programs.iter().any(stores_image);
     let threads = programs.iter().find_map(|p| match &p.io {
         victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
         _ => None,
@@ -238,6 +254,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         used,
         tables,
         stores,
+        stores_uav,
         stores_by_address,
         picks: Default::default(),
     })
@@ -397,6 +414,19 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
     })
 }
 
+/// Whether a console program can store/atomic to image/texture UAVs (`Mimg`).
+#[cfg(windows)]
+fn stores_image(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        i.encoding == Encoding::Mimg
+            && i.name().is_none_or(|n| n.contains("store") || n.contains("atomic"))
+    })
+}
+
 /// Whether a console program can store to memory through raw addresses
 /// (`crate::memory`): a flat or global store or atomic, or code that does
 /// not decode. The programs that only walk ray-tracing structures do not,
@@ -516,8 +546,70 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// Name prefixes for `VICTORY_SKIP_PREFIXES` (comma-separated ASCII substrings
+/// matched once at shader creation). When `VICTORY_BVH_NO_HIT=1` (and
+/// `VICTORY_SKIP_PREFIXES` is not set to `none`), Tier-A pure-BVH shadow and
+/// raytraced-collision passes that always miss under no-hit are auto-skipped.
+/// Shaders with an `ambient::Role` are always immune.
+#[cfg(windows)]
+fn skip_prefixes() -> &'static [Vec<u8>] {
+    static PREFIXES: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
+    PREFIXES.get_or_init(|| {
+        const TIER_A_NO_HIT: &[&str] = &[
+            "CS_RTDistantShadow",
+            "CS_RTShadowTrace32",
+            "CS_SetRTShadowsIndirectArgs",
+            "CS_GenerateShadowMasks_Raytraced",
+            "CS_RaytraceShadows_",
+            "CS_TraceShadowRays_",
+            "CS_LaserLightShadowRaytracing",
+            "CS_CollisionRaytraced",
+            "CS_ShadowTileBalanceRTCost",
+        ];
+        let env = std::env::var("VICTORY_SKIP_PREFIXES").unwrap_or_default();
+        let trimmed = env.trim();
+        if trimmed.eq_ignore_ascii_case("none") || trimmed == "0" {
+            return Vec::new();
+        }
+        let mut out: Vec<Vec<u8>> = trimmed
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none"))
+            .map(|s| s.as_bytes().to_vec())
+            .collect();
+        let no_hit = std::env::var_os("VICTORY_BVH_NO_HIT").is_some_and(|v| v == "1")
+            && !std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        if no_hit {
+            for p in TIER_A_NO_HIT {
+                let b = p.as_bytes();
+                if !out.iter().any(|e| e.as_slice() == b) {
+                    out.push(b.to_vec());
+                }
+            }
+        }
+        if !out.is_empty() {
+            tracing::info!(count = out.len(), "shader name prefixes skipped (VICTORY_SKIP_PREFIXES)");
+        }
+        out
+    })
+}
+
+#[cfg(windows)]
+fn matches_skip_prefix(container: &[u8]) -> bool {
+    let prefixes = skip_prefixes();
+    if prefixes.is_empty() {
+        return false;
+    }
+    prefixes
+        .iter()
+        .any(|pat| container.windows(pat.len()).any(|w| w == pat.as_slice()))
+}
+
 #[cfg(windows)]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
+    if let Some(shader) = p.shaders.iter().find(|shader| shader.skip_name) {
+        return Some(shader.hash.as_str());
+    }
     static HASHES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();

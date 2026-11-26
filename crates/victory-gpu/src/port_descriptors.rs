@@ -300,16 +300,16 @@ pub(crate) fn missed(index: u32, handle: u64, view: bool, tabled: bool) {
         CHECKED[2].fetch_add(1, Relaxed);
         return;
     }
-    if tabled {
-        // A draw read it through a table lately: the draw makes it anyway.
-        CHECKED[5].fetch_add(1, Relaxed);
-    }
     let adopted = ADOPTED.read().unwrap_or_else(|e| e.into_inner());
     let Some(a) = adopted.as_ref() else { return };
     if marked(a, index) {
         // Told, not taken yet.
         CHECKED[3].fetch_add(1, Relaxed);
         return;
+    }
+    if tabled {
+        // A draw read it through a table lately: the draw makes it anyway.
+        CHECKED[5].fetch_add(1, Relaxed);
     }
     let n = CHECKED[1].fetch_add(1, Relaxed);
     MISSED_ALL.fetch_add(1, Relaxed);
