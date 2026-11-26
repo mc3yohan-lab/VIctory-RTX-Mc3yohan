@@ -14,16 +14,19 @@
 #   coalesced VirtualProtect, warm host-pipelines.bin.
 #
 # Usage:
-#   scripts\play-nvidia.ps1                        # Series X 1440p + Patch 1 (fast textures, ambient settle, 0 indirect drops)
+#   scripts\play-nvidia.ps1                        # Series X 1440p (2560x1440 internal) + ReBAR VRAM windows + Patch 1
 #   scripts\play-nvidia.ps1 -Fps 60                # Unlock 30 FPS cap to 60 FPS (game clock stays 1.00x)
+#   scripts\play-nvidia.ps1 -Scale 0.5 -Fps 60     # Series X 1080p internal (0.5 * 4K, -44% pixels) + temporal upscaler
+#   scripts\play-nvidia.ps1 -Scale 0.6 -Fps 60     # Series X 1296p internal (0.6 * 4K, -19% pixels) + temporal upscaler
+#   scripts\play-nvidia.ps1 -SmoothMotion          # Launches victory_sm.exe for NVIDIA App Smooth Motion (2x visual FPS)
+#   scripts\play-nvidia.ps1 -GpuTiming             # 15s diag profiling: exact GPU ms per pass & top-40 shaders + memory breakdown
+#   scripts\play-nvidia.ps1 -SendBar               # Put submission upload memory in VRAM via ReBAR (cuts GPU copy ms)
 #   scripts\play-nvidia.ps1 -TexStore              # Enable disk cache of sharp mip levels (faster texture streaming on revisits)
 #   scripts\play-nvidia.ps1 -RayTracing            # Test real Wave32 NVIDIA Ray Tracing + exact cascade shadows
 #   scripts\play-nvidia.ps1 -SeriesS               # Series S 1080p + 4K sharp HUD @ 720p internal (0.667)
-#   scripts\play-nvidia.ps1 -Scale 0.75            # Series X 1440p @ 75% internal + temporal upscaler
-#   scripts\play-nvidia.ps1 -SmoothMotion          # Launches victory_sm.exe for NVIDIA App Smooth Motion (2x visual FPS)
 #   scripts\play-nvidia.ps1 -WaitTextures          # Sets VICTORY_TEXTURE_NO_WAIT=0 (slower streaming, avoids partial BCn blocks)
 #   scripts\play-nvidia.ps1 -SkipRtHashes          # Diagnostic only: skips 1,034 rt_off_hashes (kills indoor voxel bounce GI)
-#   scripts\play-nvidia.ps1 -PortDescriptors       # Renderer Patch 2 (11/11 title descriptor store sites hooked + race fixed)
+#   scripts\play-nvidia.ps1 -PortDescriptors       # Renderer Patch 2 (opt-in; still misses some title writers -> slower texlate)
 #   scripts\play-nvidia.ps1 -NoPortConstants       # Disable Renderer Patch 1 (VICTORY_PORT_CONSTANTS)
 #   scripts\play-nvidia.ps1 -UpQueue               # Experimental dedicated D3D12 copy queue + joined barriers
 #   scripts\play-nvidia.ps1 -SweepPerHeap          # Coolfox per-heap buffer pass (VICTORY_SWEEP_PER_HEAP=1)
@@ -51,11 +54,16 @@ param(
     [switch]$UpQueue,
     [switch]$SweepPerHeap,
     [switch]$XmaRefill,
+    [switch]$SendBar,
+    [switch]$Residency,
+    [switch]$GpuTiming,
     [switch]$Quality,
     [switch]$Safe,
     [switch]$RayTracing,
     [switch]$SmoothMotion,
     [switch]$WideShaderOpt,
+    [int]$WindowsBarMb = 4096,
+    [int]$WindowKb = 256,
     [int]$CardBuffersMinKb = 64,
     [int]$DynamicSlots = 393216,
     [switch]$RecordPipelines,
@@ -68,8 +76,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-if ($Panel -and $Build -eq 'release') {
-    Write-Host "Note: -Panel requires the 'diag' build; switching Build -> diag."
+if (($Panel -or $GpuTiming) -and $Build -eq 'release') {
+    Write-Host "Note: -Panel / -GpuTiming require the 'diag' build; switching Build -> diag."
     $Build = 'diag'
 }
 
@@ -85,13 +93,13 @@ try {
 } catch {}
 
 $settings = @{
-    # --- Core fast path (avatarmanz latest + Korinocho perf set) ---
-    # NO_WAIT=1 keeps texture streaming at ~0.6-1.4 ms/frame (NO_WAIT=0 caused 50-377 ms stalls);
-    # SHOW_NEW_LATER=1 + FAIR_DUE=1 prevent pooled-slot corruption without stalling the stream.
+    # --- Core fast path (avatarmanz latest + RTX 4090 ReBAR tuning) ---
+    # NO_WAIT=1 keeps texture streaming non-blocking; 25 ms stage + CATCHUP=1 + 12 ms early
+    # drain scene-entry backlogs without 250 ms hitches or perpetually missing textures.
     VICTORY_TEXTURE_NO_WAIT     = $(if ($WaitTextures) { '0' } else { '1' })
-    VICTORY_TEXTURE_STAGE_MS    = '8'
-    VICTORY_TEXTURE_CATCHUP     = '0'
-    VICTORY_EARLY_TEXTURES_MS   = '3'
+    VICTORY_TEXTURE_STAGE_MS    = '25'
+    VICTORY_TEXTURE_CATCHUP     = '1'
+    VICTORY_EARLY_TEXTURES_MS   = '12'
     VICTORY_BAKE_EXACT          = '1'
     VICTORY_BAKE_SOURCES        = '1'
     VICTORY_FAIR_DUE            = '1'
@@ -153,6 +161,24 @@ if ($TexStore) {
 if ($CardBuffersMinKb -gt 0) {
     $settings.VICTORY_CARD_BUFFERS_MIN_KB = "$CardBuffersMinKb"
 }
+if ($WindowsBarMb -gt 0 -and -not $Safe) {
+    # Resizable BAR (D3D12_HEAP_TYPE_GPU_UPLOAD): moves loose vertex/index/mesh windows
+    # from 25 GB/s L0 System RAM into 1,008 GB/s GDDR6X VRAM (auto-caps at 80% VRAM budget).
+    $settings.VICTORY_WINDOWS_BAR_MB = "$WindowsBarMb"
+}
+if ($WindowKb -gt 0 -and -not $Safe) {
+    $settings.VICTORY_WINDOW_KB = "$WindowKb"
+}
+if ($SendBar -and -not $Safe) {
+    $settings.VICTORY_SEND_BAR = '1'
+}
+if ($Residency) {
+    $settings.VICTORY_RESIDENCY = '1'
+}
+if ($GpuTiming) {
+    $settings.VICTORY_GPU_TIMING        = '1'
+    $settings.VICTORY_MEMORY_CATEGORIES = '1'
+}
 if ($UpQueue) {
     $settings.VICTORY_UP_QUEUE      = '1'
     $settings.VICTORY_JOIN_BARRIERS = '1'
@@ -189,10 +215,11 @@ if ($Quality) {
 }
 
 if (-not $NoAmbient -and -not $RayTracing) {
-    $settings.VICTORY_AMBIENT      = '0.8'
-    $settings.VICTORY_AMBIENT_AIR  = '1.5'
-    $settings.VICTORY_AMBIENT_MOST = '2'
-    $settings.VICTORY_AMBIENT_REFL = '2.0'
+    $settings.VICTORY_AMBIENT       = '1.0'
+    $settings.VICTORY_AMBIENT_AIR   = '1.5'
+    $settings.VICTORY_AMBIENT_MOST  = '3.0'
+    $settings.VICTORY_AMBIENT_SHADE = '0.7,0.5'
+    $settings.VICTORY_AMBIENT_REFL  = '2.0'
 }
 
 if ($RayTracing) {
@@ -222,7 +249,14 @@ if ($SeriesS) {
 }
 
 if ($Scale -gt 0.0) {
-    $clamped = [math]::Min(1.0, [math]::Max(0.2, $Scale))
+    # Both console profiles allocate their fixed RT pool for default 2/3 scale
+    # (Series X: 2/3 * 3840x2160 = 2560x1440; Series S: 2/3 * 1920x1080 = 1280x720).
+    # Values > 0.667 overflow the title's RT allocator pool and hit int3 at +0x2219650.
+    if ($Scale -gt 0.667) {
+        Write-Warning ("Scale {0} exceeds console RT pool max (0.667 = 2560x1440 on Series X; use -Scale 0.5 for 1920x1080 or -Scale 0.6 for 2304x1296). Clamping to 0.667." -f $Scale)
+        $Scale = 0.667
+    }
+    $clamped = [math]::Min(0.667, [math]::Max(0.2, $Scale))
     $settings.VICTORY_RENDER_SCALE = ('{0:0.###}' -f $clamped).Replace(',', '.')
     $settings.VICTORY_OWN_UPSCALER = '1'
 }

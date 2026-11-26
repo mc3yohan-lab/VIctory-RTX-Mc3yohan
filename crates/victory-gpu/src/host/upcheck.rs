@@ -541,7 +541,7 @@ fn look(host: &Host) -> Option<u64> {
             list.SetComputeRootUnorderedAccessView(3, found.GetGPUVirtualAddress());
             let mut bound = 0;
             for (i, (shadow, at, n)) in pieces.iter().enumerate() {
-                let Some((staging, ..)) = shadow.card_sides() else {
+                let Some((Some(staging), ..)) = shadow.card_sides() else {
                     continue;
                 };
                 if bound != shadow.id() {

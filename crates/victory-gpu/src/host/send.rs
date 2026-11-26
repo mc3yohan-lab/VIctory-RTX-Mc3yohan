@@ -105,6 +105,12 @@ fn pass(host: &Host) -> Option<&'static Pass> {
     .as_ref()
 }
 
+/// Whether `send::take` can service submissions via its own upload memory and
+/// scatter pass (so `Card` copies do not need a per-buffer D3D12 L0 staging resource).
+pub(super) fn ready(host: &Host) -> bool {
+    own() && pass(host).is_some()
+}
+
 /// Memory a submission's sends come from, mapped.
 pub(super) struct Memory {
     buffer: ID3D12Resource,

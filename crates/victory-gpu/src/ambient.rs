@@ -453,13 +453,16 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float3 was = unpack(light[p]);
     float left = dot(was, LUMA);
     // Once radiance cells are initialized (`cells[CELLS].a > 0`), always bound
-    // `was` by `found_luma * bound` even inside concave creases (`open -> 0`),
-    // so recessed eye sockets clamp missed sky irradiance to dark shadow rather
-    // than skipping the clamp and passing raw outdoor sky onto the sclera.
+    // `was` even inside concave creases (`open -> 0`), while flooring the upper
+    // cap base at 15% of room radiance so indoor corners/bunks keep soft
+    // shading without collapsing to pitch black, and recessed eye sockets still
+    // clamp raw outdoor sky leaks (>10x room) cleanly.
     float found_luma = dot(found, LUMA);
     if (cells[CELLS].a > 0.0) {
         float bound = fresh > 0.0 ? lerp(1.0, most, saturate(cells[CELLS].a / fresh)) : most;
-        float top = max(found_luma * bound, 0.0);
+        float room_luma = dot(cells[CELLS].rgb, LUMA);
+        float cap_base = max(found_luma, 0.15 * level * room_luma);
+        float top = max(cap_base * bound, 0.0);
         float has = dot(was, LUMA);
         was *= min(1.0, top / max(has, 1e-9));
     }
@@ -561,9 +564,22 @@ pub(crate) fn probe_buffers() -> Option<(ID3D12Resource, ID3D12Resource)> {
     pass().map(|p| (p.stats.clone(), p.cells.clone()))
 }
 
-fn uav_barrier(list: &ID3D12GraphicsCommandList) {
-    let barrier = D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, ..Default::default() };
-    // SAFETY: an open list; the barrier names no resource.
+fn uav_barrier(list: &ID3D12GraphicsCommandList, resource: Option<&ID3D12Resource>) {
+    let borrowed = match resource {
+        // SAFETY: `r` stays live through `ResourceBarrier`; `ManuallyDrop` skips `Release`.
+        Some(r) => Some(unsafe { std::mem::transmute_copy::<ID3D12Resource, ID3D12Resource>(r) }),
+        None => None,
+    };
+    let barrier = D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: std::mem::ManuallyDrop::new(borrowed),
+            }),
+        },
+    };
+    // SAFETY: an open list; any named resource stays live across the call.
     unsafe { list.ResourceBarrier(&[barrier]) };
 }
 
@@ -649,7 +665,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     // program has just used both views, so their textures are in the states
     // these views need; buffers the list keeps.
     unsafe {
-        uav_barrier(l);
+        uav_barrier(l, None);
         l.SetComputeRootSignature(&pass.root);
         l.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
@@ -657,25 +673,25 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(5, pass.stats.GetGPUVirtualAddress());
-        let run = |pso: &ID3D12PipelineState, x, y, z| {
+        let run = |pso: &ID3D12PipelineState, x, y, z, res: Option<&ID3D12Resource>| {
             l.SetPipelineState(pso);
             l.Dispatch(x, y, z);
-            uav_barrier(l);
+            uav_barrier(l, res);
         };
         match role {
             Role::Radiance => {
-                run(&pass.keep, 8, 9, 1);
-                run(&pass.mean, 1, 1, 1);
+                run(&pass.keep, 8, 9, 1, Some(&pass.cells));
+                run(&pass.mean, 1, 1, 1, Some(&pass.cells));
                 KEPT.store(true, Ordering::Relaxed);
             }
-            Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
-            Role::RayMiss => run(&pass.refl, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1),
+            Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2), None),
+            Role::RayMiss => run(&pass.refl, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1, None),
             Role::Resolve => {
                 if constant == 0.0 {
-                    run(&pass.place, 8, 9, 1);
-                    run(&pass.gather, 20, 45, 1);
+                    run(&pass.place, 8, 9, 1, Some(&pass.cells));
+                    run(&pass.gather, 20, 45, 1, Some(&pass.points));
                 }
-                run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+                run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1, None);
             }
         }
     }

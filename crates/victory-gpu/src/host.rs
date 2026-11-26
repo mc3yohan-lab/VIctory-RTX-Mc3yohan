@@ -2119,8 +2119,11 @@ struct CardWork {
     fetch: Prelude,
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
-    /// One dword per piece compared, odd where the piece differs: PC
-    /// memory, mapped (buffer, mapping, bytes).
+    /// One dword per piece compared, odd where the piece differs: VRAM UAV
+    /// written by `CARD_COMPARE` (avoids per-group PCIe writes) and copied
+    /// back in one burst to `differs`.
+    differs_gpu: ID3D12Resource,
+    /// CPU-readable copy of `differs_gpu`: PC memory, mapped (buffer, mapping, bytes).
     differs: (ID3D12Resource, usize, u64),
     /// Where the pieces that differ are fetched to: PC memory, mapped.
     fetched: Option<(ID3D12Resource, usize, u64)>,
@@ -2211,13 +2214,18 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
     }
     parts[thread] = h;
     GroupMemoryBarrierWithGroupSync();
+    // 6-step parallel tree reduction (matching `torn::finish`), cutting the
+    // serial thread-0 reduction tail from 63 dependent steps to 6.
+    [unroll]
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (thread < s) {
+            uint4 x = (parts[thread] ^ parts[thread + s]) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+            parts[thread] = x.yzwx ^ (x >> 15);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
     if (thread != 0u) return;
     h = parts[0];
-    [loop]
-    for (uint i = 1u; i < 64u; ++i) {
-        h = (h ^ parts[i]) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-        h = h.yzwx ^ (h >> 15);
-    }
     if (compare != 0u) {
         // The flag, and above it 31 bits of the hash (`torn`).
         uint folded = h.x ^ (h.y * 3u) ^ (h.z * 5u) ^ (h.w * 7u);
@@ -4356,6 +4364,16 @@ impl Host {
         })
     }
 
+    /// Whether `Card` copies can keep their CPU side in plain OS RAM instead of
+    /// a D3D12 L0 `shared_buffer` (saves ~1.1 GB WDDM Shared GPU Memory and
+    /// ~3,700 residency allocations when `VICTORY_SEND_OWN=1` and `upcheck` is off).
+    /// Opt-out: `VICTORY_CARD_GPU_STAGING=1`.
+    pub(crate) fn card_ram_staging(&self) -> bool {
+        static GPU_ONLY: OnceLock<bool> = OnceLock::new();
+        let force_gpu = *GPU_ONLY.get_or_init(|| std::env::var_os("VICTORY_CARD_GPU_STAGING").is_some_and(|v| v == "1"));
+        !force_gpu && !upcheck::on() && send::ready(self)
+    }
+
     fn make_card_work(&self) -> windows::core::Result<CardWork> {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -4382,6 +4400,8 @@ impl Host {
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
         const RESULTS: u64 = 1 << 20;
+        let differs_gpu = self.uav_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
+        name(&differs_gpu, || "card compare results (VRAM)".into());
         let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
         // SAFETY: the blob's own bytes; the root signature is inside the
@@ -4405,6 +4425,7 @@ impl Host {
                 fetch: list()?,
                 root,
                 pso,
+                differs_gpu,
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
                 taken: 0,
@@ -4515,7 +4536,7 @@ impl Host {
                         let sides: Vec<_> = dirty.iter().map(|(shadow, _)| shadow.card_sides()).collect();
                         let mut ranges: Vec<upq::Range<'_>> = Vec::new();
                         for ((shadow, rs), side) in dirty.iter().zip(&sides) {
-                            if let Some((staging, _, _)) = side {
+                            if let Some((Some(staging), _, _)) = side {
                                 ranges.extend(rs.iter().map(|&(a, b)| (&shadow.buffer, a as u64, *staging, (b - a) as u64)));
                             }
                         }
@@ -4528,7 +4549,9 @@ impl Host {
                         let Some((staging, before, _)) = shadow.card_sides() else {
                             continue;
                         };
-                        if own.is_none() && up.is_none() {
+                        if own.is_none() && up.is_none()
+                            && let Some(staging) = staging
+                        {
                             for &(a, b) in ranges {
                                 list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
                             }
@@ -4557,7 +4580,7 @@ impl Host {
                     }
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
-                    list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    list.SetComputeRootUnorderedAccessView(3, work.differs_gpu.GetGPUVirtualAddress());
                     for (shadow, ranges) in &dirty {
                         let (Some((_, Some(before), _)), size) = (shadow.card_sides(), shadow.card_hash_size()) else {
                             continue;
@@ -4616,7 +4639,8 @@ impl Host {
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
-        let mut at = work.taken;
+        let start_at = work.taken;
+        let mut at = start_at;
         for (shadow, ranges) in &declared {
             let mut sorted = ranges.clone();
             sorted.sort_unstable();
@@ -4705,7 +4729,7 @@ impl Host {
                     }]);
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
-                    list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    list.SetComputeRootUnorderedAccessView(3, work.differs_gpu.GetGPUVirtualAddress());
                     for r in plan.ranges.iter().filter(|r| r.compared) {
                         let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
                             continue;
@@ -4716,6 +4740,25 @@ impl Host {
                         // changed there is the next declared range's to land.)
                         card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                    }
+                    if at > start_at {
+                        list.ResourceBarrier(&[transition(
+                            &work.differs_gpu,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        )]);
+                        list.CopyBufferRegion(
+                            &work.differs.0,
+                            u64::from(start_at) * 4,
+                            &work.differs_gpu,
+                            u64::from(start_at) * 4,
+                            u64::from(at - start_at) * 4,
+                        );
+                        list.ResourceBarrier(&[transition(
+                            &work.differs_gpu,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        )]);
                     }
                     list.Close()?;
                     list.cast()
