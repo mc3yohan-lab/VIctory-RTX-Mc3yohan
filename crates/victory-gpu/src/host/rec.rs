@@ -77,9 +77,25 @@ impl Rec {
             held.0.clear();
             STATS[1].fetch_add(1, Relaxed);
         }
-        // SAFETY: a plain copy of the descriptions; nothing is released
-        // through them (their pointers are borrowed, `ManuallyDrop`).
-        held.0.extend(barriers.iter().map(|b| unsafe { std::ptr::read(b) }));
+        // Deduplicate back-to-back global NULL UAV barriers within the same
+        // pending batch (zero GPU commands between them — semantically identical).
+        for b in barriers {
+            let is_null_uav = b.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV
+                // SAFETY: `Type == UAV` selects the `UAV` union variant.
+                && unsafe { b.Anonymous.UAV.pResource.is_none() };
+            if is_null_uav
+                && held.0.last().is_some_and(|prev| {
+                    prev.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV
+                        // SAFETY: `Type == UAV` selects the `UAV` union variant.
+                        && unsafe { prev.Anonymous.UAV.pResource.is_none() }
+                })
+            {
+                continue;
+            }
+            // SAFETY: a plain copy of the descriptions; nothing is released
+            // through them (their pointers are borrowed, `ManuallyDrop`).
+            held.0.push(unsafe { std::ptr::read(b) });
+        }
         STATS[0].fetch_add(1, Relaxed);
         self.any.store(true, Relaxed);
     }

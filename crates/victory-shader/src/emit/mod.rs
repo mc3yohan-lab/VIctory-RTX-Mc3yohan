@@ -614,6 +614,22 @@ pub fn emit(
             if !local_on || exact_only {
                 continue;
             }
+            // When the program has zero barriers and zero LDS ops (e.g.
+            // `CS_Prop_BatchCull`), early-outs (`s_cbranch_execz -> s_endpgm`)
+            // cannot deadlock any group barrier on NVIDIA: try original `p`
+            // BEFORE `without_early_outs` so culled waves exit immediately.
+            let barrier_free = p.blocks.iter().all(|b| {
+                b.insts.iter().all(|i| {
+                    i.name() != "s_barrier" && !matches!(i.fields, crate::gfx10::Fields::Ds { .. })
+                })
+            });
+            if barrier_free && idiom(p, st) == exact {
+                let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
+                report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
+                if done(&local) {
+                    return local.map(|(shader, _)| shader);
+                }
+            }
             for (name, f) in &forms {
                 if let Some((p, st, io, res)) = f
                     && idiom(p, st) == exact
@@ -625,7 +641,7 @@ pub fn emit(
                     }
                 }
             }
-            if idiom(p, st) == exact {
+            if !barrier_free && idiom(p, st) == exact {
                 let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                 report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
                 if done(&local) {

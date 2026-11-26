@@ -1806,7 +1806,12 @@ impl HostHeap {
                 // The strides, then the views' title addresses
                 // (`victory_shader::emit::VIEW_ADDRESSES`).
                 let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_BYTES);
-                let (buffer, data) = host.upload_buffer(bytes)?;
+                // Prefer ReBAR VRAM (`D3D12_HEAP_TYPE_GPU_UPLOAD`) over PCIe L0 System RAM:
+                // the CPU only writes this table on descriptor updates, while every bindless
+                // shader reads it on the GPU.
+                let (buffer, data) = host
+                    .mapped_card_buffer(bytes, false)
+                    .or_else(|| host.upload_buffer(bytes))?;
                 // SAFETY: the buffer's whole mapping; a live buffer.
                 let gpu = unsafe {
                     std::ptr::write_bytes(data, 0, bytes as usize);
@@ -3296,23 +3301,29 @@ impl HostHeap {
         if crate::port_cbv::on() && self.raw == 0 {
             // NVIDIA 1M view heap (no raw twins): translated shaders read
             // table constant buffers as raw byte-address SRVs in place.
-            if desc.SizeInBytes > 0 {
-                // SAFETY: a live buffer that holds the range.
-                let first = (gpu - unsafe { buffer.GetGPUVirtualAddress() }) / 4;
+            // SAFETY: a live buffer.
+            let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
+            let span = gpu.checked_sub(base).and_then(|offset| {
+                (offset < width && offset.is_multiple_of(4)).then(|| {
+                    let bytes = u64::from(desc.SizeInBytes).min(width - offset) & !3;
+                    (offset, bytes)
+                })
+            });
+            if let Some((offset, bytes)) = span.filter(|&(_, b)| b > 0) {
                 let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
                     Format: DXGI_FORMAT_R32_TYPELESS,
                     ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
                     Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                     Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                         Buffer: D3D12_BUFFER_SRV {
-                            FirstElement: first,
-                            NumElements: desc.SizeInBytes / 4,
+                            FirstElement: offset / 4,
+                            NumElements: (bytes / 4) as u32,
                             StructureByteStride: 0,
                             Flags: D3D12_BUFFER_SRV_FLAG_RAW,
                         },
                     },
                 };
-                // SAFETY: a slot of our heap; the memory is the caller's.
+                // SAFETY: a slot of our heap; the range lies inside the live buffer.
                 unsafe { host.device.CreateShaderResourceView(buffer, Some(&raw), self.at(index)) };
             } else {
                 null_buffer_view(self.at(index));

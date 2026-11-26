@@ -67,7 +67,7 @@ param(
     [switch]$RayTracing,
     [switch]$SmoothMotion,
     [switch]$WideShaderOpt,
-    [int]$WindowsBarMb = 4096,
+    [int]$WindowsBarMb = 8192,
     [int]$WindowKb = 4096,
     [int]$CardBuffersMinKb = 64,
     [int]$DynamicSlots = 393216,

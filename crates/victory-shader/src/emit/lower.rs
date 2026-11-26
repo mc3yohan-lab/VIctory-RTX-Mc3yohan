@@ -1149,29 +1149,16 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
         }
     }
     // A region that reads and writes LDS is still taken when either:
-    // - every access is the same commuting integer reduction with no value
-    //   returned (the final value at each address does not depend on which
-    //   half runs first; a minimum followed by an add does, and is refused), or
+    // - every access is a commuting non-returning integer atomic, and either all
+    //   ops share one opcode or distinct opcodes target provably disjoint constant
+    //   LDS addresses (so the final value at each word does not depend on which
+    //   half runs first; e.g. `ds_min_u32` at 0 + `ds_or_b32` at 4 commutes, while
+    //   `ds_min_u32` + `ds_add_u32` at the same address does not), or
     // - it only raises flags (`lds_flag_region`).
     let flags_on = std::env::var_os("VICTORY_LDS_FLAGS").is_none_or(|v| v != "0");
     for r in (0..n).filter(|&r| reads[r] && writes[r]).collect::<Vec<_>>() {
         let blocks: Vec<usize> = (0..n).filter(|&b| !all[b] && find(&mut region, b) == r).collect();
-        let mut ops = blocks.iter().flat_map(|&b| p.blocks[b].insts.iter().filter_map(lds_op));
-        if let Some(op) = ops.next()
-            && matches!(
-                op,
-                "ds_add_u32"
-                    | "ds_sub_u32"
-                    | "ds_and_b32"
-                    | "ds_or_b32"
-                    | "ds_xor_b32"
-                    | "ds_min_i32"
-                    | "ds_max_i32"
-                    | "ds_min_u32"
-                    | "ds_max_u32"
-            )
-            && ops.all(|next| next == op)
-        {
+        if lds_commuting_atomics_region(p, st, &blocks) {
             continue;
         }
         if !(flags_on && lds_flag_region(p, st, &blocks)) {
@@ -1191,6 +1178,137 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
         }
     }
     Some(meet)
+}
+
+/// Whether every LDS access in `blocks` is a commuting, non-returning 32-bit
+/// integer atomic and either every access uses the same opcode or every access
+/// targets a provably constant byte offset where each distinct offset only
+/// receives one opcode (so both Wave32 halves commute without per-op barriers).
+fn lds_commuting_atomics_region(p: &Program, st: &Structured, blocks: &[usize]) -> bool {
+    let is_commuting = |name: &str| {
+        matches!(
+            name,
+            "ds_add_u32"
+                | "ds_sub_u32"
+                | "ds_and_b32"
+                | "ds_or_b32"
+                | "ds_xor_b32"
+                | "ds_min_i32"
+                | "ds_max_i32"
+                | "ds_min_u32"
+                | "ds_max_u32"
+        )
+    };
+    let mut accesses: Vec<(usize, usize, &str)> = Vec::new();
+    for &b in blocks {
+        for (i, inst) in p.blocks[b].insts.iter().enumerate() {
+            let name = inst.name();
+            if !matches!(inst.fields, Fields::Ds { .. })
+                || name.starts_with("ds_swizzle")
+                || name.contains("permute")
+            {
+                continue;
+            }
+            if !is_commuting(name) || !inst.writes.is_empty() {
+                return false;
+            }
+            if let Fields::Ds { gds: true, .. } = inst.fields {
+                return false;
+            }
+            accesses.push((b, i, name));
+        }
+    }
+    let Some(&(_, _, first_op)) = accesses.first() else {
+        return false;
+    };
+    if accesses.iter().all(|&(_, _, op)| op == first_op) {
+        return true;
+    }
+    // Distinct commuting opcodes: safe iff every access resolves to a constant
+    // LDS byte offset and every offset only ever receives one commuting opcode.
+    let mut def: HashMap<Value, (usize, usize)> = HashMap::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            for &(_, v) in &inst.writes {
+                def.insert(v, (b, i));
+            }
+        }
+    }
+    let inline = |op: &Operand| -> Option<u32> {
+        match *op {
+            Operand::Const(c @ 128..=192) => Some(u32::from(c) - 128),
+            Operand::Const(c @ 193..=208) => Some((-(i32::from(c) - 192)) as u32),
+            Operand::Literal(x) => Some(x),
+            _ => None,
+        }
+    };
+    let resolve_base = |v: Value, b: usize, i: usize| -> Option<u32> {
+        let &(db, di) = def.get(&v)?;
+        let def_inst = &p.blocks[db].insts[di];
+        let guard = st.guards.get(db).and_then(|g| g.get(di)).copied().flatten();
+        let same_guard = guard.is_none() || (db == b && guard == st.guards[b][i]);
+        match &def_inst.fields {
+            Fields::Valu(valu)
+                if same_guard
+                    && valu.dpp.is_none()
+                    && valu.sdwa.is_none()
+                    && def_inst.name() == "v_mov_b32" =>
+            {
+                match valu.src.first()? {
+                    op @ (Operand::Const(_) | Operand::Literal(_)) => inline(op),
+                    Operand::Scalar { code, .. } => {
+                        let sv = def_inst.read(Reg::S(*code))?;
+                        let &(sb, si) = def.get(&sv)?;
+                        let s_inst = &p.blocks[sb].insts[si];
+                        if s_inst.name() != "s_mov_b32" {
+                            None
+                        } else if let Fields::Sop { src, .. } = &s_inst.fields {
+                            inline(src.first()?)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            Fields::Valu(valu)
+                if same_guard
+                    && valu.dpp.is_none()
+                    && valu.sdwa.is_none()
+                    && def_inst.name() == "v_xor_b32"
+                    && valu.src.len() == 2
+                    && valu.src[0] == valu.src[1] =>
+            {
+                Some(0)
+            }
+            _ => None,
+        }
+    };
+    let mut by_addr: HashMap<u32, &str> = HashMap::new();
+    for (b, i, name) in accesses {
+        let inst = &p.blocks[b].insts[i];
+        let Fields::Ds { addr, offset0, offset1, .. } = &inst.fields else {
+            return false;
+        };
+        let Some(Operand::Vector { reg, .. }) = *addr else {
+            return false;
+        };
+        let Some(v) = inst.read(Reg::V(reg)) else {
+            return false;
+        };
+        let Some(base) = resolve_base(v, b, i) else {
+            return false;
+        };
+        let at = base.wrapping_add(u32::from(*offset0) | u32::from(*offset1) << 8);
+        if let Some(&prev) = by_addr.get(&at) {
+            if prev != name {
+                return false;
+            }
+        } else {
+            by_addr.insert(at, name);
+        }
+    }
+    true
 }
 
 /// Whether a lane-branch region (`blocks`, see [`lds_meetings`]) that both reads and writes
@@ -6769,10 +6887,18 @@ impl<'a> Lower<'a> {
     /// call from `x - 4` on would read both out of it.
     fn raw_dwords(&mut self, h: V, addr: V, count: u32) -> Vec<V> {
         let c = self.cur;
+        // GFX10 `s_buffer_load_dword*` ignores `addr[1:0]`; preserve dword
+        // alignment explicitly (constant offsets fold away in `opt.rs`).
+        let align_mask = self.s.m.i32(!3u32);
+        let addr = self.s.m.bin(c, Bin::And, addr, align_mask);
         let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         let mut out = Vec::with_capacity(count as usize);
-        for first in (0..count).step_by(4) {
-            let n = (count - first).min(4);
+        // Gate 4-dword wide loads on `Self::wide_loads()` (`VICTORY_SHADER_OPT`
+        // bit 64): grouped 4-dword `rawBufferLoad(mask=0xF)` caused black water /
+        // misread tails on RTX when off (`SHADER_OPT=63`).
+        let step = if Self::wide_loads() { 4usize } else { 1usize };
+        for first in (0..count).step_by(step) {
+            let n = (count - first).min(step as u32);
             let off = self.s.m.i32(4 * first);
             let a = self.s.m.bin(c, Bin::Add, addr, off);
             let mask = self.s.m.i8((1u8 << n) - 1);
@@ -6864,6 +6990,31 @@ impl<'a> Lower<'a> {
         // The host's table of strides by heap slot tells a buffer view
         // (not 0) from anything else, which is still read as a constant
         // buffer; only the load that fits the slot runs.
+        // Under Port 5 on NVIDIA 1M heaps (`constants_raw() && raw_views() == 0`),
+        // both buffer SRVs and constant buffers are raw SRVs in place at the exact
+        // same slot `(11, 0)`: collapse the two-branch `SLOT_STRIDES` dispatch.
+        if kind.is_none() && super::shader::constants_raw() && super::shader::raw_views() == 0 {
+            if let Some(stride) = self.slot_stride(src)? {
+                let zero = self.s.m.i32(0);
+                if let Some(is_constant) = self.slot_is_constant(src)? {
+                    let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
+                    let valid = self.s.m.bin(self.cur, Bin::Or, is_buffer, is_constant);
+                    let at = self.begin_guarded(Some(valid));
+                    let h = self.handle(site, src, false, (11, 0))?;
+                    let raw: Vec<(V, V)> = self.raw_dwords(h, addr, count).into_iter().map(|x| (x, zero)).collect();
+                    let raw = self.end_guarded(at, &raw);
+                    for (k, x) in raw.into_iter().enumerate() {
+                        self.write(inst, Reg::S(code + k as u8), x, None);
+                    }
+                } else {
+                    let h = self.handle(site, src, false, (11, 0))?;
+                    for (k, x) in self.raw_dwords(h, addr, count).into_iter().enumerate() {
+                        self.write(inst, Reg::S(code + k as u8), x, None);
+                    }
+                }
+                return Ok(());
+            }
+        }
         let picked = match kind {
             None => self.slot_stride(src)?,
             Some(_) => None,
@@ -13732,9 +13883,13 @@ mod tests {
             5 << 24 | 9,
             S_ENDPGM,
         ];
-        for (first, second, ordered) in [(0x07u32, 0, true), (0, 0, false)] {
+        for (first, second, off2, ordered) in [
+            (0x07u32, 0u32, 0u32, true),  // ds_min_u32 + ds_add_u32 at same offset 0 -> ordered
+            (0u32, 0u32, 0u32, false),    // ds_add_u32 + ds_add_u32 at offset 0 -> commutes
+            (0x07u32, 0x0au32, 4u32, false), // ds_min_u32 at 0 + ds_or_b32 at 4 -> disjoint offsets commute
+        ] {
             words[5] = 0x36 << 26 | first << 18;
-            words[9] = 0x36 << 26 | second << 18;
+            words[9] = 0x36 << 26 | second << 18 | off2;
             let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
             let native = NativeProgram {
                 stage: HwStage::Cs,

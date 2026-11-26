@@ -556,7 +556,13 @@ fn record(
         }
     }
     let both = |b: &ID3D12Resource| dests.iter().any(|d| d.as_raw() == b.as_raw());
-    let constants = source | D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+    // Include SRV states alongside VERTEX_AND_CONSTANT_BUFFER: under Port 5
+    // (`VICTORY_PORT_CBV=1`), `own.between` is read via raw byte-address SRVs
+    // in the same `ExecuteCommandLists` batch, so NVIDIA L1TEX must be flushed.
+    let constants = source
+        | D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER
+        | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+        | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     let mut barriers = vec![transition(between, dest, constants)];
     barriers.extend(sources.iter().map(|b| transition(b, source, if both(b) { dest } else { common })));
     let done: Vec<D3D12_RESOURCE_BARRIER> = dests.iter().map(|b| transition(b, dest, common)).collect();
@@ -731,14 +737,15 @@ impl Host {
             let at = match places.get(&place) {
                 Some(&at) => at,
                 None => {
-                    if end + len as u64 > BETWEEN {
+                    let padded = (len as u64).next_multiple_of(256);
+                    if end + padded > BETWEEN {
                         return Err("too much at once");
                     }
                     if !mapped(src, src + len, &mut room) {
                         return Err("not all of what it reads is mapped");
                     }
                     let at = end;
-                    end = (end + len as u64).next_multiple_of(256);
+                    end += padded;
                     places.insert(place, at);
                     at
                 }
