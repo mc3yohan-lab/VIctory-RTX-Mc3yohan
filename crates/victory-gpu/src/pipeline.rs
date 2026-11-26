@@ -150,10 +150,6 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
-    /// Whether the shader's code can store to *any* UAV (buffer, image/texture
-    /// `Mimg`, scalar, flat, or global store/atomic). Used by command-list
-    /// `uav_dirty` tracking so image-only UAV writers are always ordered.
-    pub(crate) stores_uav: bool,
     /// Whether it can store through raw addresses ([`stores_by_address`]).
     pub(crate) stores_by_address: bool,
     /// Whether it stores through a view it picks from the heap by an index,
@@ -231,7 +227,6 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
-    let stores_uav = stores || programs.iter().any(stores_image);
     let threads = programs.iter().find_map(|p| match &p.io {
         victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
         _ => None,
@@ -254,7 +249,6 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         used,
         tables,
         stores,
-        stores_uav,
         stores_by_address,
         picks: Default::default(),
     })
@@ -411,19 +405,6 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
             Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
             _ => false,
         }
-    })
-}
-
-/// Whether a console program can store/atomic to image/texture UAVs (`Mimg`).
-#[cfg(windows)]
-fn stores_image(program: &victory_shader::NativeProgram) -> bool {
-    use victory_shader::gfx10::{Encoding, decode};
-    let Ok(code) = decode(&program.code) else {
-        return true;
-    };
-    code.iter().any(|i| {
-        i.encoding == Encoding::Mimg
-            && i.name().is_none_or(|n| n.contains("store") || n.contains("atomic"))
     })
 }
 

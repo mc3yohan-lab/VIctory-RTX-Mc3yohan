@@ -2136,153 +2136,33 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
     wait_for(this, address, comparison, reference, true);
 }
 
-/// Classification bitflags returned by [`classify_barrier_groups`].
-pub(super) const BARRIER_GROUP_CLASSIFIED: u32 = 1;
-pub(super) const BARRIER_GROUP_NEEDS_UAV: u32 = 2;
-pub(super) const BARRIER_GROUP_ANY_SYNC: u32 = 4;
-
-/// Inspects the title's Enhanced Barrier groups (`D3D12_BARRIER_GROUP`, 16 B
-/// each: `(type: u32, num: u32, ptr: *const u8)`) before returning to the
-/// title (so `list/thin.rs` does not lose stack-allocated descriptors).
-///
-/// Texture state transitions are already tracked and emitted by `ensure_state`,
-/// and placed buffer copies emit resource-scoped barriers in `host/place.rs`.
-/// Only barriers that synchronize prior `UNORDERED_ACCESS`, `COMMON`, or
-/// raytracing/unknown accesses require a host `UAV` barrier; pure `RTV`/`DSV`/
-/// `SRV`/`COPY`/`NO_ACCESS` transitions skip the full-GPU SM stall.
-pub(super) fn classify_barrier_groups(count: u32, groups: *const u8) -> u32 {
-    if count == 0 {
-        return BARRIER_GROUP_CLASSIFIED;
-    }
-    if groups.is_null() {
-        return BARRIER_GROUP_CLASSIFIED | BARRIER_GROUP_NEEDS_UAV | BARRIER_GROUP_ANY_SYNC;
-    }
-    // Strictly non-UAV `D3D12_BARRIER_ACCESS` bits:
-    // VB(0x1), CBV(0x2), IB(0x4), RTV(0x8), DSV_WRITE(0x10), DSV_READ(0x20),
-    // SRV(0x40), SO(0x100), INDIRECT/PRED(0x200), COPY_DST(0x400),
-    // COPY_SRC(0x800), RESOLVE_DST(0x1000), RESOLVE_SRC(0x2000),
-    // SHADING_RATE(0x10000), NO_ACCESS(0x8000_0000).
-    // Notably EXCLUDED (treated as needing UAV sync): COMMON (0x0),
-    // UNORDERED_ACCESS (0x80), RT_AS_READ/WRITE (0x4000/0x8000), and any
-    // unknown bits.
-    const NO_ACCESS: u32 = 0x8000_0000;
-    const NON_UAV_ACCESS: u32 =
-        0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x100 | 0x200 | 0x400 | 0x800 | 0x1000 | 0x2000 | 0x10000 | NO_ACCESS;
-    const GROUP_SIZE: usize = 16;
-
-    let mut any_sync = false;
-    let mut needs_uav = false;
-    for g in 0..(count as usize).min(64) {
-        // SAFETY: the title passes `count` valid 16-byte `D3D12_BARRIER_GROUP` structs.
-        let base = unsafe { groups.add(g * GROUP_SIZE) };
-        let kind = unsafe { base.cast::<u32>().read_unaligned() };
-        let num = unsafe { base.add(4).cast::<u32>().read_unaligned() };
-        let ptr = unsafe { base.add(8).cast::<*const u8>().read_unaligned() };
-        if num == 0 {
-            continue;
-        }
-        if ptr.is_null() {
-            return BARRIER_GROUP_CLASSIFIED | BARRIER_GROUP_NEEDS_UAV | BARRIER_GROUP_ANY_SYNC;
-        }
-        // Known ABI strides: GLOBAL=16, TEXTURE=64, BUFFER=40 (list.rs:2344).
-        // For safety, if a TEXTURE group has >1 entry or an unknown group type
-        // appears, check `kind == 0 | 2` at full count and `kind == 1` at
-        // 64-byte stride (if any element's AccessBefore looks non-standard,
-        // `access_before & !NON_UAV_ACCESS != 0` conservatively sets needs_uav).
-        let stride: usize = match kind {
-            0 => 16,
-            1 => 64,
-            2 => 40,
-            _ => return BARRIER_GROUP_CLASSIFIED | BARRIER_GROUP_NEEDS_UAV | BARRIER_GROUP_ANY_SYNC,
-        };
-        for i in 0..(num as usize).min(256) {
-            // SAFETY: each barrier starts with `[SyncBefore, SyncAfter, AccessBefore, AccessAfter]`.
-            let b = unsafe { ptr.add(i * stride).cast::<[u32; 4]>().read_unaligned() };
-            let [sync_before, _sync_after, access_before, _access_after] = b;
-            #[cfg(all(windows, feature = "diagnostics"))]
-            {
-                static SEEN: std::sync::Mutex<Vec<(u32, u32, u32, u32, u32)>> = std::sync::Mutex::new(Vec::new());
-                let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-                let key = (kind, sync_before, _sync_after, access_before, _access_after);
-                if seen.len() < 48 && !seen.contains(&key) {
-                    seen.push(key);
-                    tracing::info!(
-                        kind,
-                        num,
-                        sync_before = format_args!("{sync_before:#x}"),
-                        sync_after = format_args!("{_sync_after:#x}"),
-                        access_before = format_args!("{access_before:#x}"),
-                        access_after = format_args!("{_access_after:#x}"),
-                        "enhanced barrier group shape"
-                    );
-                }
-            }
-            if sync_before != 0 {
-                any_sync = true;
-                if access_before != NO_ACCESS
-                    && (access_before == 0 || (access_before & !NON_UAV_ACCESS) != 0)
-                {
-                    needs_uav = true;
-                }
-            }
-            if needs_uav && any_sync {
-                return BARRIER_GROUP_CLASSIFIED | BARRIER_GROUP_NEEDS_UAV | BARRIER_GROUP_ANY_SYNC;
-            }
-        }
-    }
-    let mut flags = BARRIER_GROUP_CLASSIFIED;
-    if needs_uav {
-        flags |= BARRIER_GROUP_NEEDS_UAV;
-    }
-    if any_sync {
-        flags |= BARRIER_GROUP_ANY_SYNC;
-    }
-    flags
-}
-
-/// Replays a pre-classified `barrier_groups` call (`list/thin.rs` and direct).
-pub(super) fn barrier_groups_classified(this: This, count: u32, flags: u32) {
-    if count == 0 {
-        return;
-    }
-    let classified = flags & BARRIER_GROUP_CLASSIFIED != 0;
-    let needs_uav = !classified || (flags & BARRIER_GROUP_NEEDS_UAV != 0);
-    let any_sync = !classified || (flags & BARRIER_GROUP_ANY_SYNC != 0);
-    #[cfg(windows)]
-    if any_sync {
-        with_state(this, |_, state| state.synced());
-    }
-    if !needs_uav {
-        return;
-    }
+/// The enhanced barriers `(group count, groups)`: buffer, texture and
+/// global barriers with layouts instead of states. Every host use of a
+/// title texture (clears, copies) moves its host copy to the state it needs
+/// first, so only their ordering matters: one barrier on every shader
+/// write (the title's buffer barriers order compute passes).
+extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
-    {
+    if count > 0 {
         crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
         if crate::copystat::barrier_test() & 1 != 0 {
             return;
         }
     }
     #[cfg(windows)]
-    if let Some(list) = host_list(this) {
+    if count > 0
+        && let Some(list) = host_list(this)
+    {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+        with_state(this, |_, state| state.synced());
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.barriers(&[barrier]) };
     }
     #[cfg(not(windows))]
-    let _ = (this, count, flags);
-}
-
-/// The enhanced barriers `(group count, groups)`: buffer, texture and
-/// global barriers with layouts instead of states. Every host use of a
-/// title texture (clears, copies) moves its host copy to the state it needs
-/// first, so only barriers synchronizing prior UAV/COMMON/unknown accesses
-/// emit a host UAV barrier.
-extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
-    let flags = classify_barrier_groups(count, groups);
-    barrier_groups_classified(this, count, flags);
+    let _ = (this, count);
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and

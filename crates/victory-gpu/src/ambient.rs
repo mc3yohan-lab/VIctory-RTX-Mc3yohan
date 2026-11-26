@@ -564,9 +564,9 @@ pub(crate) fn probe_buffers() -> Option<(ID3D12Resource, ID3D12Resource)> {
     pass().map(|p| (p.stats.clone(), p.cells.clone()))
 }
 
-fn uav_barrier(list: &crate::host::rec::Rec, resource: Option<&ID3D12Resource>) {
+fn uav_barrier(list: &ID3D12GraphicsCommandList, resource: Option<&ID3D12Resource>) {
     let borrowed = match resource {
-        // SAFETY: `r` stays live through `barriers`; `ManuallyDrop` skips `Release`.
+        // SAFETY: `r` stays live through `ResourceBarrier`; `ManuallyDrop` skips `Release`.
         Some(r) => Some(unsafe { std::mem::transmute_copy::<ID3D12Resource, ID3D12Resource>(r) }),
         None => None,
     };
@@ -580,7 +580,7 @@ fn uav_barrier(list: &crate::host::rec::Rec, resource: Option<&ID3D12Resource>) 
         },
     };
     // SAFETY: an open list; any named resource stays live across the call.
-    unsafe { list.barriers(&[barrier]) };
+    unsafe { list.ResourceBarrier(&[barrier]) };
 }
 
 /// Whether the light of a frame has been kept: the estimate has something
@@ -676,7 +676,6 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         let run = |pso: &ID3D12PipelineState, x, y, z, res: Option<&ID3D12Resource>| {
             l.SetPipelineState(pso);
             l.Dispatch(x, y, z);
-            l.mark_uav_dirty();
             uav_barrier(l, res);
         };
         match role {

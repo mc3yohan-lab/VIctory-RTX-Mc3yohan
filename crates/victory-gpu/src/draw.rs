@@ -3321,9 +3321,6 @@ impl State {
         }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
-        if p.stages.iter().any(|s| s.translated().stores_uav) {
-            list.list.mark_uav_dirty();
-        }
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
@@ -4395,14 +4392,10 @@ impl State {
     }
 
     /// A draw with the pipeline `p` was recorded (as [`State::buffers_written`]
-    /// if its shaders can store to buffers, plus `uav_dirty` if any stage can
-    /// store to a buffer or image UAV).
+    /// if its shaders can store to buffers).
     fn drew(&mut self, list: &HostList, p: Option<&HostPipeline>) {
         if p.is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores)) {
             self.batch = None;
-        }
-        if p.is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores_uav)) {
-            list.list.mark_uav_dirty();
         }
         if let Some(p) = p
             && p.stages.iter().any(|s| s.shader.probe.is_some())
@@ -4681,9 +4674,6 @@ impl State {
         };
         if kind == MESH {
             self.mesh_scissor(list, false);
-        }
-        if p.stages.iter().any(|s| s.translated().stores_uav) {
-            list.list.mark_uav_dirty();
         }
         if kind == DISPATCH {
             self.buffers_written();

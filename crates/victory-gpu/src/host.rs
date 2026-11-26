@@ -4719,30 +4719,16 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    // What the submission's shaders wrote to the compared
-                    // buffers, first (resource-specific UAV barriers instead
-                    // of stalling the whole GPU on unrelated targets).
-                    let mut uavs: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
-                    for r in plan.ranges.iter().filter(|r| r.compared) {
-                        let raw = r.shadow.buffer.as_raw();
-                        if !uavs.iter().any(|u| {
-                            u.Anonymous.UAV.pResource.as_ref().is_some_and(|res| res.as_raw() == raw)
-                        }) {
-                            let borrowed: ID3D12Resource = std::mem::transmute_copy(&r.shadow.buffer);
-                            uavs.push(D3D12_RESOURCE_BARRIER {
-                                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                                Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                                        pResource: std::mem::ManuallyDrop::new(Some(borrowed)),
-                                    }),
-                                },
-                            });
-                        }
-                    }
-                    if !uavs.is_empty() {
-                        list.ResourceBarrier(&uavs);
-                    }
+                    // What the submission's shaders wrote, first.
+                    list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                                pResource: std::mem::ManuallyDrop::new(None),
+                            }),
+                        },
+                    }]);
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs_gpu.GetGPUVirtualAddress());
@@ -6676,7 +6662,6 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
-        self.list.reset_uav_dirty();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }

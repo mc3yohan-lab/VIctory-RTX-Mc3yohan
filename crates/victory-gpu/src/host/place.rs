@@ -164,17 +164,11 @@ pub(super) fn read_by(runs: &[&HostList], written: &[(usize, usize)]) -> bool {
 #[cfg(feature = "diagnostics")]
 pub(super) static READERS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
-/// Resource-scoped synchronization for the exact source/destination buffers of
-/// a placed buffer copy, replacing full-GPU `GLOBAL_BARRIER(ALL->ALL)` stalls.
+/// Everything recorded so far is done, and seen, before what follows.
 ///
 /// # Safety
-/// An open list and live buffer handles.
-unsafe fn sync_placed_buffers(
-    host: &Host,
-    list: &crate::host::rec::Rec,
-    buffers: &[&ID3D12Resource],
-    before_copy: bool,
-) {
+/// An open list.
+unsafe fn wait_for_all(host: &Host, list: &ID3D12GraphicsCommandList) {
     static ENHANCED: OnceLock<bool> = OnceLock::new();
     let enhanced = *ENHANCED.get_or_init(|| {
         let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
@@ -190,53 +184,42 @@ unsafe fn sync_placed_buffers(
     });
     // SAFETY: the caller's.
     unsafe {
-        if enhanced && let Ok(l7) = list.cast::<ID3D12GraphicsCommandList7>() {
-            let mut barriers: Vec<D3D12_BUFFER_BARRIER> = Vec::with_capacity(buffers.len());
-            for &buf in buffers {
-                if barriers.iter().any(|b| b.pResource.as_ref().is_some_and(|r| r.as_raw() == buf.as_raw())) {
-                    continue;
-                }
-                let borrowed: ID3D12Resource = std::mem::transmute_copy(buf);
-                barriers.push(D3D12_BUFFER_BARRIER {
-                    SyncBefore: if before_copy { D3D12_BARRIER_SYNC_ALL_SHADING } else { D3D12_BARRIER_SYNC_COPY },
-                    SyncAfter: if before_copy { D3D12_BARRIER_SYNC_COPY } else { D3D12_BARRIER_SYNC_ALL_SHADING },
-                    AccessBefore: if before_copy { D3D12_BARRIER_ACCESS_COMMON } else { D3D12_BARRIER_ACCESS_COPY_DEST },
-                    AccessAfter: if before_copy { D3D12_BARRIER_ACCESS_COMMON } else { D3D12_BARRIER_ACCESS_COMMON },
-                    pResource: std::mem::ManuallyDrop::new(Some(borrowed)),
-                    Offset: 0,
-                    Size: u64::MAX,
-                });
-            }
-            if !barriers.is_empty() {
-                l7.Barrier(&[D3D12_BARRIER_GROUP {
-                    Type: D3D12_BARRIER_TYPE_BUFFER,
-                    NumBarriers: barriers.len() as u32,
-                    Anonymous: D3D12_BARRIER_GROUP_0 {
-                        pBufferBarriers: barriers.as_ptr(),
-                    },
-                }]);
-            }
+        if enhanced && let Ok(list) = list.cast::<ID3D12GraphicsCommandList7>() {
+            let all = [D3D12_GLOBAL_BARRIER {
+                SyncBefore: D3D12_BARRIER_SYNC_ALL,
+                SyncAfter: D3D12_BARRIER_SYNC_ALL,
+                AccessBefore: D3D12_BARRIER_ACCESS_COMMON,
+                AccessAfter: D3D12_BARRIER_ACCESS_COMMON,
+            }];
+            list.Barrier(&[D3D12_BARRIER_GROUP {
+                Type: D3D12_BARRIER_TYPE_GLOBAL,
+                NumBarriers: 1,
+                Anonymous: D3D12_BARRIER_GROUP_0 {
+                    pGlobalBarriers: all.as_ptr(),
+                },
+            }]);
             return;
         }
-        let mut uavs: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(buffers.len());
-        for &buf in buffers {
-            if uavs.iter().any(|u| u.Anonymous.UAV.pResource.as_ref().is_some_and(|r| r.as_raw() == buf.as_raw())) {
-                continue;
-            }
-            let borrowed: ID3D12Resource = std::mem::transmute_copy(buf);
-            uavs.push(D3D12_RESOURCE_BARRIER {
-                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                        pResource: std::mem::ManuallyDrop::new(Some(borrowed)),
-                    }),
-                },
-            });
-        }
-        if !uavs.is_empty() {
-            list.barriers(&uavs);
-        }
+        let alias = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Aliasing: std::mem::ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
+                    pResourceBefore: std::mem::ManuallyDrop::new(None),
+                    pResourceAfter: std::mem::ManuallyDrop::new(None),
+                }),
+            },
+        };
+        let uav = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: std::mem::ManuallyDrop::new(None),
+                }),
+            },
+        };
+        list.ResourceBarrier(&[alias, uav]);
     }
 }
 
@@ -273,10 +256,10 @@ impl HostList {
         to.refresh(self, dst as u64, len as u64);
         // SAFETY (both): an open list; live buffers (the list holds the
         // copies and its scratch memory), ranges inside them.
+        unsafe { wait_for_all(host, &self.list) };
         match (&own, &scratch) {
             (Some(from), _) => {
                 from.refresh(self, src as u64, len as u64);
-                unsafe { sync_placed_buffers(host, &self.list, &[&from.buffer, &to.buffer], true) };
                 let offset = from.offset(src as u64);
                 if from.buffer.as_raw() == to.buffer.as_raw() {
                     let Some(between) = self.between(host, len as u64) else {
@@ -284,7 +267,8 @@ impl HostList {
                     };
                     unsafe {
                         self.list.CopyBufferRegion(&between, 0, &from.buffer, offset, len as u64);
-                        self.list.barriers(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                        self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                        wait_for_all(host, &self.list);
                         self.list.CopyBufferRegion(&to.buffer, at, &between, 0, len as u64);
                     }
                 } else {
@@ -293,12 +277,11 @@ impl HostList {
                 STATS[2].fetch_add(1, Ordering::Relaxed);
             }
             (None, Some((from, offset, _))) => unsafe {
-                sync_placed_buffers(host, &self.list, &[&to.buffer], true);
                 self.list.CopyBufferRegion(&to.buffer, at, from, *offset, len as u64);
             },
             (None, None) => return false,
         }
-        unsafe { sync_placed_buffers(host, &self.list, &[&to.buffer], false) };
+        unsafe { wait_for_all(host, &self.list) };
         STATS[0].fetch_add(1, Ordering::Relaxed);
         STATS[1].fetch_add(len as u64, Ordering::Relaxed);
         to.gpu_writes(self, dst as u64, len as u64);
@@ -329,16 +312,17 @@ impl HostList {
         STATS[3].fetch_add(1, Ordering::Relaxed);
         // SAFETY: an open list; live buffers, ranges inside them.
         unsafe {
-            sync_placed_buffers(host, &self.list, &[&from.buffer], true);
+            wait_for_all(host, &self.list);
             self.list.CopyBufferRegion(&between, 0, &from.buffer, from.offset(src as u64), len as u64);
-            self.list.barriers(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            wait_for_all(host, &self.list);
         }
         Some(between)
     }
 
     /// A buffer on the card for this recording alone.
     fn between(&self, host: &Host, len: u64) -> Option<ID3D12Resource> {
-        let buffer = host.uav_buffer_internal(len.next_multiple_of(1 << 16))?;
+        let buffer = host.uav_buffer(len.next_multiple_of(1 << 16))?;
         name(&buffer, || "bytes between copies".into());
         self.keep(&buffer);
         Some(buffer)

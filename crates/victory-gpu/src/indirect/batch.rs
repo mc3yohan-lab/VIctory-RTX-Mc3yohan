@@ -257,55 +257,10 @@ impl Table {
     }
 }
 
-/// Production variant routed through `Rec::barriers`: skips UAV barrier when
-/// `!rec.uav_dirty()`, otherwise emits resource-specific UAV barriers for only
-/// the `1..=4` source argument buffers in `src_res`.
-pub(super) fn record_on_rec(
-    c: &Clamp,
-    rec: &crate::host::rec::Rec,
-    (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
-    budget: u64,
-    sources: [u64; SOURCES],
-    src_res: &[&ID3D12Resource],
-    jobs: u64,
-) {
-    let after = transition(
-        dst,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-    );
-    #[cfg(feature = "diagnostics")]
-    let need_uav = rec.uav_dirty() && crate::copystat::barrier_test() & 2 == 0;
-    #[cfg(not(feature = "diagnostics"))]
-    let need_uav = rec.uav_dirty();
-    let mut pre: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(src_res.len() + 1);
-    if need_uav {
-        for &res in src_res {
-            pre.push(super::uav_barrier_for(res));
-        }
-    }
-    pre.push(transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
-    // SAFETY: an open list; our root signature and pipeline; live buffers.
-    unsafe {
-        rec.barriers(&pre);
-        rec.SetComputeRootSignature(&c.root);
-        rec.SetPipelineState(&c.pso);
-        for (i, source) in sources.into_iter().enumerate() {
-            rec.SetComputeRootShaderResourceView(i as u32, source);
-        }
-        rec.SetComputeRootShaderResourceView(SOURCES as u32, jobs);
-        rec.SetComputeRootUnorderedAccessView(SOURCES as u32 + 1, dst.GetGPUVirtualAddress());
-        rec.SetComputeRootUnorderedAccessView(SOURCES as u32 + 2, budget);
-        rec.Dispatch(JOBS.div_ceil(64), 1, 1);
-        rec.barriers(&[after]);
-    }
-}
-
 /// Records the pass over the table at `jobs` (a host address) into `dst`,
 /// which is in state `before` and left in `INDIRECT_ARGUMENT`: after every
 /// earlier shader write (the title's argument passes), before what reads
 /// the clamped records.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn record(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
