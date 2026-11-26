@@ -1023,6 +1023,15 @@ impl Queued {
     }
 }
 
+/// Whether due texture slots are served in turns, a slot looked at before
+/// and one never looked at ([`TextureQueue::in_order`]; on unless
+/// `VICTORY_FAIR_DUE=0`). Prevents fresh on-screen textures from waiting
+/// 300-1,500 frames behind a backlog of partially-mapped streaming slots.
+fn fair_due() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FAIR_DUE").is_none_or(|v| v != "0"))
+}
+
 /// Slots due of a [`TextureQueue`], of those looked at before and of the
 /// others: the frame each was written in, the slot and its write's number.
 type Due = [Vec<(u64, u32, u64)>; 2];
@@ -1090,15 +1099,32 @@ impl TextureQueue {
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
         again.sort_unstable_by(newest_first);
         fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
+        let mut fresh_order: Vec<(u32, u64)> = Vec::with_capacity(fresh.len().min(max));
         let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
+        while new < old && fresh_order.len() < max {
+            fresh_order.push((fresh[new].1, fresh[new].2));
             new += 1;
-            if new < old && order.len() < max {
+            if new < old && fresh_order.len() < max {
                 old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+                fresh_order.push((fresh[old].1, fresh[old].2));
             }
+        }
+        let mut again_order = again.iter().map(|&(_, index, write)| (index, write));
+        if !fair_due() {
+            let mut order: Vec<(u32, u64)> = again_order.collect();
+            order.extend(fresh_order);
+            order.truncate(max);
+            return order;
+        }
+        let mut fresh_order = fresh_order.into_iter();
+        let mut order = Vec::with_capacity(max.min(fresh.len() + again.len()));
+        while order.len() < max {
+            let (a, b) = (again_order.next(), fresh_order.next());
+            if a.is_none() && b.is_none() {
+                break;
+            }
+            order.extend(a);
+            order.extend(b);
         }
         order.truncate(max);
         order
@@ -2686,9 +2712,16 @@ impl HostHeap {
         if let Some((_, _, data)) = &self.strides
             && index < victory_shader::emit::SLOT_STRIDES_COUNT
         {
+            let entry = match (stride, view) {
+                (Some(s), _) => s | kind,
+                (None, Some(View::Constant(..))) if victory_shader::emit::constant_marks() => {
+                    victory_shader::emit::SLOT_STRIDE_CONSTANT
+                }
+                _ => kind,
+            };
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0) | kind) };
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(entry) };
         }
         let was = if stride.is_some() {
             self.buffers.put(index);
@@ -3475,6 +3508,59 @@ fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
             .cast::<D3D12_UNORDERED_ACCESS_VIEW_DESC>()
             .read_unaligned()
     }
+}
+
+/// The unsigned integer format with the layout of a 16-bit float or
+/// signed integer format (one, two or four channels), if `format` is one.
+pub(crate) fn half_format(format: u32) -> Option<u32> {
+    match format {
+        // R16G16B16A16_FLOAT and _SINT: R16G16B16A16_UINT.
+        10 | 14 => Some(12),
+        // R16G16_FLOAT and _SINT: R16G16_UINT.
+        34 | 38 => Some(36),
+        // R16_FLOAT and _SINT: R16_UINT.
+        54 | 59 => Some(57),
+        _ => None,
+    }
+}
+
+/// `view` as a shader is shown it where it moves a buffer's 16-bit
+/// channels as unsigned integers (`HostShader::half_views`, fxceless PR #927).
+pub(crate) fn half_view(view: &View) -> Option<View> {
+    const BUFFER: u32 = 1;
+    match view {
+        View::Shader(resource, Some(desc)) if desc[1] == BUFFER => {
+            let mut desc = *desc;
+            desc[0] = half_format(desc[0])?;
+            Some(View::Shader(*resource, Some(desc)))
+        }
+        View::Unordered(resource, counter, Some(desc)) if desc[1] == BUFFER => {
+            let mut desc = *desc;
+            desc[0] = half_format(desc[0])?;
+            Some(View::Unordered(*resource, *counter, Some(desc)))
+        }
+        View::Placed(unordered, resource, desc) if resource[0] == BUFFER && desc[1] == BUFFER => {
+            let mut desc = *desc;
+            desc[0] = half_format(desc[0])?;
+            Some(View::Placed(*unordered, *resource, desc))
+        }
+        _ => None,
+    }
+}
+
+/// Returns the format of `view` if moving 16-bit channels as unsigned integers
+/// is not exact for that buffer format.
+pub(crate) fn half_inexact(view: &View) -> Option<u32> {
+    const BUFFER: u32 = 1;
+    const EXACT: [u32; 13] = [10, 12, 14, 34, 36, 38, 54, 57, 59, 25, 30, 50, 62];
+    let format = match view {
+        View::Shader(_, Some(desc)) | View::Unordered(_, _, Some(desc)) if desc[1] == BUFFER => {
+            desc[0]
+        }
+        View::Placed(_, resource, desc) if resource[0] == BUFFER && desc[1] == BUFFER => desc[0],
+        _ => return None,
+    };
+    (!EXACT.contains(&format)).then_some(format)
 }
 
 /// A buffer view of title memory at `address` on its host copy: the first

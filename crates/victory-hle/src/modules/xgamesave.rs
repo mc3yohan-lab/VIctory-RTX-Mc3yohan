@@ -213,7 +213,9 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
-            std::fs::remove_dir_all(entry.path())?;
+            if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+                tracing::debug!(dir = %entry.path().display(), %e, "an unfinished save version stays for now");
+            }
         } else if let Some(n) = version_number(&file) {
             highest = highest.max(n);
             if entry.file_type().is_ok_and(|t| t.is_dir()) {
@@ -231,7 +233,10 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
             continue;
         };
         for old in &committed[at + 1..] {
-            std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
+            let path = dir.join(format!("v{old}"));
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                tracing::info!(dir = %path.display(), %e, "an older save version stays for now; it goes at a later save");
+            }
         }
         return Ok(Some(Version {
             dir: version,

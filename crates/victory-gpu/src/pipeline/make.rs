@@ -27,7 +27,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::Shader;
-use super::host::{GraphicsState, HostPipeline};
+use super::host::{GraphicsState, HostPipeline, TargetFormats};
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
@@ -46,6 +46,10 @@ pub(crate) struct Pending {
     /// Total microseconds draws have waited for this pipeline so far
     /// ([`wait_once`]).
     waited_us: AtomicU64,
+    /// Declared render-target/depth formats, plus chain of format variants
+    /// created on demand when the title draws into different formats (`fxceless a35c5573`).
+    pub(crate) formats: TargetFormats,
+    variant: OnceLock<Arc<Pending>>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -63,6 +67,8 @@ impl Pending {
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
         Pending {
+            formats: graphics.as_ref().map_or([0; 9], |g| g.formats()),
+            variant: OnceLock::new(),
             screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
             shaders,
             graphics,
@@ -180,6 +186,47 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
+}
+
+/// Pipelines made again for the formats bound at a draw, since the start.
+static VARIANTS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a draw into views of other formats than its pipeline declares gets a
+/// host pipeline for those formats ([`for_formats`]); on unless `VICTORY_TARGET_VARIANTS=0`.
+fn variants_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TARGET_VARIANTS").is_none_or(|v| v != "0"))
+}
+
+/// The host pipeline for a draw with `p` into views of the formats `bound`
+/// that `p` does not declare.
+#[cold]
+pub(crate) fn for_formats<'a>(p: &'a Arc<Pending>, bound: &TargetFormats) -> Option<&'a HostPipeline> {
+    match p.graphics.as_deref() {
+        Some(g) if variants_on() => ready(variant(p, g, &super::host::formats_for(&p.formats, bound))),
+        _ => ready(p),
+    }
+}
+
+fn variant<'a>(p: &'a Arc<Pending>, g: &GraphicsState, bound: &TargetFormats) -> &'a Arc<Pending> {
+    let mut at = p;
+    for _ in 0..64 {
+        let next = at.variant.get_or_init(|| {
+            let so_far = VARIANTS.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::info!(
+                declared = ?p.formats,
+                bound = ?bound,
+                so_far,
+                "a pipeline is made again for the render target formats bound at its draw (VICTORY_TARGET_VARIANTS=0: use title pipeline)"
+            );
+            Arc::new(Pending::new(p.shaders.clone(), Some(Box::new(g.with_formats(bound)))))
+        });
+        if next.formats == *bound {
+            return next;
+        }
+        at = next;
+    }
+    p
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier

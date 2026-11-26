@@ -1,23 +1,28 @@
 # Launches the Xbox Series title tuned for NVIDIA RTX 4090 (24 GB VRAM, Wave32, 1M view heap)
-# and Intel Core i9-12900KF (8P/16T + 8E/8T), combining:
-# - Korinocho/victory-fork's 22.2 FPS 1440p NVIDIA 'perf' profile + VICTORY_TABLES_EARLY=1
-# - trustno1-coder/VIctory-NVIDIA's dynamic slots, intro video fix, render scale, own upscaler,
-#   watchdog disarm, Series S 4K HUD compose, and Smooth Motion support
-# - Our RTX 4090 hardware fixes: wide indirect (>65,535), MED3|LEGACY float shortcuts,
-#   VICTORY_BVH_NO_HIT=1, VICTORY_WAVE_WIDE=last, coalesced VirtualProtect, warm host-pipelines.bin.
+# and Intel Core i9-12900KF (8P/16T + 8E/8T), combining the best of:
+# - avatarmanz/VIctory-7900XTX latest (VICTORY_SHOW_NEW_LATER, AVX2 SYNC_IN_PLACE, SPANS_QUICK,
+#   UNDER_FUSED, METER_THREAD, LANE_CORE, upq copy queue)
+# - Korinocho/victory-fork (22.2+ FPS 1440p perf set + VICTORY_TABLES_EARLY=1)
+# - trustno1-coder/VIctory-NVIDIA (Faces move PR #927, VICTORY_NAN_SCRUB=1, rt_off_hashes.txt,
+#   VICTORY_FAIR_DUE=1, VICTORY_VIDEO_PLANES=1, VICTORY_TARGET_VARIANTS=1, hooks.rs render scale /
+#   own upscaler / watchdog disarm, Series S 4K HUD compose.rs, Smooth Motion)
+# - Our RTX 4090 work: wide indirect (>65,535), MED3|LEGACY float shortcuts, VICTORY_BVH_NO_HIT=1,
+#   VICTORY_WAVE_WIDE=last, O(1) VICTORY_SKIP_PIPELINES in release, coalesced VirtualProtect, warm host-pipelines.bin.
 #
 # Usage:
-#   scripts\play-nvidia.ps1                        # Full 1440p Series X max FPS (release, auto-logged)
-#   scripts\play-nvidia.ps1 -Scale 0.75            # 1440p output @ 75% internal scale + temporal upscaler (~30 FPS)
-#   scripts\play-nvidia.ps1 -SeriesS               # Series S 1080p game + 4K sharp HUD (compose.rs, ~30 FPS)
-#   scripts\play-nvidia.ps1 -SeriesS -Scale 0.75   # Ultra-fluid Series S
-#   scripts\play-nvidia.ps1 -SmoothMotion          # Launches victory_sm.exe copy for NVIDIA App Smooth Motion (2x FPS)
-#   scripts\play-nvidia.ps1 -Ambient               # Enable bounded indirect-light stand-in if dim rooms look too dark
+#   scripts\play-nvidia.ps1                        # Series X 1440p native (clean textures, bounded ambient, RT-off hashes, release)
+#   scripts\play-nvidia.ps1 -Scale 0.75            # Series X 1440p @ 75% internal + temporal upscaler (push ~30 FPS)
+#   scripts\play-nvidia.ps1 -SeriesS               # Series S 1080p + 4K sharp HUD @ 720p internal (0.667)
+#   scripts\play-nvidia.ps1 -SeriesS -Scale 0.5    # Max FPS Series S (540p internal + 4K HUD)
+#   scripts\play-nvidia.ps1 -SmoothMotion          # Launches victory_sm.exe for NVIDIA App Smooth Motion (2x visual FPS)
+#   scripts\play-nvidia.ps1 -FastTextures          # Sets VICTORY_TEXTURE_NO_WAIT=1 (slightly faster, may cause rainbow textures)
+#   scripts\play-nvidia.ps1 -NoAmbient             # Disables indirect light stand-in
+#   scripts\play-nvidia.ps1 -UpQueue               # Experimental dedicated D3D12 copy queue + joined barriers
 #   scripts\play-nvidia.ps1 -Panel                 # Live diagnostics overlay (auto-switches to diag build)
-#   scripts\play-nvidia.ps1 -Quality               # Fewer animation/skin glitches (lower FPS: RELAY=1, CARD_STEPS=0)
-#   scripts\play-nvidia.ps1 -Safe                  # Conservative copy/memory path
-#   scripts\play-nvidia.ps1 -Full4K                # Native Series X 3840x2160 output
-#   scripts\play-nvidia.ps1 -NoLog                 # Disable log file capture
+#   scripts\play-nvidia.ps1 -Quality               # Conservative sync (RELAY=1, CARD_STEPS=0)
+#   scripts\play-nvidia.ps1 -Safe                  # Safe fallback path
+#   scripts\play-nvidia.ps1 -Full4K                # Series X 3840x2160 native output
+#   scripts\play-nvidia.ps1 -NoLog                 # Disable automatic log capture
 #
 # Run from a normal (non-elevated) PowerShell window so NVIDIA keeps its DXCache in the usual place.
 param(
@@ -25,7 +30,9 @@ param(
     [switch]$SeriesS,
     [double]$Scale = 0.0,
     [switch]$Full4K,
-    [switch]$Ambient,
+    [switch]$FastTextures,
+    [switch]$NoAmbient,
+    [switch]$UpQueue,
     [switch]$Quality,
     [switch]$Safe,
     [switch]$RayTracing,
@@ -60,9 +67,11 @@ try {
 } catch {}
 
 $settings = @{
-    # --- Korinocho 22.2 FPS 'perf' base + avatarmanz fast path ---
-    VICTORY_TEXTURE_NO_WAIT     = '1'
+    # --- Core fast path (avatarmanz latest + Korinocho perf set) ---
+    VICTORY_TEXTURE_NO_WAIT     = $(if ($FastTextures) { '1' } else { '0' })
     VICTORY_TEXTURE_STAGE_MS    = '40'
+    VICTORY_FAIR_DUE            = '1'
+    VICTORY_SHOW_NEW_LATER      = '1'
     VICTORY_UPLOAD_AHEAD        = '1'
     VICTORY_SHOW_AFTER          = '1'
     VICTORY_VIDEO_PLANES        = '1'
@@ -80,21 +89,22 @@ $settings = @{
     VICTORY_CARD_AWAKE          = '1'
     VICTORY_D3D12_DRED          = 'light'
     VICTORY_D3D12_BACKGROUND    = '0'
-    VICTORY_SKIP_PIPELINES      = 'none'
     VICTORY_MEMORY_MAP          = '0'
 
     # --- NVIDIA 1M view heap: zero refused tables / zero dropped draws ---
     VICTORY_TABLES_EARLY        = '1'
     VICTORY_DYNAMIC_SLOTS       = "$DynamicSlots"
 
-    # --- Pipeline workers & watchdog safety ---
+    # --- Pipeline workers, format variants & watchdog safety ---
     VICTORY_PIPELINE_LOWEST     = '0'
     VICTORY_PIPELINE_WORKERS    = '8'
     VICTORY_PIPELINE_WAIT_ONCE  = '1'
+    VICTORY_TARGET_VARIANTS     = '1'
     VICTORY_NO_WATCHDOG         = '1'
 
     # --- Shader translator (MUST match `victory shaders` and `victory warm`) ---
     VICTORY_WAVE_WIDE           = 'last'
+    VICTORY_NAN_SCRUB           = '1'
 }
 
 if (-not $NoWideShaderOpt) {
@@ -102,6 +112,10 @@ if (-not $NoWideShaderOpt) {
 }
 if ($CardBuffersMinKb -gt 0) {
     $settings.VICTORY_CARD_BUFFERS_MIN_KB = "$CardBuffersMinKb"
+}
+if ($UpQueue) {
+    $settings.VICTORY_UP_QUEUE      = '1'
+    $settings.VICTORY_JOIN_BARRIERS = '1'
 }
 
 if ($Safe) {
@@ -119,28 +133,37 @@ if ($Quality) {
     $settings.VICTORY_TEXTURE_NO_WAIT = '0'
 }
 
-if ($Ambient) {
+if (-not $NoAmbient) {
     $settings.VICTORY_AMBIENT      = '0.8'
     $settings.VICTORY_AMBIENT_AIR  = '1.5'
     $settings.VICTORY_AMBIENT_MOST = '2'
 }
 
 if ($RayTracing) {
-    $settings.VICTORY_BVH_BUILDER = '1'
+    $settings.VICTORY_BVH_BUILDER    = '1'
+    $settings.VICTORY_SKIP_PIPELINES = 'none'
 } else {
-    $settings.VICTORY_BVH_NO_HIT  = '1'
+    $settings.VICTORY_BVH_NO_HIT     = '1'
+    $rtHashesPath = Join-Path $PSScriptRoot 'rt_off_hashes.txt'
+    if (Test-Path -LiteralPath $rtHashesPath) {
+        $settings.VICTORY_SKIP_PIPELINES = (Get-Content -LiteralPath $rtHashesPath -Raw).Trim()
+    } else {
+        $settings.VICTORY_SKIP_PIPELINES = 'none'
+    }
 }
 
 if ($SeriesS) {
     $settings.VICTORY_COMPOSE      = '1'
     $settings.VICTORY_OWN_UPSCALER = '1'
+    # Series S at scale 1.0 hits a title breakpoint on start (trustno1-coder 033be27f); default to 720p internal (0.667).
+    if ($Scale -le 0.0) { $Scale = 0.667 }
 } elseif (-not $Full4K) {
     $settings.VICTORY_DISPLAY_MODE = '2560x1440'
 }
 
 if ($Scale -gt 0.0) {
     $clamped = [math]::Min(1.0, [math]::Max(0.2, $Scale))
-    $settings.VICTORY_RENDER_SCALE = ('{0:0.##}' -f $clamped).Replace(',', '.')
+    $settings.VICTORY_RENDER_SCALE = ('{0:0.###}' -f $clamped).Replace(',', '.')
     $settings.VICTORY_OWN_UPSCALER = '1'
 }
 
