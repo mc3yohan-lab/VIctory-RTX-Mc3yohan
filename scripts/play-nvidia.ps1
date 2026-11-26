@@ -128,6 +128,7 @@ $settings = @{
     VICTORY_PIPELINE_WAIT_ONCE  = '1'
     VICTORY_TARGET_VARIANTS     = '1'
     VICTORY_NO_WATCHDOG         = '1'
+    VICTORY_XMA_REFILL          = '1'
 
     # --- Shader translator (MUST match `victory shaders` and `victory warm`) ---
     # Default SHADER_OPT=63 (bit 64 grouped 4-dword scalar loads blackened water in fxceless run 277 with 0 ms gain).
