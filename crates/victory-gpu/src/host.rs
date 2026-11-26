@@ -5983,11 +5983,11 @@ impl Host {
         for (shadow, at, bytes) in batch.placed.drain(..) {
             shadow.placed_copy(at, &bytes);
         }
-        if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
-            #[cfg(feature = "diagnostics")]
-            marks.push((lists.len(), crate::copystat::Timed::Compare));
-            lists.push(Some(check));
-        }
+        // A title list can leave a buffer promoted to COPY_DEST. Buffers
+        // decay to COMMON between ExecuteCommandLists calls, so submit
+        // the compare separately before signalling this submission's fence
+        // (trustno1-coder/VIctory-NVIDIA d1fe0bd0; fixes D3D12 error 538).
+        let check = card.as_ref().and_then(|c| c.check.clone()).map(|list| [Some(list)]);
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
@@ -6031,6 +6031,9 @@ impl Host {
                     self.queue.ExecuteCommandLists(&lists[from..to]);
                     from = to;
                 }
+                if let Some(check) = &check {
+                    self.queue.ExecuteCommandLists(check);
+                }
                 self.queue.Signal(&self.fence, *submitted)
             };
             awake::sent(&self.device);
@@ -6070,12 +6073,16 @@ impl Host {
         // to date, apart from the run's commands; the compare apart from the
         // last run.)
         let groups: Vec<(&[Option<ID3D12CommandList>], crate::copystat::Timed)> = if timing() {
-            marks
+            let mut g: Vec<_> = marks
                 .iter()
                 .zip(marks.iter().skip(1).map(|m| m.0).chain([lists.len()]))
                 .filter(|&(&(a, _), b)| a < b)
                 .map(|(&(a, kind), b)| (&lists[a..b], kind))
-                .collect()
+                .collect();
+            if let Some(check) = &check {
+                g.push((&check[..], crate::copystat::Timed::Compare));
+            }
+            g
         } else {
             vec![(&lists[..], crate::copystat::Timed::Other)]
         };
@@ -6088,6 +6095,13 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                #[cfg(feature = "diagnostics")]
+                let separate_compare = !timing();
+                #[cfg(not(feature = "diagnostics"))]
+                let separate_compare = true;
+                if separate_compare && _i + 1 == groups.len() && let Some(check) = &check {
+                    self.queue.ExecuteCommandLists(check);
+                }
                 self.card_sent();
                 let waited = self
                     .queue

@@ -71,10 +71,11 @@ Series X profile (ray tracing off).
   *Critical:* translator env vars (`VICTORY_SHADER_OPT=63`, `VICTORY_WAVE_WIDE=last`,
   `VICTORY_NAN_SCRUB=1`, `VICTORY_BVH_NO_HIT=1`, `VICTORY_PORT_CBV=1`) must match between `shaders`/`warm` and live runs.
 
-### 2. GPU Bandwidth, Shared-Memory Reduction & Synchronization
-- **Resizable BAR VRAM Windows (`VICTORY_WINDOWS_BAR_MB=4096`, `VICTORY_WINDOW_KB=256`):**
+### 3. GPU Bandwidth, Shared-Memory Reduction & Synchronization
+- **Resizable BAR VRAM Windows (`VICTORY_WINDOWS_BAR_MB=4096`, `VICTORY_WINDOW_KB=4096`):**
   moves loose vertex/index/mesh windows off 25 GB/s System RAM (`L0`) into 1,008 GB/s GDDR6X
-  (`D3D12_HEAP_TYPE_GPU_UPLOAD`), automatically capping at 80% VRAM budget.
+  (`D3D12_HEAP_TYPE_GPU_UPLOAD`), automatically capping at 80% VRAM budget while keeping
+  window count compact (`4 MiB` windows avoid loose-window overlap overhead).
 - **Plain OS-RAM `Card::staging` (`shadow.rs`):** when `VICTORY_SEND_OWN=1` (default) and
   `upcheck` is off, carded buffers' CPU sides use demand-paged `VirtualAlloc` instead of
   D3D12 `L0` `shared_buffer`, saving **~1.1 GB of WDDM Shared GPU Memory** and ~3,700
@@ -86,24 +87,21 @@ Series X profile (ray tracing off).
 - **Coalesced `CARD_COMPARE` spans, `CopyBufferRegion`, and `VICTORY_JOIN_BARRIERS=1`**,
   plus scoped resource UAV barriers inside `ambient.rs` and removal of redundant cross-queue waits.
 
-### 3. CPU Frame Preparation, Descriptors, Textures & Visual Fixes
+### 4. CPU Frame Preparation, Descriptors, Textures & Visual Fixes
 - **NVIDIA 1M View Heap + O(1) `u64` bitmap dynamic slab allocator (`descriptor/host.rs`):**
   lazy 64-slot per-list slabs, batched `release_dynamic_many`, and immediate `tables_done()`
   on flight landing (`host.rs`) with zero refused descriptor tables.
 - **`WaitOnAddress` / `WakeByAddressAll` blocking fence waits (`fence.rs`)** and
   `ahead::drain()` before skin-bake uploads (`texture/ahead.rs`, `draw.rs`).
-- **Renderer Patch #1 (`VICTORY_PORT_CONSTANTS=1`, ON by default):** keeps the 185 MB
-  constants heap in place (`0` forgotten regions).
-- **Renderer Patch #2 (`VICTORY_PORT_DESCRIPTORS=1`, opt-in):** expanded from 6 to **11**
-  byte-verified Scarlett descriptor store hooks in `victory-loader/src/descriptor_sites.rs`
-  (kept OFF by default until the remaining unpatched writers below are hooked).
+- **O(dirty) `DIRTY_CARDED` tracking (`shadow.rs`)** + `writes_with_kind` view-memory separation
+  + `!flying()` `mapped()` gating + `VICTORY_LAND_THREADS=6`.
 - **Ambient light stand-in (`ambient.rs`):** `Role::RayMiss` (`CS_RayMiss_*`) specular sky
   cap preventing glowing eyes indoors, `x=0` border normal/AO tap fix, corner clamp floor
-  (`0.15 * level * room_luma`) so dark corners keep natural bounce light, and time-based
-  settling (`VICTORY_AMBIENT_SETTLE`).
+  (`0.15 * level * room_luma`), strict `Role::Resolve` depth SRV validation (D3D12 error `646`),
+  and time-based settling (`VICTORY_AMBIENT_SETTLE`).
 - **Safe internal render scale guard (`play-nvidia.ps1`):** clamps `-Scale <= 0.667` on
-  both Series X (`2560x1440` max internal) and Series S (`1280x720` max internal) to prevent
-  RT allocator pool overflow (`int 3` at `+0x2219650`).
+  `-Full4K` / `-SeriesS` to prevent RT allocator pool overflow (`int 3` at `+0x2219650`),
+  while allowing up to `1.0` at `1920x1080` / `2560x1440` `VICTORY_OUTPUT`.
 
 ---
 
@@ -170,6 +168,7 @@ $env:VICTORY_SHADER_OPT = '63'
 $env:VICTORY_WAVE_WIDE  = 'last'
 $env:VICTORY_NAN_SCRUB  = '1'
 $env:VICTORY_BVH_NO_HIT = '1'
+$env:VICTORY_PORT_CBV   = '1'
 
 target\release\victory.exe shaders --jobs 16 <path\to\your\dump>
 target\release\victory.exe warm --used --jobs 16 --save-library
@@ -179,27 +178,34 @@ target\release\victory.exe warm --used --jobs 16 --save-library
 `play-nvidia.ps1` auto-detects the executable from `victory.toml` (or pass `-Exe <path>`):
 
 ```powershell
-# Series X 1440p native + ReBAR 4 GB VRAM windows + Patch 1 + 60 FPS cap unlock
-.\scripts\play-nvidia.ps1 -Fps 60
+# Series X 1080p output + Ports 1, 2, 5, 6, 7 + ReBAR 4 GB VRAM windows + 60 FPS unlock (recommended)
+.\scripts\play-nvidia.ps1
 
-# Series X 1080p internal (-44% pixels, safe RT pool) + NVIDIA Smooth Motion (2x visual FPS)
-.\scripts\play-nvidia.ps1 -Fps 60 -Scale 0.5 -SmoothMotion
+# Series X 1080p native internal (scale 1.0) + Ports 1, 2, 5, 6, 7
+.\scripts\play-nvidia.ps1 -Scale 1.0
 
-# Series X 1296p internal (-19% pixels)
-.\scripts\play-nvidia.ps1 -Fps 60 -Scale 0.6
+# Series X 1440p output (1706x960 internal -> 2560x1440) + Ports 1, 2, 5, 6, 7
+.\scripts\play-nvidia.ps1 -Full1440p
 
-# 15s GPU per-pass & top-40 shader profiling (auto-uses diag build)
+# Series X 4K output (2560x1440 internal, original baseline resolution)
+.\scripts\play-nvidia.ps1 -Full4K
+
+# Series X 1080p + NVIDIA Smooth Motion (2x visual FPS)
+.\scripts\play-nvidia.ps1 -SmoothMotion
+
+# 15s GPU per-pass & top-40 shader profiling (auto-uses diag build with diagnostics feature)
 .\scripts\play-nvidia.ps1 -GpuTiming
 
-# Safe fallback mode (disables ReBAR windows, port patches, thin lists)
+# Safe fallback mode (disables port patches, ReBAR windows, and thin lists)
 .\scripts\play-nvidia.ps1 -Safe
 ```
 
-*(Other useful switches: `-SendBar`, `-TexStore`, `-SeriesS`, `-RayTracing`, `-Panel`, `-NoPortConstants`, `-PortDescriptors`, `-Residency`, `-Full4K`.)*
+*(Other useful switches: `-SendBar`, `-TexStore`, `-SeriesS`, `-RayTracing`, `-Panel`, `-NoPortCbv`, `-NoPortDescriptors`, `-NoPortGuard`, `-NoPortJournal`, `-NoPortConstants`, `-Residency`.)*
 
 ### Verification Before Committing
 ```powershell
-cargo test --locked --release -p victory-gpu --lib -- torn ambient warp_card_compare host_ram_card_staging
+cargo test --locked --release -p victory-shader --lib -- divergent_lds_atomics
+cargo test --locked --release -p victory-gpu --lib -- torn ambient warp_card_compare host_ram_card_staging changed_key12 room_only_wakes idle_sweep_restarts
 cargo run --locked -p xtask -- policy
 ```
 
@@ -209,7 +215,7 @@ cargo run --locked -p xtask -- policy
 
 Built on the combined work of the VIctory open-source ecosystem (commit history preserves upstream authors):
 - **[Marvisak/VIctory](https://github.com/Marvisak/VIctory)** — core loader, HLE runtime, D3D12 backend, and GFX10-to-DXIL recompiler.
-- **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)** — direct upstream base (`9576c45`: `VICTORY_THIN`, `VICTORY_ASYNC_SUBMIT`, `VICTORY_RELAY`, `VICTORY_LAND`, `VICTORY_CARD_STEPS`, Renderer Patches 1 & 2, `VICTORY_AMBIENT_SETTLE`, `VICTORY_TEXTURE_STORE`, FPS unlock, frame record/replay).
+- **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)** — direct upstream base (`c9c932c`: `VICTORY_THIN`, `VICTORY_ASYNC_SUBMIT`, `VICTORY_RELAY`, `VICTORY_LAND`, `VICTORY_CARD_STEPS`, Renderer Ports 1, 2, 5, 6, 7, `VICTORY_OUTPUT` / `VICTORY_UPSCALER`, `VICTORY_AMBIENT_SETTLE`, `VICTORY_TEXTURE_STORE`, FPS unlock, frame record/replay).
 - **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** — face animation, legacy FMA reflections, 32-bit int typed views, target format variants, texture read-back.
 - **[codec-d/cool_fox](https://github.com/codec-d/cool_fox)** — Wave32 guarded joins & active-loop lowering, immediate table release, `WaitOnAddress` fence waits, bake upload drain, residency budgets.
 - **[trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA)**, **DexNom/VIctory**, **Belobug/VIctory-Belobug-AMD**, **FQY55kai/ZJOU-VICTORY**, **myokex/victory-amd**, **Geckomacabre**, **cxy0072019-sketch**, and **romainhedouin**.

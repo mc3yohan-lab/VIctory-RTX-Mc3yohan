@@ -1,23 +1,23 @@
 # Launches the Xbox Series title tuned for NVIDIA RTX 4090 (24 GB VRAM, Wave32, 1M view heap)
-# and Intel Core i9-12900KF (8P/16T + 8E/8T), combining the best of:
-# - avatarmanz/VIctory-7900XTX latest (`722c0e1`): Renderer Patches 1+2 (VICTORY_PORT_CONSTANTS,
-#   VICTORY_PORT_DESCRIPTORS), all 4 Wave32 NVIDIA RT/BVH/tiled-cascade-shadow PRs (#4,#66,#82,#142),
-#   FPS unlock (VICTORY_FRAME_INTERVAL_MS), two-plane compose (VICTORY_PLANES), TablePlan, PR #24/#121,
-#   VICTORY_SHOW_NEW_LATER, AVX2 SYNC_IN_PLACE, SPANS_QUICK, UNDER_FUSED, LANE_CORE, upq copy queue.
-# - fxceless/victory-fork: Faces move (PR #927), legacy FMA water-reflection fix (PR #1026),
-#   32-bit int typed views (PR #684), VICTORY_TARGET_VARIANTS=1, xgamesave resilience.
-# - trustno1-coder/VIctory-NVIDIA + Korinocho + DexNom: VICTORY_NAN_SCRUB=1, rt_off_hashes.txt,
-#   VICTORY_FAIR_DUE=1, VICTORY_VIDEO_PLANES=1, VICTORY_TABLES_EARLY=1, hooks.rs render scale /
-#   own upscaler / watchdog disarm, Wave64 mask recovery (PR #155), Smooth Motion.
-# - Our RTX 4090 work: wide indirect (>65,535), MED3|LEGACY float shortcuts, VICTORY_BVH_NO_HIT=1,
-#   VICTORY_WAVE_WIDE=last, O(1) VICTORY_SKIP_PIPELINES in release, PR #23 shadow::exact guard,
-#   coalesced VirtualProtect, warm host-pipelines.bin.
+# and Intel Core i9-12900KF (8P/16T + 8E/8T), combining:
+# - avatarmanz/VIctory-7900XTX (`c9c932c`): Renderer Ports 1, 2, 5, 6, 7 (VICTORY_PORT_CONSTANTS,
+#   VICTORY_PORT_DESCRIPTORS, VICTORY_PORT_CBV, VICTORY_PORT_GUARD, VICTORY_PORT_JOURNAL),
+#   native VICTORY_OUTPUT + VICTORY_UPSCALER=6, Wave32 NVIDIA RT/BVH/tiled-cascade-shadow PRs,
+#   FPS unlock (VICTORY_FRAME_INTERVAL_MS), two-plane compose, TablePlan, AVX2 SYNC_IN_PLACE,
+#   SPANS_QUICK, UNDER_FUSED, LANE_CORE, upq copy queue.
+# - fxceless/victory-fork + trustno1-coder/VIctory-NVIDIA + codec-d/cool_fox:
+#   Faces move, legacy FMA reflections, 32-bit int typed views, VICTORY_TARGET_VARIANTS=1,
+#   D3D12 538 Compare state-decay fix, D3D12 646 ambient depth SRV fix, Wave32 LDS atomic ordering,
+#   TextureQueue::reschedule, sweep_batch wrap-around, VICTORY_NAN_SCRUB=1, watchdog disarm.
+# - VIctory-RTX RTX 4090 work: ReBAR 4 GB VRAM windows (WindowKb=4096), plain OS-RAM Card::staging,
+#   6-step VRAM CARD_COMPARE tree reduction, 12B PORT_DESCRIPTORS header diff (99.9993% accuracy),
+#   DIRTY_CARDED O(dirty), Tier-A pure-BVH auto-skip, Role::RayMiss eye fix, coalesced VirtualProtect.
 #
 # Usage:
-#   scripts\play-nvidia.ps1                        # Series X 1440p (2560x1440 internal) + ReBAR VRAM windows + Patch 1
-#   scripts\play-nvidia.ps1 -Fps 60                # Unlock 30 FPS cap to 60 FPS (game clock stays 1.00x)
-#   scripts\play-nvidia.ps1 -Scale 0.5 -Fps 60     # Series X 1080p internal (0.5 * 4K, -44% pixels) + temporal upscaler
-#   scripts\play-nvidia.ps1 -Scale 0.6 -Fps 60     # Series X 1296p internal (0.6 * 4K, -19% pixels) + temporal upscaler
+#   scripts\play-nvidia.ps1                        # Series X 1080p output + Ports 1,2,5,6,7 + ReBAR + 60 FPS unlock (fastest)
+#   scripts\play-nvidia.ps1 -Scale 1.0             # Series X native 1920x1080 internal + 1080p output
+#   scripts\play-nvidia.ps1 -Full1440p             # Series X 2560x1440 output (1706x960 internal -> 1440p upscaled)
+#   scripts\play-nvidia.ps1 -Full4K                # Series X 3840x2160 output (2560x1440 internal, console default)
 #   scripts\play-nvidia.ps1 -SmoothMotion          # Launches victory_sm.exe for NVIDIA App Smooth Motion (2x visual FPS)
 #   scripts\play-nvidia.ps1 -GpuTiming             # 15s diag profiling: exact GPU ms per pass & top-40 shaders + memory breakdown
 #   scripts\play-nvidia.ps1 -SendBar               # Put submission upload memory in VRAM via ReBAR (cuts GPU copy ms)
@@ -25,16 +25,12 @@
 #   scripts\play-nvidia.ps1 -RayTracing            # Test real Wave32 NVIDIA Ray Tracing + exact cascade shadows
 #   scripts\play-nvidia.ps1 -SeriesS               # Series S 1080p + 4K sharp HUD @ 720p internal (0.667)
 #   scripts\play-nvidia.ps1 -WaitTextures          # Sets VICTORY_TEXTURE_NO_WAIT=0 (slower streaming, avoids partial BCn blocks)
-#   scripts\play-nvidia.ps1 -SkipRtHashes          # Diagnostic only: skips 1,034 rt_off_hashes (kills indoor voxel bounce GI)
-#   scripts\play-nvidia.ps1 -PortDescriptors       # Renderer Patch 2 (opt-in; still misses some title writers -> slower texlate)
-#   scripts\play-nvidia.ps1 -NoPortConstants       # Disable Renderer Patch 1 (VICTORY_PORT_CONSTANTS)
-#   scripts\play-nvidia.ps1 -UpQueue               # Experimental dedicated D3D12 copy queue + joined barriers
-#   scripts\play-nvidia.ps1 -SweepPerHeap          # Coolfox per-heap buffer pass (VICTORY_SWEEP_PER_HEAP=1)
-#   scripts\play-nvidia.ps1 -NoAmbient             # Disables indirect light stand-in
-#   scripts\play-nvidia.ps1 -Panel                 # Live diagnostics overlay (auto-switches to diag build)
-#   scripts\play-nvidia.ps1 -Quality               # Conservative sync (RELAY=1, CARD_STEPS=0, NO_WAIT=0)
-#   scripts\play-nvidia.ps1 -Safe                  # Safe fallback path (disables port patches and thin lists)
-#   scripts\play-nvidia.ps1 -Full4K                # Series X 3840x2160 native output
+#   scripts\play-nvidia.ps1 -NoPortCbv             # Disable Renderer Port 5 (uses non-CBV shader cache key)
+#   scripts\play-nvidia.ps1 -NoPortDescriptors     # Disable Renderer Port 2 (full view-heap scan fallback)
+#   scripts\play-nvidia.ps1 -NoPortGuard           # Disable Renderer Port 6 (shared guard lock + parallel planning)
+#   scripts\play-nvidia.ps1 -NoPortJournal         # Disable Renderer Port 7 (early heap sync + 64-sharded journal)
+#   scripts\play-nvidia.ps1 -NoPortConstants       # Disable Renderer Port 1 (VICTORY_PORT_CONSTANTS)
+#   scripts\play-nvidia.ps1 -Safe                  # Safe fallback path (disables port patches, ReBAR windows, and thin lists)
 #   scripts\play-nvidia.ps1 -NoLog                 # Disable automatic log capture
 #
 # Run from a normal (non-elevated) PowerShell window so NVIDIA keeps its DXCache in the usual place.
@@ -42,8 +38,10 @@ param(
     [string]$Exe = '',
     [switch]$SeriesS,
     [double]$Scale = 0.0,
-    [double]$Fps = 0.0,
+    [double]$Fps = 60.0,
+    [switch]$Full1440p,
     [switch]$Full4K,
+    [switch]$FidelityFx,
     [switch]$WaitTextures,
     [switch]$TexStore,
     [switch]$SkipRtHashes,
@@ -52,6 +50,10 @@ param(
     [switch]$NoAmbient,
     [switch]$NoPortConstants,
     [switch]$PortDescriptors,
+    [switch]$NoPortDescriptors,
+    [switch]$NoPortCbv,
+    [switch]$NoPortGuard,
+    [switch]$NoPortJournal,
     [switch]$UpQueue,
     [switch]$SweepPerHeap,
     [switch]$XmaRefill,
@@ -147,13 +149,25 @@ $settings = @{
 }
 
 if (-not $NoPortConstants -and -not $Safe) {
-    # Renderer Patch 1 (avatarmanz): in-place 185 MB constants heap (verified 0 forgotten regions, saves ~10,800 fills/frame).
+    # Renderer Port 1: in-place 185 MB constants heap (verified 0 forgotten regions, saves ~10,800 fills/frame).
     $settings.VICTORY_PORT_CONSTANTS = '1'
 }
-if ($PortDescriptors -and -not $Safe) {
-    # Renderer Patch 2: 12-byte descriptor header diff + copy_simple mark ordering fixed.
-    # Saves ~10-11 ms/frame CPU in sync_heaps when verified at 0 missed live views.
+if ((-not $NoPortDescriptors -or $PortDescriptors) -and -not $Safe) {
+    # Renderer Port 2: 12-byte descriptor header diff + copy_simple mark ordering (99.9993% accuracy, 0.08 misses/frame).
     $settings.VICTORY_PORT_DESCRIPTORS = '1'
+}
+if (-not $NoPortCbv -and -not $Safe) {
+    # Renderer Port 5: read constant buffers in place as raw bytes (~22,000 fills/frame -> 0, -4.7 ms).
+    # Note: shader cache keys on VICTORY_PORT_CBV=1 (must match `victory shaders` / `victory warm`).
+    $settings.VICTORY_PORT_CBV = '1'
+}
+if (-not $NoPortGuard -and -not $Safe) {
+    # Renderer Port 6: shared write-guard lock with per-64 KiB claims + parallel refresh planning (-2 ms).
+    $settings.VICTORY_PORT_GUARD = '1'
+}
+if (-not $NoPortJournal -and -not $Safe) {
+    # Renderer Port 7: early heap sync at title submit + 64-sharded journal locks (-1 to -3 ms).
+    $settings.VICTORY_PORT_JOURNAL = '1'
 }
 if ($TexStore) {
     $texStoreDir = Join-Path $env:LOCALAPPDATA 'victory\cache\textures'
@@ -248,25 +262,32 @@ if ($RayTracing) {
 }
 
 if ($SeriesS) {
-    $settings.VICTORY_PLANES       = '1'
-    $settings.VICTORY_OWN_UPSCALER = '1'
+    $settings.VICTORY_PLANES   = '1'
+    $settings.VICTORY_UPSCALER = $(if ($FidelityFx) { '7' } else { '6' })
     # Series S at scale 1.0 hits a title breakpoint on start (trustno1-coder 033be27f); default to 720p internal (0.667).
     if ($Scale -le 0.0) { $Scale = 0.667 }
-} elseif (-not $Full4K) {
-    $settings.VICTORY_DISPLAY_MODE = '2560x1440'
+} else {
+    # Force the title's own temporal upscaler (6) by default so FidelityFX does not write unpatched
+    # descriptors under VICTORY_PORT_DESCRIPTORS=1.
+    $settings.VICTORY_UPSCALER = $(if ($FidelityFx) { '7' } else { '6' })
+    if ($Full1440p) {
+        $settings.VICTORY_OUTPUT = '2560x1440'
+    } elseif (-not $Full4K) {
+        # Upstream native output scaling: 1920x1080 output on Series X (~16 ms less GPU work vs 4K).
+        $settings.VICTORY_OUTPUT = '1920x1080'
+    }
 }
 
 if ($Scale -gt 0.0) {
-    # Both console profiles allocate their fixed RT pool for default 2/3 scale
-    # (Series X: 2/3 * 3840x2160 = 2560x1440; Series S: 2/3 * 1920x1080 = 1280x720).
-    # Values > 0.667 overflow the title's RT allocator pool and hit int3 at +0x2219650.
-    if ($Scale -gt 0.667) {
-        Write-Warning ("Scale {0} exceeds console RT pool max (0.667 = 2560x1440 on Series X; use -Scale 0.5 for 1920x1080 or -Scale 0.6 for 2304x1296). Clamping to 0.667." -f $Scale)
-        $Scale = 0.667
+    # At 3840x2160 (-Full4K) or Series S, >0.667 overflows the title's RT allocator pool (int3 at +0x2219650).
+    # At 1920x1080 or 2560x1440 output (`VICTORY_OUTPUT`), scale up to 1.0 fits inside the Series X RT pool.
+    $maxScale = if ($SeriesS -or $Full4K) { 0.667 } else { 1.0 }
+    if ($Scale -gt $maxScale) {
+        Write-Warning ("Scale {0} exceeds safe RT pool max ({1}) for this output mode. Clamping to {1}." -f $Scale, $maxScale)
+        $Scale = $maxScale
     }
-    $clamped = [math]::Min(0.667, [math]::Max(0.2, $Scale))
+    $clamped = [math]::Min($maxScale, [math]::Max(0.5, $Scale))
     $settings.VICTORY_RENDER_SCALE = ('{0:0.###}' -f $clamped).Replace(',', '.')
-    $settings.VICTORY_OWN_UPSCALER = '1'
 }
 
 if ($RecordPipelines) { $settings.VICTORY_PIPELINE_BOOK = '1' }
@@ -340,8 +361,9 @@ foreach ($k in $settings.Keys) {
 
 $Exe = (Resolve-Path -LiteralPath $Exe).Path
 $consoleArg = if ($SeriesS) { 'series-s' } else { 'series-x' }
-$mode = if ($SeriesS) { 'Series S 1080p+4K HUD' } elseif ($Full4K) { 'Series X 3840x2160' } else { 'Series X 2560x1440' }
+$mode = if ($SeriesS) { 'Series S 1080p+4K HUD' } elseif ($Full4K) { 'Series X 3840x2160' } elseif ($Full1440p) { 'Series X 2560x1440' } else { 'Series X 1920x1080' }
 if ($Scale -gt 0.0) { $mode += " @ scale $($settings.VICTORY_RENDER_SCALE)" }
+if ($Fps -gt 0.0) { $mode += ", cap ${Fps} FPS" }
 Write-Host "Starting VIctory ($Build, $mode) on NVIDIA RTX 4090 with $($settings.Count) switches..."
 
 $runArgs = @('run', $Exe, '--console', $consoleArg, '--execute')

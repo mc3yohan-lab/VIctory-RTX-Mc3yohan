@@ -3349,14 +3349,23 @@ impl State {
             Role::Air => AIR,
             Role::RayMiss => RAY_MISS,
         };
-        let image = entry(ResourceType::Uav, at);
-        let depth = match role {
-            Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air | Role::RayMiss => image,
-        };
-        let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
-            once!(?role, "no stand-in for the indirect light: other tables");
+        let Some((of, image)) = entry(ResourceType::Uav, at) else {
+            once!(?role, "no stand-in for the indirect light: missing image UAV");
             return false;
+        };
+        let depth = match role {
+            Role::Resolve => {
+                let Some((seen, depth)) = entry(ResourceType::Srv, DEPTH) else {
+                    once!(?role, "no stand-in for the indirect light: missing depth SRV");
+                    return false;
+                };
+                if (seen.Width, seen.Height) != (of.Width, of.Height) {
+                    once!(?role, "no stand-in for the indirect light: depth dimensions differ");
+                    return false;
+                }
+                Some(depth)
+            }
+            Role::Radiance | Role::Air | Role::RayMiss => None,
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT or R16G16B16A16_FLOAT for RayMiss.)
         let format_ok = match role {
@@ -3365,7 +3374,7 @@ impl State {
             Role::Radiance | Role::Air => of.Format.0 == 26,
         };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-        if !format_ok || (seen.Width, seen.Height) != (of.Width, of.Height) || volume != (role == Role::Air) {
+        if !format_ok || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
             return false;
         }
@@ -3395,8 +3404,9 @@ impl State {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
             return None;
         };
-        let resource = match crate::descriptor::view(table + u64::from(offset) * 4)? {
-            View::Shader(r, _) | View::Unordered(r, ..) => r,
+        let resource = match (kind, crate::descriptor::view(table + u64::from(offset) * 4)?) {
+            (ResourceType::Srv, View::Shader(r, _))
+            | (ResourceType::Uav, View::Unordered(r, ..)) => r,
             _ => return None,
         };
         let start = match self.ambient_tables.iter().find(|m| m.0 == slot) {

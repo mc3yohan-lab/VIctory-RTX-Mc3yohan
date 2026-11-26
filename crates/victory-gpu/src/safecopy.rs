@@ -206,6 +206,7 @@ unsafe extern "system" {
 /// `seen` holds `records * 32` bytes of ours that nothing else reads or
 /// writes meanwhile, and `bits` at least `records.div_ceil(64)` words, all
 /// 0; `title` is as [`copy`]'s source. [`on`] must have been asked.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) unsafe fn changed(title: *const u8, seen: *mut u8, records: usize, bits: &mut [u64]) -> bool {
     assert!(bits.len() >= records.div_ceil(64));
     // SAFETY: a fault reading title memory leaves through the failing exit

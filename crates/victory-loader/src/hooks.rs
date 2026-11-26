@@ -174,15 +174,23 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
         return 0;
     }
     let mut applied = 0;
-    if own {
+    let upstream_upscaler = crate::resolution::asked_upscaler().is_some();
+    if own && !upstream_upscaler {
         // SAFETY: forwarded from this function's contract.
         applied += usize::from(unsafe { apply(base, &OWN_UPSCALER) });
     }
     if let Some(text) = scale {
         match parse_scale(&text) {
             Some(scale) => {
+                // `resolution::apply_asked` handles `OWN_SCALE` (0x28f1e78..0x28f1e82) for
+                // scales in 0.5..=1.0; skip our overlapping 0x28f1e7e write there so both
+                // byte-checks stay clean while keeping our 0x28f1e87 max=min patch.
+                let upstream_scale = (0.5..=1.0).contains(&scale);
                 // With the own upscaler forced, FSR is left as it is.
-                for p in render_scale_patches(base, scale, !own) {
+                for p in render_scale_patches(base, scale, !own && !upstream_upscaler) {
+                    if upstream_scale && p.rva == 0x28f1e7e {
+                        continue;
+                    }
                     let p = Patch {
                         what: p.what,
                         rva: p.rva,
