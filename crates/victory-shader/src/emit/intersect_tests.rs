@@ -700,3 +700,23 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
         other => panic!("{:?}", other.map(|_| ())),
     }
 }
+
+#[test]
+fn a_node_test_that_answers_no_hit_reads_nothing() {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            super::lower::intersect::TEST_NO_HIT.set(None);
+        }
+    }
+    super::lower::intersect::TEST_NO_HIT.set(Some(true));
+    let _guard = Guard;
+    for wide in [true, false] {
+        let (shader, _) = build(wide, WHOLE).expect("no-hit lowers and validates");
+        assert!(!shader.root_srvs.contains(&super::SLOT_MEMORY));
+        assert!(!shader.root_uavs.contains(&super::SLOT_FAULTS));
+        let (shader_tbl, _) = build(wide, Descriptor::Table).expect("table no-hit lowers and validates");
+        assert!(!shader_tbl.root_srvs.contains(&super::SLOT_MEMORY));
+        assert!(!shader_tbl.root_uavs.contains(&super::SLOT_FAULTS));
+    }
+}

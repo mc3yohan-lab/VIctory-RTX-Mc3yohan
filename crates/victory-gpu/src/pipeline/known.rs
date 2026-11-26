@@ -214,13 +214,76 @@ pub fn use_translations(dir: PathBuf) {
     crate::shader_cache::use_shader_cache(dir);
 }
 
+/// Populates and saves the D3D12 pipeline library (`host-pipelines.bin`) in
+/// `dir` for the given known pipeline indices across `jobs` worker threads.
+/// Intended to run after isolated multi-process warming has already verified
+/// the pipelines and populated the driver shader cache.
+/// Returns `(succeeded, failed)`.
+pub fn populate_library(dir: &Path, which: &[usize], jobs: usize) -> (usize, usize) {
+    super::library::use_pipeline_cache(dir.to_path_buf());
+    let mut places = HashMap::new();
+    walk_shaders(dir, |stage, hash, at, len| {
+        let _ = places.insert(hash, (stage, at, len));
+    });
+    let wanted: HashSet<usize> = which.iter().copied().collect();
+    let mut entries = HashMap::new();
+    walk_pipelines(dir, |n, bytes| {
+        if wanted.contains(&n) {
+            entries.insert(n, bytes.to_vec());
+        }
+    });
+    let ordered: Vec<usize> = which.iter().copied().filter(|n| entries.contains_key(n)).collect();
+    if ordered.is_empty() {
+        return (0, 0);
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let ok = std::sync::atomic::AtomicUsize::new(0);
+    let fail = std::sync::atomic::AtomicUsize::new(0);
+    let workers = jobs.max(1).min(ordered.len());
+    let shaders_path = dir.join(SHADERS);
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| {
+                let Ok(mut file) = std::fs::File::open(&shaders_path) else { return };
+                let mut read = |hash: &[u8; 32]| {
+                    let &(_, at, len) = places.get(hash)?;
+                    let mut bytes = vec![0; len as usize];
+                    file.seek(SeekFrom::Start(at)).ok()?;
+                    file.read_exact(&mut bytes).ok()?;
+                    Some(bytes)
+                };
+                loop {
+                    let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(&n) = ordered.get(idx) else { break };
+                    let Some(entry) = entries.get(&n) else { continue };
+                    let made = parse(entry, &mut read)
+                        .and_then(|(shaders, g)| HostPipeline::new(&shaders, g.as_deref()))
+                        .is_some();
+                    if made {
+                        ok.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+    super::library::save(true);
+    (
+        ok.load(std::sync::atomic::Ordering::Relaxed),
+        fail.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Makes the host pipelines of those of `which` (numbers in the file) and
 /// lets each go again: the driver's cache on disk keeps them. `each` is told
 /// the number before, and what came of it after: milliseconds and whether
 /// there is one.
 pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64, bool)>)) {
     let mut places = HashMap::new();
-    walk_shaders(dir, |stage, hash, at, len| drop(places.insert(hash, (stage, at, len))));
+    walk_shaders(dir, |stage, hash, at, len| {
+        let _ = places.insert(hash, (stage, at, len));
+    });
     let Ok(mut file) = std::fs::File::open(dir.join(SHADERS)) else { return };
     let wanted: HashSet<usize> = which.iter().copied().collect();
     let mut entries = HashMap::new();

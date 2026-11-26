@@ -43,6 +43,9 @@ pub(crate) struct Pending {
     used: AtomicBool,
     /// A pass over the screen ([`GraphicsState::screen_pass`]).
     screen: bool,
+    /// Total microseconds draws have waited for this pipeline so far
+    /// ([`wait_once`]).
+    waited_us: AtomicU64,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -68,6 +71,7 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            waited_us: AtomicU64::new(0),
         }
     }
 
@@ -200,6 +204,14 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// Whether one pipeline is waited for at most one budget over the whole run,
+/// rather than stalling every frame it stays in view while compiling
+/// (`VICTORY_PIPELINE_WAIT_ONCE=0`: wait every frame as before).
+fn wait_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_ONCE").is_none_or(|v| v != "0"))
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
@@ -207,6 +219,15 @@ fn wait(p: &Pending, frame: u64) {
     if budget.is_zero() {
         return;
     }
+    let own = if wait_once() {
+        let own = budget.saturating_sub(Duration::from_micros(p.waited_us.load(Ordering::Relaxed)));
+        if own.is_zero() {
+            return;
+        }
+        own
+    } else {
+        Duration::MAX
+    };
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now); of the passes over the screen too.
     static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
@@ -217,7 +238,7 @@ fn wait(p: &Pending, frame: u64) {
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
-        let left = budget.saturating_sub(spent.1);
+        let left = budget.saturating_sub(spent.1).min(own);
         if shared {
             spent.1 += left;
         }
@@ -238,6 +259,9 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    if wait_once() && p.made.get().is_none() {
+        p.waited_us.fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
+    }
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
             ms = waited.as_millis() as u64,
@@ -283,7 +307,10 @@ fn slow_limit() -> usize {
         if std::env::var_os("VICTORY_PIPELINE_SLOW").is_some_and(|v| v == "0") {
             usize::MAX
         } else {
-            (worker_count(None, std::thread::available_parallelism().map_or(2, |n| n.get())) / 4).max(1)
+            let asked = std::env::var("VICTORY_PIPELINE_WORKERS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok());
+            (worker_count(asked, std::thread::available_parallelism().map_or(2, |n| n.get())) / 4).max(1)
         }
     })
 }
@@ -298,6 +325,9 @@ struct Queue {
     slow: VecDeque<Arc<Pending>>,
     slow_now: usize,
     requested: VecDeque<Arc<Pending>>,
+    /// Requested pipelines known to take long: served after fast requested
+    /// pipelines so quick draws are never stuck behind 10-second compiles.
+    requested_slow: VecDeque<Arc<Pending>>,
 }
 
 impl Queue {
@@ -308,6 +338,7 @@ impl Queue {
             slow: VecDeque::new(),
             slow_now: 0,
             requested: VecDeque::new(),
+            requested_slow: VecDeque::new(),
         }
     }
 
@@ -325,6 +356,8 @@ impl Queue {
         p.queue_state.store(priority, Ordering::Relaxed);
         if priority == REQUESTED && p.screen && screens_first() {
             self.screen.push_back(p.clone());
+        } else if priority == REQUESTED && slow {
+            self.requested_slow.push_back(p.clone());
         } else if priority == REQUESTED {
             self.requested.push_back(p.clone());
         } else if slow {
@@ -342,7 +375,11 @@ impl Queue {
         };
         let mut p = self.screen.pop_front();
         if p.is_none() && !screens_only {
-            p = self.requested.pop_front().or_else(|| unclaimed(&mut self.early));
+            p = self
+                .requested
+                .pop_front()
+                .or_else(|| self.requested_slow.pop_front())
+                .or_else(|| unclaimed(&mut self.early));
             if p.is_none() && self.slow_now < slow_limit {
                 p = unclaimed(&mut self.slow);
                 if let Some(p) = &p {
@@ -577,5 +614,21 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+    }
+
+    /// Fast requested pipelines compile ahead of known-slow requested pipelines,
+    /// while known-slow requested pipelines still preempt early background work.
+    #[test]
+    fn fast_requested_pipelines_go_before_slow_requested() {
+        let new = || Arc::new(Pending::new(Vec::new(), None));
+        let (slow_req, fast_req, early_fast) = (new(), new(), new());
+        let mut queue = Queue::new();
+        assert_eq!(queue.push_as(&early_fast, EARLY, false), Some(true));
+        assert_eq!(queue.push_as(&slow_req, REQUESTED, true), Some(true));
+        assert_eq!(queue.push_as(&fast_req, REQUESTED, false), Some(true));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &fast_req));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &slow_req));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &early_fast));
+        assert!(queue.pop(false, 1).is_none());
     }
 }

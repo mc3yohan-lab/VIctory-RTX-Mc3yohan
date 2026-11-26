@@ -266,7 +266,7 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
 /// The most groups in x that an indirect dispatch runs as the title asks:
 /// 65,535 is the most D3D12 names for a dispatch, 2^20 ([`SOURCE`]'s GROUPS)
 /// what is bounded here anyway (`VICTORY_INDIRECT_WIDE=0`: 65,535; a record
-/// that asks for more still runs 65,535).
+/// that asks for more still runs 65,535; `VICTORY_INDIRECT_WIDE=1`: force 2^20).
 ///
 /// The title's tile lists are dispatches of one group per tile, and two of
 /// them are classes of the picture's 8x4 tiles, 115,200 in all at
@@ -275,10 +275,263 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
 /// its last 1,905 tiles, the lowest of the picture. The console runs what it
 /// is asked (its dispatch counts are 32 bits), and so does an AMD card, whose
 /// dispatch packets and group numbers are the same; D3D12 does not look at
-/// indirect counts. Other cards stay at 65,535.
-fn widest(amd: bool) -> u32 {
-    let on = std::env::var_os("VICTORY_INDIRECT_WIDE").is_none_or(|v| v != "0");
-    if amd && on { 1 << 20 } else { 65_535 }
+/// indirect counts. Non-AMD hardware cards (such as NVIDIA) are probed once
+/// with a tiny 65,537-group indirect dispatch; cards that execute every group
+/// get 2^20 too, others stay at 65,535.
+fn widest(device: &ID3D12Device) -> u32 {
+    match std::env::var_os("VICTORY_INDIRECT_WIDE").as_deref() {
+        Some(v) if v == std::ffi::OsStr::new("0") => 65_535,
+        Some(v) if v == std::ffi::OsStr::new("1") => 1 << 20,
+        _ => {
+            if supports_wide_indirect(device) {
+                1 << 20
+            } else {
+                65_535
+            }
+        }
+    }
+}
+
+/// One-time probe cached per adapter LUID: whether `device` executes every
+/// group of a `65,537 x 1 x 1` indirect compute dispatch with distinct
+/// `SV_GroupID.x`.
+fn supports_wide_indirect(device: &ID3D12Device) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1,
+        IDXGIFactory4,
+    };
+
+    static CACHE: OnceLock<Mutex<HashMap<(u32, i32), bool>>> = OnceLock::new();
+    // SAFETY: plain query on a live device.
+    let luid = unsafe { device.GetAdapterLuid() };
+    let key = (luid.LowPart, luid.HighPart);
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(&known) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return known;
+    }
+
+    // SAFETY: plain DXGI query.
+    let desc = unsafe {
+        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(luid))
+            .and_then(|a| a.GetDesc1())
+            .ok()
+    };
+    let Some(desc) = desc else {
+        return false;
+    };
+    let supported = if desc.VendorId == 0x1002 {
+        true
+    } else if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 {
+        false
+    } else {
+        let ok = probe_wide_indirect(device).unwrap_or(false);
+        tracing::info!(
+            vendor = format_args!("{:#06x}", desc.VendorId),
+            supported = ok,
+            "probed wide indirect compute dispatch (>65,535 groups in x)"
+        );
+        ok
+    };
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, supported);
+    supported
+}
+
+/// Dispatches a tiny `65,537 x 1 x 1` indirect compute shader on `device` and
+/// checks that all 65,537 groups ran with max `SV_GroupID.x == 65,536`.
+fn probe_wide_indirect(device: &ID3D12Device) -> Option<bool> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC};
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+    const PROBE_GROUPS: u32 = 65_537;
+    const PROBE_CS: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer seen : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 group : SV_GroupID) {
+    uint was;
+    seen.InterlockedAdd(0, 1, was);
+    seen.InterlockedMax(4, group.x, was);
+}
+"#;
+
+    let mut code: Option<ID3DBlob> = None;
+    // SAFETY: static HLSL source and entry names; output blob is ours.
+    unsafe {
+        D3DCompile(
+            PROBE_CS.as_ptr().cast(),
+            PROBE_CS.len(),
+            s!("wide_probe"),
+            None,
+            None,
+            s!("main"),
+            s!("cs_5_1"),
+            0,
+            0,
+            &mut code,
+            None,
+        )
+        .ok()?;
+    }
+    let code = code?;
+    // SAFETY: live device and compiled shader blob; all resources stay alive until the fence completes.
+    unsafe {
+        let bytes =
+            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes).ok()?;
+        let pso: ID3D12PipelineState = device
+            .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: bytes.as_ptr().cast(),
+                    BytecodeLength: bytes.len(),
+                },
+                ..Default::default()
+            })
+            .ok()?;
+
+        let arg = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        };
+        let sig_desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: 12,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &arg,
+            NodeMask: 0,
+        };
+        let mut sig: Option<ID3D12CommandSignature> = None;
+        device
+            .CreateCommandSignature(&sig_desc, None::<&ID3D12RootSignature>, &mut sig)
+            .ok()?;
+        let sig = sig?;
+
+        let make_buf = |heap_type: D3D12_HEAP_TYPE,
+                        size: u64,
+                        flags: D3D12_RESOURCE_FLAGS,
+                        state: D3D12_RESOURCE_STATES|
+         -> Option<ID3D12Resource> {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: heap_type,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: size,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_UNKNOWN,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: flags,
+                ..Default::default()
+            };
+            let mut out: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut out)
+                .ok()?;
+            out
+        };
+
+        // Upload buffer holds [PROBE_GROUPS, 1, 1] at offset 0 and 16 zero bytes at offset 16.
+        let upload = make_buf(
+            D3D12_HEAP_TYPE_UPLOAD,
+            64,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+        )?;
+        let seen = make_buf(
+            D3D12_HEAP_TYPE_DEFAULT,
+            16,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        )?;
+        let readback = make_buf(
+            D3D12_HEAP_TYPE_READBACK,
+            16,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        )?;
+
+        let mut up_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        upload.Map(0, None, Some(&mut up_ptr)).ok()?;
+        std::ptr::write_bytes(up_ptr.cast::<u8>(), 0, 64);
+        let words = [PROBE_GROUPS, 1, 1];
+        std::ptr::copy_nonoverlapping(words.as_ptr(), up_ptr.cast::<u32>(), 3);
+        upload.Unmap(0, None);
+
+        let queue: ID3D12CommandQueue = device
+            .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            })
+            .ok()?;
+        let allocator: ID3D12CommandAllocator = device
+            .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+            .ok()?;
+        let list: ID3D12GraphicsCommandList = device
+            .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+            .ok()?;
+        let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+        let event = CreateEventW(None, false, false, None).ok()?;
+
+        list.CopyBufferRegion(&seen, 0, &upload, 16, 16);
+        list.ResourceBarrier(&[transition(
+            &seen,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        )]);
+        list.SetComputeRootSignature(&root);
+        list.SetPipelineState(&pso);
+        list.SetComputeRootUnorderedAccessView(0, seen.GetGPUVirtualAddress());
+        list.ExecuteIndirect(&sig, 1, &upload, 0, None, 0);
+        let uav = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: std::mem::ManuallyDrop::new(None),
+                }),
+            },
+        };
+        list.ResourceBarrier(&[
+            uav,
+            transition(
+                &seen,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            ),
+        ]);
+        list.CopyBufferRegion(&readback, 0, &seen, 0, 16);
+        list.Close().ok()?;
+
+        let lists = [Some(windows::core::Interface::cast::<ID3D12CommandList>(&list).ok()?)];
+        queue.ExecuteCommandLists(&lists);
+        queue.Signal(&fence, 1).ok()?;
+        fence.SetEventOnCompletion(1, event).ok()?;
+        let wait = WaitForSingleObject(event, 5_000);
+        let _ = CloseHandle(event);
+        if wait.0 != 0 {
+            return Some(false);
+        }
+
+        let mut rb_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let range = D3D12_RANGE { Begin: 0, End: 16 };
+        readback.Map(0, Some(&range), Some(&mut rb_ptr)).ok()?;
+        let count = rb_ptr.cast::<u32>().read_volatile();
+        let max_group = rb_ptr.cast::<u32>().add(1).read_volatile();
+        let empty = D3D12_RANGE { Begin: 0, End: 0 };
+        readback.Unmap(0, Some(&empty));
+        Some(count == PROBE_GROUPS && max_group == PROBE_GROUPS - 1)
+    }
 }
 
 /// Whether `device` is an AMD card's.
@@ -308,7 +561,7 @@ fn rest() -> u32 {
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
     #[cfg(feature = "diagnostics")]
     let batched = source == batch::SOURCE;
-    let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
+    let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(device), rest());
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -2981,7 +3234,9 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         let Some(mut gpu) = WarpHarness::on(false) else {
             return;
         };
-        if !amd(&gpu.device) || widest(true) == 65_535 {
+        let w = widest(&gpu.device);
+        eprintln!("card_runs_wide_indirect_dispatches: widest = {w}");
+        if w == 65_535 {
             return;
         }
         let worker = compile_cs(&gpu.device, CS).expect("the worker must compile");

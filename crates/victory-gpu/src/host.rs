@@ -923,7 +923,12 @@ fn create() -> windows::core::Result<Host> {
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
             // (RDNA has waves of 32 and 64, the vendor's older cards of 64 alone.)
             let amd = crate::indirect::amd(&device);
-            victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
+            let float_fast = if amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64 {
+                victory_shader::emit::rdna::ALL
+            } else {
+                victory_shader::emit::rdna::MED3 | victory_shader::emit::rdna::LEGACY
+            };
+            victory_shader::emit::set_host_rdna_mask(float_fast);
         }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
@@ -3398,7 +3403,23 @@ fn relay_worker() {
             }
         };
         match next {
-            Ok(items) => host.relay_land(items, &mut fetch),
+            Ok(mut items) => {
+                // Korinocho eade3566: the card has run these flights. Their
+                // lists' dynamic descriptor tables are given back here before
+                // landing, not 3-8 frames later when the flights drop
+                // (`VICTORY_TABLES_EARLY=0`: as before). Prevents NVIDIA's
+                // 1,000,000-view-heap dynamic slot pool from exhausting and
+                // dropping hundreds of draws per frame.
+                static EARLY: OnceLock<bool> = OnceLock::new();
+                if *EARLY.get_or_init(|| std::env::var_os("VICTORY_TABLES_EARLY").is_none_or(|v| v != "0")) {
+                    for item in &mut items {
+                        if let Late::Run(flight) = item {
+                            flight.lists.iter_mut().for_each(crate::list::Detached::tables_done);
+                        }
+                    }
+                }
+                host.relay_land(items, &mut fetch)
+            }
             Err(target) => {
                 let waiting = std::time::Instant::now();
                 #[cfg(feature = "diagnostics")]
@@ -8804,6 +8825,18 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        self.present_over(texture, state, None, frame)
+    }
+
+    /// [`Self::present`], with an optional second plane laid over `texture`
+    /// (`crate::compose`, `VICTORY_COMPOSE=1` for Series S 4K HUD plane).
+    pub(crate) fn present_over(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        over: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -8887,7 +8920,11 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ),
             ]);
-            list.CopyResource(&back, texture);
+            let laid = over.and_then(|(ui, ui_state)| crate::compose::record(&self.device, list, texture, ui, ui_state));
+            if let Some(laid) = &laid {
+                copy.keep(laid);
+            }
+            list.CopyResource(&back, laid.as_ref().unwrap_or(texture));
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))

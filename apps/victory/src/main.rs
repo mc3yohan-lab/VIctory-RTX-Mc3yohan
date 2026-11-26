@@ -123,6 +123,10 @@ enum Command {
         /// Only the pipelines earlier runs drew with.
         #[arg(long)]
         used: bool,
+        /// After warming the driver cache, also populate and save
+        /// `host-pipelines.bin` in-process for all non-bad matching pipelines.
+        #[arg(long)]
+        save_library: bool,
         /// (What the processes it starts are given.)
         #[arg(long, hide = true)]
         these: Option<String>,
@@ -215,7 +219,14 @@ fn main() -> Result<()> {
         }
         Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
         #[cfg(windows)]
-        Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        Command::Warm {
+            jobs,
+            limit,
+            again,
+            used,
+            save_library,
+            these,
+        } => warm::run(jobs, limit, again, used, save_library, these),
         Command::Run {
             exe,
             unimplemented,

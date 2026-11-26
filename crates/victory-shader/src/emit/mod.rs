@@ -118,7 +118,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
+pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_host_rdna_mask};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -506,12 +506,17 @@ pub fn emit(
                 }
             }
         }
-        // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
-        // waves: this form puts group barriers inside branches and loops, and runs 121-124
-        // lost the card in a submission of two programs that had just moved to it
-        // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
-        // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // Off unless asked for (`VICTORY_WAVE_WIDE=1` before local waves, or
+        // `VICTORY_WAVE_WIDE=last` only if every barrier-free / local-wave path
+        // still left the program at wave64): this form puts group barriers
+        // inside branches and loops, and runs 121-124 lost the card in a
+        // submission of two programs that had just moved to it
+        // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs'
+        // form below, which has no barrier, stays on.
+        let wide_mode = std::env::var_os("VICTORY_WAVE_WIDE");
+        let wide_on = wide_mode.as_deref() == Some(std::ffi::OsStr::new("1"));
+        let wide_last = wide_mode.as_deref() == Some(std::ffi::OsStr::new("last"));
+        let mut deep = None;
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -522,7 +527,7 @@ pub fn emit(
                 // lane runs, where the two host waves can exchange.
                 // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
                 let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
-                let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
+                deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
@@ -590,6 +595,21 @@ pub fn emit(
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
+                }
+            }
+        }
+        if wide_last {
+            let bases = [
+                deep.as_ref().map(|f| &f.0),
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            if let Some(base) = bases.into_iter().flatten().next() {
+                let again = widen(c, native, base, why);
+                report("wave-wide branches (last)", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
                 }
             }
         }

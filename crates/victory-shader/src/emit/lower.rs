@@ -1117,12 +1117,25 @@ pub fn host_settings() -> [u32; 4] {
     [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna()]
 }
 
-static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static HOST_RDNA: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Tells the translator that the host's shaders run on AMD RDNA hardware
 /// ([`super::rdna_float`]).
 pub fn set_host_rdna(on: bool) {
-    HOST_RDNA.store(on, std::sync::atomic::Ordering::Relaxed);
+    HOST_RDNA.store(
+        if on { super::rdna::ALL } else { 0 },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Tells the translator which [`super::rdna`] float shortcut bits are safe
+/// for the host GPU (all bits on AMD RDNA; `MED3 | LEGACY` on IEEE-754 hosts
+/// such as NVIDIA).
+pub fn set_host_rdna_mask(bits: u32) {
+    HOST_RDNA.store(
+        bits & super::rdna::ALL,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 #[cfg(test)]
@@ -1137,7 +1150,7 @@ pub(super) fn host_rdna() -> u32 {
     if let Some(bits) = TEST_RDNA.get() {
         return bits;
     }
-    if HOST_RDNA.load(std::sync::atomic::Ordering::Relaxed) { super::rdna_float() } else { 0 }
+    HOST_RDNA.load(std::sync::atomic::Ordering::Relaxed) & super::rdna_float()
 }
 
 /// The refusal of a first half of an interpolation whose result is read
@@ -6231,7 +6244,7 @@ impl<'a> Lower<'a> {
                 }
                 None => self.handle(site, src, false, (11, 0))?,
             };
-            if Self::wide_loads() {
+            if Self::wide_loads() && !(size && root) {
                 for (k, x) in self.raw_dwords(h, addr, count).into_iter().enumerate() {
                     self.write(inst, Reg::S(code + k as u8), x, None);
                 }

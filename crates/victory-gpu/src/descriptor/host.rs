@@ -1422,16 +1422,20 @@ pub(crate) const DYNAMIC: u32 = 1 << 18;
 /// play-1125-0127: 27,000 to 35,000 tables a frame, up to 3,285 of them
 /// refused, with 2,639 indirect draws and dispatches).
 fn dynamic_slots(count: u32, null: u32) -> u32 {
-    static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
+    static ASKED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let asked = *ASKED.get_or_init(|| {
         std::env::var("VICTORY_DYNAMIC_SLOTS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(DYNAMIC << 2)
     });
     if null < PORTABLE_VIEWS {
-        return DYNAMIC;
+        // On 1M-capped hosts (NVIDIA), default to DYNAMIC (262,144) leaving
+        // ~737k title slots, while still honoring an explicit override bounded
+        // so at least 524,288 title slots remain.
+        let max_on_capped = null.saturating_sub(1 << 19).max(DYNAMIC);
+        return asked.unwrap_or(DYNAMIC).clamp(DYNAMIC / 2, max_on_capped);
     }
+    let most = asked.unwrap_or(DYNAMIC << 2);
     null.saturating_sub(count).min(most).max(DYNAMIC)
 }
 
@@ -2580,8 +2584,8 @@ impl HostHeap {
                 if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
                     return None;
                 }
-                let twin = twinned(&view);
-                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
+                let twin = self.raw != 0 && twinned(&view);
+                let kept = make_twinned(&view, views.slot(at), twin.then(|| views.slot(at + 1)))?;
                 let listed = Listed {
                     kind: crate::draw::view_kind(&view),
                     texture: is_texture_view(&view),

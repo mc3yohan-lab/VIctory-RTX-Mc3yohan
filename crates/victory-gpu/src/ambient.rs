@@ -322,10 +322,15 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     float3 was = unpack(light[p]);
     // What the program left counts as far as it can be true: the sky's light
-    // outdoors, not the blocks of other memory.
-    float top = max(dot(found, LUMA) * most, 1e-6);
-    float has = dot(was, LUMA);
-    was *= min(1.0, top / max(has, 1e-6));
+    // outdoors, not the blocks of other memory. When screen-space radiance is
+    // dark/unready (loading or missing passes), keep existing light instead of
+    // clamping it down to pitch-black silhouettes.
+    float found_luma = dot(found, LUMA);
+    if (found_luma > 1e-4) {
+        float top = max(found_luma * most, 1e-6);
+        float has = dot(was, LUMA);
+        was *= min(1.0, top / max(has, 1e-6));
+    }
     light[p] = pack(max(was, found));
 }
 #endif
@@ -421,6 +426,19 @@ pub(crate) struct Views {
     pub(crate) slices: u32,
 }
 
+/// Upper cap multiplier on indirect light (`VICTORY_AMBIENT_MOST`, default 4.0;
+/// 2.0 avoids hazy overbright interiors when ray tracing is off).
+fn most() -> f32 {
+    static MOST: OnceLock<f32> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_AMBIENT_MOST")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|&v| v.is_finite() && v > 0.0)
+            .unwrap_or(4.0)
+    })
+}
+
 /// After the title's program of that role, in `list` with the program's view
 /// heap set. Replaces the list's compute root signature and pipeline; false
 /// if it recorded nothing.
@@ -459,7 +477,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[6] = views.size[0];
     words[7] = views.size[1];
     words[8] = 0.04f32.to_bits();
-    words[9] = 4.0f32.to_bits();
+    words[9] = most().to_bits();
     words[10] = air().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's

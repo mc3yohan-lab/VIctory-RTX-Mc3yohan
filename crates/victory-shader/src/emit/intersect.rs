@@ -37,6 +37,24 @@ thread_local! {
     /// and their directory.)
     pub(in crate::emit) static TEST_MEMORY: std::cell::Cell<Option<(u32, u64)>> =
         const { std::cell::Cell::new(None) };
+    /// A test's override for [`no_hit`], for its thread only.
+    pub(in crate::emit) static TEST_NO_HIT: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_BVH_NO_HIT=1`: every ray-tracing node test answers no hit without
+/// reading title memory, when `VICTORY_BVH_BUILDER` is off. Saves shader size,
+/// compile time, and title-memory page lookups when ray tracing is disabled.
+fn no_hit() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_NO_HIT.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_BVH_NO_HIT").is_some_and(|v| v == "1")
+            && !std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")
+    })
 }
 
 /// Where the instruction's node is.
@@ -123,6 +141,19 @@ impl<'a> Lower<'a> {
             x.push(self.i32_of(v)?);
         }
         let pointer = x[0];
+        if no_hit() {
+            let c = self.cur;
+            let (k4, k6) = (self.s.m.i32(4), self.s.m.i32(6));
+            let pair = self.s.m.bin(c, Bin::And, pointer, k6);
+            let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
+            let none = self.s.m.i32(bvh::NONE);
+            let miss = bvh::MISS.map(|f| self.s.m.i32(f.to_bits()));
+            for (k, m) in miss.into_iter().enumerate() {
+                let r = self.s.m.select(c, is_box, none, m);
+                self.write(inst, Reg::V(dst + k as u8), r, guard);
+            }
+            return Ok(());
+        }
         let pointer_high = wide.then(|| x[1]);
         let f: Vec<V> = x[1 + usize::from(wide)..]
             .iter()

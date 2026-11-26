@@ -14,9 +14,10 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
 use windows_sys::Win32::UI::WindowsAndMessaging::{self as wm, HMENU};
-use windows_sys::core::{PCSTR, PCWSTR, w};
+use windows_sys::core::{PCSTR, PCWSTR, s, w};
 
 use crate::{HleModule, hle_export};
 
@@ -153,7 +154,30 @@ pub extern "system" fn CreateWindowExA(
 /// its proportions, and centred; what it shows is scaled to it (the swap
 /// chain stretches). `VICTORY_WINDOW_MAX=WIDTHxHEIGHT` applies a smaller
 /// limit without changing the title's render targets.
+/// Enables per-monitor DPI awareness v2 once before any top-level window is
+/// sized or created, so Windows reports physical monitor pixels instead of
+/// DPI-virtualised coordinates that cause DWM double-scaling and resize jumps.
+fn enable_dpi_awareness() {
+    static DONE: std::sync::Once = std::sync::Once::new();
+    DONE.call_once(|| {
+        type SetContext = unsafe extern "system" fn(isize) -> i32;
+        const PER_MONITOR_AWARE_V2: isize = -4;
+        // SAFETY: user32.dll is loaded in this process; we resolve and call
+        // `SetProcessDpiAwarenessContext` dynamically for compatibility.
+        unsafe {
+            let user32 = GetModuleHandleW(w!("user32.dll"));
+            if !user32.is_null()
+                && let Some(proc) = GetProcAddress(user32, s!("SetProcessDpiAwarenessContext"))
+            {
+                let set_ctx: SetContext = std::mem::transmute(proc);
+                let _ = set_ctx(PER_MONITOR_AWARE_V2);
+            }
+        }
+    });
+}
+
 fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
+    enable_dpi_awareness();
     let mut area = RECT::default();
     // SAFETY: `area` receives the primary monitor's work area.
     let known =

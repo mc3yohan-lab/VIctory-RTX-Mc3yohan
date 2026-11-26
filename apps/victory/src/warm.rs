@@ -26,7 +26,14 @@ fn folder() -> Result<PathBuf> {
     Ok(cfg.cache_subdir("shaders")?.with_file_name("pipelines"))
 }
 
-pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, these: Option<String>) -> Result<()> {
+pub fn run(
+    jobs: Option<usize>,
+    limit: Option<usize>,
+    again: bool,
+    used: bool,
+    save_library: bool,
+    these: Option<String>,
+) -> Result<()> {
     let dir = folder()?;
     if let Some(these) = these {
         return make(&dir, &these);
@@ -83,7 +90,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                     while !rest.is_empty() {
                         let (made, ended) = child(rest, |n, ms, there| {
                             if ms >= SLOW_MS {
-                                let _ = writeln!(lock(&slow_out), "\n{} {ms:.0}", keys[n]);
+                                let _ = writeln!(lock(&slow_out), "{} {ms:.0}", keys[n]);
                             }
                             let mut state = lock(&state);
                             state.0.push(ms);
@@ -124,6 +131,25 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         times.last().copied().unwrap_or(0.0),
         times.iter().sum::<f64>() / 1e3
     );
+    if save_library {
+        let lib_began = Instant::now();
+        let bad_now = std::fs::read_to_string(&bad_file).unwrap_or_default();
+        let bad_now: HashSet<&str> = bad_now.lines().filter_map(|l| l.split(' ').next()).collect();
+        let mut targets: Vec<usize> = (0..keys.len())
+            .filter(|&n| {
+                let key = keys[n].as_str();
+                !bad_now.contains(key) && (!used || early.contains(key))
+            })
+            .collect();
+        targets.sort_by_key(|&n| (!early.contains(keys[n].as_str()), &keys[n]));
+        targets.truncate(limit.unwrap_or(usize::MAX));
+        println!("saving {} verified pipelines into host-pipelines.bin ({jobs} threads)...", targets.len());
+        let (ok, fail) = known::populate_library(&dir, &targets, jobs);
+        println!(
+            "host-pipelines.bin saved in {:.1} s ({ok} stored/loaded, {fail} no host pipeline)",
+            lib_began.elapsed().as_secs_f64()
+        );
+    }
     Ok(())
 }
 

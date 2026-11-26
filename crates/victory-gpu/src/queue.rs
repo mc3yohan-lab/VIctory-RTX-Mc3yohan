@@ -924,6 +924,8 @@ extern "system" fn present(
             crate::capture::dump_targets(frame);
         }
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    note_planes(planes, plane_parameters);
     #[cfg(windows)]
     if behind::on() && !this.is_null() {
         const COPY_SOURCE: u32 = 0x800;
@@ -949,7 +951,9 @@ extern "system" fn present(
             None
         };
         let resource = texture.as_ref().map_or(0, |t| t.0);
-        behind::present(this, texture.map(|(_, copy, state)| (copy, state)), Shown { frame, resource });
+        let over = second_plane(planes, plane_parameters, resource as This)
+            .map(|(copy, state)| (copy, if crate::list::thin::wanted() { u32::MAX } else { state }));
+        behind::present(this, texture.map(|(_, copy, state)| (copy, state)), Shown { frame, resource, over });
         called.end();
         #[cfg(feature = "diagnostics")]
         frame_ends();
@@ -969,7 +973,8 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        show(texture, state, Shown { frame, resource: resource as usize });
+        let over = second_plane(planes, plane_parameters, resource);
+        show(texture, state, Shown { frame, resource: resource as usize, over });
         crate::resource::host_transition(resource, state);
         let _ = host;
     }
@@ -995,10 +1000,88 @@ fn frame_ends() {
 
 /// The frame a present shows, and the title's resource it shows.
 #[cfg(windows)]
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Shown {
     frame: u64,
     resource: usize,
+    /// Optional second plane laid over the shown one (`VICTORY_COMPOSE=1`),
+    /// and its host state (`u32::MAX`: read from `t.state` when shown).
+    over: Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
+}
+
+/// A present's second plane, to be laid over the first (`crate::compose`) with
+/// `VICTORY_COMPOSE=1` (Series S 4K interface plane over 1080p game plane).
+#[cfg(windows)]
+fn second_plane(
+    planes: u32,
+    plane_parameters: *const Plane,
+    first: This,
+) -> Option<(std::sync::Arc<crate::resource::HostTexture>, u32)> {
+    const STRIDE: usize = 72;
+    const COPY_SOURCE: u32 = 0x800;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_COMPOSE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("present planes: a second plane is laid over the first (VICTORY_COMPOSE=1)");
+        }
+        on
+    });
+    if !on || planes < 2 || plane_parameters.is_null() {
+        return None;
+    }
+    // SAFETY: the title passes `planes` descriptions of `STRIDE` bytes.
+    let plane = unsafe { plane_parameters.cast::<u8>().add(STRIDE).cast::<Plane>().as_ref() }?;
+    if plane.count == 0 || plane.resources.is_null() {
+        return None;
+    }
+    // SAFETY: the plane lists `count` resources.
+    let resource = unsafe { *plane.resources };
+    if resource == first {
+        return None;
+    }
+    let copy = crate::resource::host_copy(resource)?;
+    let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+    crate::resource::host_transition(resource, state);
+    Some((copy, state))
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn note_planes(planes: u32, plane_parameters: *const Plane) {
+    const STRIDE: usize = 72;
+    static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+    let frame = FRAMES.load(Ordering::Relaxed);
+    let changed = LAST.swap(u64::from(planes), Ordering::Relaxed) != u64::from(planes);
+    if !changed && !(frame.is_power_of_two() && frame <= 4096) {
+        return;
+    }
+    if plane_parameters.is_null() {
+        return;
+    }
+    for i in 0..planes.min(4) as usize {
+        // SAFETY: the title passes `planes` descriptions of `STRIDE` bytes.
+        let Some(plane) = (unsafe { plane_parameters.cast::<u8>().add(i * STRIDE).cast::<Plane>().as_ref() }) else {
+            continue;
+        };
+        if plane.resources.is_null() {
+            continue;
+        }
+        for k in 0..plane.count.min(2) as usize {
+            // SAFETY: the plane lists `count` resources.
+            let resource = unsafe { *plane.resources.add(k) };
+            let desc = crate::resource::texture_memory(resource).map(|m| m.1);
+            tracing::info!(
+                frame,
+                planes,
+                plane = i,
+                count = plane.count,
+                resource = ?resource,
+                hosted = crate::resource::host_copy(resource).is_some(),
+                desc = ?desc,
+                "present plane"
+            );
+        }
+    }
 }
 
 /// Shows `texture`, in host state `state`, in our window.
@@ -1007,7 +1090,11 @@ fn show(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u
     let Some(host) = crate::host::host() else {
         return;
     };
-    let shown = host.present(texture, state, what.frame);
+    let over = what.over.as_ref().map(|(t, s)| {
+        let s = if *s == u32::MAX { t.state.load(Ordering::Relaxed) } else { *s };
+        (&t.texture, s)
+    });
+    let shown = host.present_over(texture, state, over, what.frame);
     #[cfg(feature = "diagnostics")]
     blinks(what.frame, what.resource as This, state, shown);
     #[cfg(not(feature = "diagnostics"))]

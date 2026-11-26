@@ -2002,6 +2002,10 @@ fn open(g: &mut Guards, start: usize, end: usize) -> usize {
 }
 
 /// Gives write access back to `blocks`, guarded ones.
+/// Coalesces consecutive 64 KiB blocks into a single `VirtualProtect` call per
+/// contiguous run to slash kernel VAD lock contention and cross-core TLB
+/// shootdowns (with automatic per-block fallback if a run fails or touches
+/// unexpected protection).
 fn unguard(g: &mut Guards, blocks: &[usize]) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
     #[cfg(feature = "diagnostics")]
@@ -2013,7 +2017,7 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
         g.clean.remove(block);
         PUBLISHED.clear(block);
     }
-    for &block in blocks {
+    let unguard_one = |block: usize| {
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe {
@@ -2026,6 +2030,53 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
             }
         }
         PROTECTED.clear(block);
+    };
+    if blocks.len() <= 1 {
+        for &block in blocks {
+            unguard_one(block);
+        }
+    } else {
+        let mut sorted: Vec<usize> = blocks.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut i = 0;
+        while i < sorted.len() {
+            let start = sorted[i];
+            let mut end = start + 1;
+            let mut j = i + 1;
+            while j < sorted.len() && sorted[j] == end {
+                end += 1;
+                j += 1;
+            }
+            let count = end - start;
+            if count == 1 {
+                unguard_one(start);
+            } else {
+                let mut old = 0;
+                // SAFETY: contiguous blocks we previously made read-only.
+                let ok = unsafe {
+                    VirtualProtect((start * BLOCK) as *const _, count * BLOCK, PAGE_READWRITE, &mut old) != 0
+                };
+                if ok && matches!(old, PAGE_READONLY | PAGE_READWRITE) {
+                    for block in start..end {
+                        PROTECTED.clear(block);
+                    }
+                } else {
+                    if ok {
+                        // Restore unexpected protection before retrying block-by-block.
+                        let mut ignored = 0;
+                        // SAFETY: reversing the call that just succeeded.
+                        unsafe {
+                            VirtualProtect((start * BLOCK) as *const _, count * BLOCK, old, &mut ignored);
+                        }
+                    }
+                    for block in start..end {
+                        unguard_one(block);
+                    }
+                }
+            }
+            i = j;
+        }
     }
     #[cfg(feature = "diagnostics")]
     if !blocks.is_empty() {
@@ -2789,6 +2840,46 @@ mod tests {
         // Before the view goes, as the runtime does: the address may be
         // another test's the moment it is free.
         title_memory_unmapping(view, 2 * BLOCK);
+        // SAFETY: our view.
+        unsafe {
+            UnmapViewOfFile(
+                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: view as *mut _,
+                },
+            )
+        };
+    }
+
+    /// Unguarding a multi-block contiguous span opens every block cleanly in one
+    /// coalesced protection change and allows immediate writes across all blocks.
+    #[test]
+    fn unguard_coalesces_contiguous_blocks() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+        };
+        const BLOCKS: usize = 4;
+        // SAFETY: a pagefile section of 4 blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (BLOCKS * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCKS * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        assert!(guard(view, view + BLOCKS * BLOCK).is_some());
+        // Open all 4 blocks via `writing`, which calls `unguard` over the full span.
+        writing(view, BLOCKS * BLOCK);
+        for b in 0..BLOCKS {
+            // SAFETY: every block in our mapping is now read-write.
+            unsafe { ((view + b * BLOCK + 64) as *mut u8).write_volatile(0xA5) };
+        }
+        title_memory_unmapping(view, BLOCKS * BLOCK);
         // SAFETY: our view.
         unsafe {
             UnmapViewOfFile(

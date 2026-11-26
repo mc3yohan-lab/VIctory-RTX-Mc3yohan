@@ -573,11 +573,18 @@ pub(crate) fn pipeline(
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+    static SAVE_EVERY: OnceLock<std::time::Duration> = OnceLock::new();
+    let save_every = *SAVE_EVERY.get_or_init(|| {
+        let secs = std::env::var("VICTORY_LIBRARY_SAVE_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(90);
+        std::time::Duration::from_secs(secs)
+    });
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+        if !now && last.is_some_and(|t| t.elapsed() < save_every) {
             return;
         }
         *last = Some(std::time::Instant::now());
