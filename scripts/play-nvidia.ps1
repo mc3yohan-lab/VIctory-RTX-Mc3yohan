@@ -1,26 +1,33 @@
 # Launches the Xbox Series title tuned for NVIDIA RTX 4090 (24 GB VRAM, Wave32, 1M view heap)
 # and Intel Core i9-12900KF (8P/16T + 8E/8T), combining the best of:
-# - avatarmanz/VIctory-7900XTX latest (VICTORY_SHOW_NEW_LATER, AVX2 SYNC_IN_PLACE, SPANS_QUICK,
-#   UNDER_FUSED, METER_THREAD, LANE_CORE, upq copy queue)
-# - Korinocho/victory-fork (22.2+ FPS 1440p perf set + VICTORY_TABLES_EARLY=1)
-# - trustno1-coder/VIctory-NVIDIA (Faces move PR #927, VICTORY_NAN_SCRUB=1, rt_off_hashes.txt,
-#   VICTORY_FAIR_DUE=1, VICTORY_VIDEO_PLANES=1, VICTORY_TARGET_VARIANTS=1, hooks.rs render scale /
-#   own upscaler / watchdog disarm, Series S 4K HUD compose.rs, Smooth Motion)
+# - avatarmanz/VIctory-7900XTX latest (`722c0e1`): Renderer Patches 1+2 (VICTORY_PORT_CONSTANTS,
+#   VICTORY_PORT_DESCRIPTORS), all 4 Wave32 NVIDIA RT/BVH/tiled-cascade-shadow PRs (#4,#66,#82,#142),
+#   FPS unlock (VICTORY_FRAME_INTERVAL_MS), two-plane compose (VICTORY_PLANES), TablePlan, PR #24/#121,
+#   VICTORY_SHOW_NEW_LATER, AVX2 SYNC_IN_PLACE, SPANS_QUICK, UNDER_FUSED, LANE_CORE, upq copy queue.
+# - fxceless/victory-fork: Faces move (PR #927), legacy FMA water-reflection fix (PR #1026),
+#   32-bit int typed views (PR #684), VICTORY_TARGET_VARIANTS=1, xgamesave resilience.
+# - trustno1-coder/VIctory-NVIDIA + Korinocho + DexNom: VICTORY_NAN_SCRUB=1, rt_off_hashes.txt,
+#   VICTORY_FAIR_DUE=1, VICTORY_VIDEO_PLANES=1, VICTORY_TABLES_EARLY=1, hooks.rs render scale /
+#   own upscaler / watchdog disarm, Wave64 mask recovery (PR #155), Smooth Motion.
 # - Our RTX 4090 work: wide indirect (>65,535), MED3|LEGACY float shortcuts, VICTORY_BVH_NO_HIT=1,
-#   VICTORY_WAVE_WIDE=last, O(1) VICTORY_SKIP_PIPELINES in release, coalesced VirtualProtect, warm host-pipelines.bin.
+#   VICTORY_WAVE_WIDE=last, O(1) VICTORY_SKIP_PIPELINES in release, PR #23 shadow::exact guard,
+#   coalesced VirtualProtect, warm host-pipelines.bin.
 #
 # Usage:
-#   scripts\play-nvidia.ps1                        # Series X 1440p native (clean textures, bounded ambient, RT-off hashes, release)
-#   scripts\play-nvidia.ps1 -Scale 0.75            # Series X 1440p @ 75% internal + temporal upscaler (push ~30 FPS)
+#   scripts\play-nvidia.ps1                        # Series X 1440p + Renderer Patches 1+2 (clean textures, ambient, RT-off)
+#   scripts\play-nvidia.ps1 -Fps 60                # Unlock 30 FPS cap to 60 FPS (game clock stays 1.00x)
+#   scripts\play-nvidia.ps1 -RayTracing            # Test real Wave32 NVIDIA Ray Tracing + exact cascade shadows!
+#   scripts\play-nvidia.ps1 -UpQueue               # Dedicated D3D12 copy queue + joined barriers
 #   scripts\play-nvidia.ps1 -SeriesS               # Series S 1080p + 4K sharp HUD @ 720p internal (0.667)
-#   scripts\play-nvidia.ps1 -SeriesS -Scale 0.5    # Max FPS Series S (540p internal + 4K HUD)
+#   scripts\play-nvidia.ps1 -Scale 0.75            # Series X 1440p @ 75% internal + temporal upscaler
+#   scripts\play-nvidia.ps1 -NoPortPatches         # A/B test without VICTORY_PORT_CONSTANTS / VICTORY_PORT_DESCRIPTORS
 #   scripts\play-nvidia.ps1 -SmoothMotion          # Launches victory_sm.exe for NVIDIA App Smooth Motion (2x visual FPS)
-#   scripts\play-nvidia.ps1 -FastTextures          # Sets VICTORY_TEXTURE_NO_WAIT=1 (slightly faster, may cause rainbow textures)
+#   scripts\play-nvidia.ps1 -FastTextures          # Sets VICTORY_TEXTURE_NO_WAIT=1 (faster, may cause rainbow textures)
+#   scripts\play-nvidia.ps1 -SweepPerHeap          # Coolfox per-heap buffer pass (VICTORY_SWEEP_PER_HEAP=1)
 #   scripts\play-nvidia.ps1 -NoAmbient             # Disables indirect light stand-in
-#   scripts\play-nvidia.ps1 -UpQueue               # Experimental dedicated D3D12 copy queue + joined barriers
 #   scripts\play-nvidia.ps1 -Panel                 # Live diagnostics overlay (auto-switches to diag build)
 #   scripts\play-nvidia.ps1 -Quality               # Conservative sync (RELAY=1, CARD_STEPS=0)
-#   scripts\play-nvidia.ps1 -Safe                  # Safe fallback path
+#   scripts\play-nvidia.ps1 -Safe                  # Safe fallback path (disables port patches and thin lists)
 #   scripts\play-nvidia.ps1 -Full4K                # Series X 3840x2160 native output
 #   scripts\play-nvidia.ps1 -NoLog                 # Disable automatic log capture
 #
@@ -29,15 +36,19 @@ param(
     [string]$Exe = 'C:\Users\Yohan\Downloads\VersionXbox\game_scarlett_master.exe',
     [switch]$SeriesS,
     [double]$Scale = 0.0,
+    [double]$Fps = 0.0,
     [switch]$Full4K,
     [switch]$FastTextures,
     [switch]$NoAmbient,
+    [switch]$NoPortPatches,
     [switch]$UpQueue,
+    [switch]$SweepPerHeap,
+    [switch]$XmaRefill,
     [switch]$Quality,
     [switch]$Safe,
     [switch]$RayTracing,
     [switch]$SmoothMotion,
-    [switch]$NoWideShaderOpt,
+    [switch]$WideShaderOpt,
     [int]$CardBuffersMinKb = 64,
     [int]$DynamicSlots = 393216,
     [switch]$RecordPipelines,
@@ -103,12 +114,17 @@ $settings = @{
     VICTORY_NO_WATCHDOG         = '1'
 
     # --- Shader translator (MUST match `victory shaders` and `victory warm`) ---
+    # Default SHADER_OPT=63 (bit 64 grouped 4-dword scalar loads blackened water in fxceless run 277 with 0 ms gain).
+    VICTORY_SHADER_OPT          = $(if ($WideShaderOpt) { '127' } else { '63' })
     VICTORY_WAVE_WIDE           = 'last'
     VICTORY_NAN_SCRUB           = '1'
 }
 
-if (-not $NoWideShaderOpt) {
-    $settings.VICTORY_SHADER_OPT = '127'
+if (-not $NoPortPatches -and -not $Safe) {
+    # Renderer Patches 1+2 (avatarmanz origin/main): in-place 174 MB constants heap + hooked descriptor writes.
+    # Both are byte-checked and fall back cleanly per region / per frame if a store is missed.
+    $settings.VICTORY_PORT_CONSTANTS   = '1'
+    $settings.VICTORY_PORT_DESCRIPTORS = '1'
 }
 if ($CardBuffersMinKb -gt 0) {
     $settings.VICTORY_CARD_BUFFERS_MIN_KB = "$CardBuffersMinKb"
@@ -117,10 +133,21 @@ if ($UpQueue) {
     $settings.VICTORY_UP_QUEUE      = '1'
     $settings.VICTORY_JOIN_BARRIERS = '1'
 }
+if ($SweepPerHeap) {
+    $settings.VICTORY_SWEEP_PER_HEAP = '1'
+}
+if ($XmaRefill) {
+    $settings.VICTORY_XMA_REFILL = '1'
+}
+if ($Fps -gt 0.0) {
+    $intervalMs = [math]::Max(1.0, [math]::Min(1000.0, 1000.0 / $Fps))
+    $settings.VICTORY_FRAME_INTERVAL_MS = ('{0:0.###}' -f $intervalMs).Replace(',', '.')
+}
 
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'
     $settings.VICTORY_LAND_ECHO  = '0'
+    $settings.VICTORY_CARD_STEPS = '0'
     $settings.Remove('VICTORY_UPLOAD_AHEAD')
 } else {
     $settings.VICTORY_THIN       = '1'
@@ -133,7 +160,7 @@ if ($Quality) {
     $settings.VICTORY_TEXTURE_NO_WAIT = '0'
 }
 
-if (-not $NoAmbient) {
+if (-not $NoAmbient -and -not $RayTracing) {
     $settings.VICTORY_AMBIENT      = '0.8'
     $settings.VICTORY_AMBIENT_AIR  = '1.5'
     $settings.VICTORY_AMBIENT_MOST = '2'
@@ -153,7 +180,7 @@ if ($RayTracing) {
 }
 
 if ($SeriesS) {
-    $settings.VICTORY_COMPOSE      = '1'
+    $settings.VICTORY_PLANES       = '1'
     $settings.VICTORY_OWN_UPSCALER = '1'
     # Series S at scale 1.0 hits a title breakpoint on start (trustno1-coder 033be27f); default to 720p internal (0.667).
     if ($Scale -le 0.0) { $Scale = 0.667 }

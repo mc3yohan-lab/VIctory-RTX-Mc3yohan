@@ -32,7 +32,8 @@ pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
 pub const VIEW_INTEGER: u32 = 1 << 31;
 /// With [`VIEW_INTEGER`]: a signed (`SINT`) format.
 pub const VIEW_SIGNED: u32 = 1 << 30;
-/// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
+/// Dwords of the [`SLOT_STRIDES`] buffer's strides: heap indices are
+/// clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 /// LOCAL (port of fxceless/victory-fork PR #1216, GamingRipperDoc): the
 /// [`SLOT_STRIDES`] dword of a slot that holds a constant buffer view (a
@@ -53,6 +54,15 @@ pub fn constant_marks() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_CONSTANT_MARKS").is_some_and(|v| v == "1"))
 }
+
+/// Where the [`SLOT_STRIDES`] buffer's second table begins (bytes): two
+/// dwords per view heap slot, the title address of the buffer view (or
+/// ray-tracing structure) there, low 32 bits first; 0 for anything else.
+/// Read by a program that takes the address out of a descriptor it picks
+/// at a computed index and walks the memory behind it.
+pub const VIEW_ADDRESSES: u32 = SLOT_STRIDES_COUNT * 4;
+/// Bytes of the whole [`SLOT_STRIDES`] buffer.
+pub const SLOT_STRIDES_BYTES: u32 = VIEW_ADDRESSES + SLOT_STRIDES_COUNT * 8;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
@@ -805,6 +815,11 @@ impl Shader {
             self.m.named_md("dx.viewIdState", vec![view_node]);
         }
 
+        if self.pixel {
+            container::same_mode_per_row(&mut self.inputs, true);
+        } else {
+            container::same_mode_per_row(&mut self.outputs, false);
+        }
         let sigs = if graphics {
             let ins = self.signature_md(self.inputs.clone());
             let outs = self.signature_md(self.outputs.clone());
