@@ -1,10 +1,12 @@
-# VIctory-RTX (NVIDIA RTX / Wave32 Fork)
+# VIctory-RTX-Mc3yohan (NVIDIA RTX / Wave32 Fork)
 
-An NVIDIA-focused fork of [VIctory](https://github.com/Marvisak/VIctory) built on top of
-[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX) (`c9c932c`),
-a compatibility and porting layer that runs an Xbox Series title natively on Windows 11
-from files supplied by the user, translating D3D12.X and GFX10 shaders to Direct3D 12
-Shader Model 6.6 on **Wave32 NVIDIA GPUs** (tuned on RTX 4090 + hybrid Intel Core i9).
+> Maintained by **Mc3yohan** ([github.com/Mc3yohan](https://github.com/Mc3yohan)) · GPL-3.0-or-later
+
+An NVIDIA-focused fork of [Marvisak/VIctory](https://github.com/Marvisak/VIctory) built on top of
+[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX) (`c9c932c`) and
+selected community NVIDIA/Wave32 fixes (full provenance in [Credits & Attribution](#credits--attribution)),
+translating D3D12.X and GFX10 shaders to Direct3D 12 Shader Model 6.6 on **Wave32 NVIDIA GPUs**
+(tuned on RTX 4090 + hybrid Intel Core i9).
 
 **This repository contains no game files, code or assets.** You must supply your own
 dump outside this folder (`victory.toml`). Every commit is audited by `cargo xtask policy`
@@ -200,14 +202,21 @@ cargo run --locked -p xtask -- policy
 
 ---
 
-## Credits
+## Credits & Attribution
 
-Built on the combined work of the VIctory open-source ecosystem (commit history preserves upstream authors):
-- **[Marvisak/VIctory](https://github.com/Marvisak/VIctory)** — core loader, HLE runtime, D3D12 backend, and GFX10-to-DXIL recompiler.
-- **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)** — direct upstream base (`c9c932c`: `VICTORY_THIN`, `VICTORY_ASYNC_SUBMIT`, `VICTORY_RELAY`, `VICTORY_LAND`, `VICTORY_CARD_STEPS`, Renderer Ports 1, 2, 5, 6, 7, `VICTORY_OUTPUT` / `VICTORY_UPSCALER`, `VICTORY_AMBIENT_SETTLE`, `VICTORY_TEXTURE_STORE`, FPS unlock, frame record/replay).
-- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** — face animation, legacy FMA reflections, 32-bit int typed views, target format variants, texture read-back.
-- **[codec-d/cool_fox](https://github.com/codec-d/cool_fox)** — Wave32 guarded joins & active-loop lowering, immediate table release, `WaitOnAddress` fence waits, bake upload drain, residency budgets.
-- **[trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA)**, **DexNom/VIctory**, **Belobug/VIctory-Belobug-AMD**, **FQY55kai/ZJOU-VICTORY**, **myokex/victory-amd**, **Geckomacabre**, **cxy0072019-sketch**, and **romainhedouin**.
+`VIctory-RTX-Mc3yohan` is built on the open-source VIctory ecosystem (all upstream Git commit
+history and authors are preserved). Each project's specific contributions integrated here:
+
+| Project / Author | What Was Taken / Integrated |
+|---|---|
+| **[Marvisak/VIctory](https://github.com/Marvisak/VIctory)** | Original project & foundation: PE/XEX loader, HLE runtime, D3D12 backend, memory watch/shadowing, and GFX10-to-DXIL shader recompiler. |
+| **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)** (`c9c932c`) | Direct upstream base: `VICTORY_THIN`, `VICTORY_ASYNC_SUBMIT`, `VICTORY_RELAY`, `VICTORY_LAND`, `VICTORY_CARD_STEPS`, Renderer Ports 1, 2, 5, 6, 7 (`PORT_CONSTANTS`, `PORT_DESCRIPTORS`, `PORT_CBV`, `PORT_GUARD`, `PORT_JOURNAL`), native `VICTORY_OUTPUT` / `VICTORY_UPSCALER`, `VICTORY_AMBIENT_SETTLE`, `VICTORY_TEXTURE_STORE`, FPS cap unlock, two-plane compose, `TablePlan`, AVX2 `SYNC_IN_PLACE`, `SPANS_QUICK`, `UNDER_FUSED`, `upq`, and frame record/replay. |
+| **[codec-d/cool_fox](https://github.com/codec-d/cool_fox)** *(and `Davidjc13` / `Rubenpannen`)* | Wave32 guarded joins (`lanes.guards`) & single-latch active-loop lowering (`DIVERGENT_MASK_EXCHANGE`), Wave32 commuting-atomic LDS ordering (`lds_meetings`), immediate table release, `WaitOnAddress` fence waits, skin-bake upload drain (`ahead::drain`), `TextureQueue::reschedule`, `sweep_batch` wrap-around, and VRAM residency budgets. |
+| **[trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA)** | D3D12 error `538` fix (separate `Compare` submission for `COMMON` state decay), D3D12 error `646` fix (strict `Role::Resolve` depth SRV binding & dimension check), `VICTORY_NAN_SCRUB=1`, `rt_off_hashes.txt`, `VICTORY_FAIR_DUE=1`, `VICTORY_VIDEO_PLANES=1`, `VICTORY_TABLES_EARLY=1`, and Smooth Motion copy workflow. |
+| **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** | Face animation (16-bit typed integer views), legacy FMA reflection fix, 32-bit int typed views, `VICTORY_TARGET_VARIANTS=1`, `SLOT_STRIDE_CONSTANT`, texture read-back, and `xgamesave` resilience. |
+| **ZigZagBoi1/ScarlettPort & vitutu1/victory-perf** | `crates/victory-loader/src/hooks.rs` (title watchdog disarm `VICTORY_NO_WATCHDOG=1` and render-scale hooks). |
+| **DexNom/VIctory, Korinocho, Belobug/VIctory-Belobug-AMD, FQY55kai/ZJOU-VICTORY, myokex/victory-amd, Geckomacabre, cxy0072019-sketch, romainhedouin** | Cube-map gradient LOD, Wave32/RT/BVH/tiled-cascade-shadow fixes, and ecosystem diagnostics/research incorporated via upstream & community PRs. |
+| **Mc3yohan (`VIctory-RTX-Mc3yohan`, this fork)** | **NVIDIA 1M-heap in-place Port 5** (`VICTORY_PORT_CBV=1` with `raw_views=0`, `16,750` zero-copy CBVs/frame without 4M twin heaps + D3D12 unit test), **ReBAR 4 GB VRAM loose windows** (`WindowKb=4096`) + **plain OS-RAM `Card::staging`** (`~1.1 GB` shared GPU memory saved), **6-step VRAM `CARD_COMPARE` tree reduction + `differs_gpu`** (`+20.3%` on RTX 4090), **12-byte `PORT_DESCRIPTORS` key diff (`changed_key12`) + `copy_simple` ordering** (`99.9993%` hit rate) + 11 Scarlett descriptor store hooks, **`DIRTY_CARDED` O(dirty)**, `writes_with_kind`, `!flying()` `mapped()` gating, coalesced `VirtualProtect`, **Tier-A pure-BVH auto-skip**, `-GpuTiming` under `DRED=light` fix, **`Role::RayMiss` indoor eye-glow fix + `ambient.rs` corner clamp & `x=0` border fix**, `hooks.rs`/`resolution.rs` harmonization, and the unified NVIDIA launcher (`scripts/play-nvidia.ps1`). |
 
 ## License
 

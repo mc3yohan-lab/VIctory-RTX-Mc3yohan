@@ -56,6 +56,7 @@ pub fn run(
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
+    println!("fork           VIctory-RTX-Mc3yohan (NVIDIA Wave32 fork of Marvisak/VIctory + avatarmanz/VIctory-7900XTX)");
     match victory_game::identify(&hash) {
         Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),

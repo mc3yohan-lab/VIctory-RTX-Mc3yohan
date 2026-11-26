@@ -1,17 +1,19 @@
-# Launches the Xbox Series title tuned for NVIDIA RTX 4090 (24 GB VRAM, Wave32, 1M view heap)
-# and Intel Core i9-12900KF (8P/16T + 8E/8T), combining:
+﻿# VIctory-RTX-Mc3yohan — NVIDIA RTX / Wave32 Launcher (maintained by Mc3yohan)
+# Built on Marvisak/VIctory + avatarmanz/VIctory-7900XTX + community NVIDIA/Wave32 fixes.
+# Tuned for NVIDIA RTX 4090 (24 GB VRAM, Wave32, 1M view heap) & hybrid Intel Core i9:
 # - avatarmanz/VIctory-7900XTX (`c9c932c`): Renderer Ports 1, 2, 5, 6, 7 (VICTORY_PORT_CONSTANTS,
 #   VICTORY_PORT_DESCRIPTORS, VICTORY_PORT_CBV, VICTORY_PORT_GUARD, VICTORY_PORT_JOURNAL),
 #   native VICTORY_OUTPUT + VICTORY_UPSCALER=6, Wave32 NVIDIA RT/BVH/tiled-cascade-shadow PRs,
 #   FPS unlock (VICTORY_FRAME_INTERVAL_MS), two-plane compose, TablePlan, AVX2 SYNC_IN_PLACE,
 #   SPANS_QUICK, UNDER_FUSED, LANE_CORE, upq copy queue.
-# - fxceless/victory-fork + trustno1-coder/VIctory-NVIDIA + codec-d/cool_fox:
+# - fxceless/victory-fork + trustno1-coder/VIctory-NVIDIA + codec-d/cool_fox + ScarlettPort:
 #   Faces move, legacy FMA reflections, 32-bit int typed views, VICTORY_TARGET_VARIANTS=1,
 #   D3D12 538 Compare state-decay fix, D3D12 646 ambient depth SRV fix, Wave32 LDS atomic ordering,
 #   TextureQueue::reschedule, sweep_batch wrap-around, VICTORY_NAN_SCRUB=1, watchdog disarm.
-# - VIctory-RTX RTX 4090 work: ReBAR 4 GB VRAM windows (WindowKb=4096), plain OS-RAM Card::staging,
-#   6-step VRAM CARD_COMPARE tree reduction, 12B PORT_DESCRIPTORS header diff (99.9993% accuracy),
-#   DIRTY_CARDED O(dirty), Tier-A pure-BVH auto-skip, Role::RayMiss eye fix, coalesced VirtualProtect.
+# - VIctory-RTX-Mc3yohan original work: NVIDIA 1M-heap in-place Port 5 (VICTORY_PORT_CBV=1 with
+#   raw_views=0), ReBAR 4 GB VRAM windows (WindowKb=4096), plain OS-RAM Card::staging, 6-step VRAM
+#   CARD_COMPARE tree reduction, 12B PORT_DESCRIPTORS header diff (99.9993% accuracy), DIRTY_CARDED
+#   O(dirty), Tier-A pure-BVH auto-skip, Role::RayMiss eye fix, coalesced VirtualProtect.
 #
 # Usage:
 #   scripts\play-nvidia.ps1                        # Series X 1080p output + Ports 1,2,5,6,7 + ReBAR + 60 FPS unlock (fastest)
@@ -364,7 +366,7 @@ $consoleArg = if ($SeriesS) { 'series-s' } else { 'series-x' }
 $mode = if ($SeriesS) { 'Series S 1080p+4K HUD' } elseif ($Full4K) { 'Series X 3840x2160' } elseif ($Full1440p) { 'Series X 2560x1440' } else { 'Series X 1920x1080' }
 if ($Scale -gt 0.0) { $mode += " @ scale $($settings.VICTORY_RENDER_SCALE)" }
 if ($Fps -gt 0.0) { $mode += ", cap ${Fps} FPS" }
-Write-Host "Starting VIctory ($Build, $mode) on NVIDIA RTX 4090 with $($settings.Count) switches..."
+Write-Host "Starting VIctory-RTX-Mc3yohan ($Build, $mode) on NVIDIA RTX 4090 with $($settings.Count) switches..."
 
 $runArgs = @('run', $Exe, '--console', $consoleArg, '--execute')
 
