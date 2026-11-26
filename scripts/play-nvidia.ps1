@@ -22,7 +22,7 @@
 #   scripts\play-nvidia.ps1 -Scale 0.75            # Series X 1440p @ 75% internal + temporal upscaler
 #   scripts\play-nvidia.ps1 -SmoothMotion          # Launches victory_sm.exe for NVIDIA App Smooth Motion (2x visual FPS)
 #   scripts\play-nvidia.ps1 -WaitTextures          # Sets VICTORY_TEXTURE_NO_WAIT=0 (slower streaming, avoids partial BCn blocks)
-#   scripts\play-nvidia.ps1 -SkipRtHashes          # Opt-in: skip 1,034 rt_off_hashes (use only if white indoor haze appears)
+#   scripts\play-nvidia.ps1 -KeepRtShaders         # Diagnostic: do not skip rt_off_hashes.txt when -RayTracing is off
 #   scripts\play-nvidia.ps1 -PortDescriptors       # Experimental Patch 2 (OFF by default: missed 78K-137K views on title)
 #   scripts\play-nvidia.ps1 -NoPortConstants       # Disable Renderer Patch 1 (VICTORY_PORT_CONSTANTS)
 #   scripts\play-nvidia.ps1 -UpQueue               # Experimental dedicated D3D12 copy queue + joined barriers
@@ -43,6 +43,7 @@ param(
     [switch]$Full4K,
     [switch]$WaitTextures,
     [switch]$TexStore,
+    [switch]$KeepRtShaders,
     [switch]$SkipRtHashes,
     [switch]$NoAmbient,
     [switch]$NoPortConstants,
@@ -89,6 +90,8 @@ $settings = @{
     # SHOW_NEW_LATER=1 + FAIR_DUE=1 prevent pooled-slot corruption without stalling the stream.
     VICTORY_TEXTURE_NO_WAIT     = $(if ($WaitTextures) { '0' } else { '1' })
     VICTORY_TEXTURE_STAGE_MS    = '40'
+    VICTORY_BAKE_EXACT          = '1'
+    VICTORY_BAKE_SOURCES        = '1'
     VICTORY_FAIR_DUE            = '1'
     VICTORY_SHOW_NEW_LATER      = '1'
     VICTORY_UPLOAD_AHEAD        = '1'
@@ -103,6 +106,9 @@ $settings = @{
     VICTORY_RELAY_COPY          = '1'
     VICTORY_INDIRECT_BATCH      = '2'
     VICTORY_INDIRECT_REST       = '0'
+    VICTORY_LAND_SKIP           = '1'
+    VICTORY_LAND_THREADS        = '6'
+    VICTORY_LANE_CORE           = '1'
     VICTORY_MAP_THREADS         = '1'
     VICTORY_TITLE_PRIORITIES    = '0'
     VICTORY_CARD_AWAKE          = '1'
@@ -165,8 +171,9 @@ if ($Safe) {
     $settings.VICTORY_CARD_STEPS = '0'
     $settings.Remove('VICTORY_UPLOAD_AHEAD')
 } else {
-    $settings.VICTORY_THIN       = '1'
-    $settings.VICTORY_JOIN_PARTS = '8'
+    $settings.VICTORY_THIN         = '1'
+    $settings.VICTORY_THIN_THREADS = '10'
+    $settings.VICTORY_JOIN_PARTS   = '8'
 }
 
 if ($Quality) {
@@ -186,7 +193,7 @@ if ($RayTracing) {
     $settings.VICTORY_SKIP_PIPELINES = 'none'
 } else {
     $settings.VICTORY_BVH_NO_HIT     = '1'
-    if ($SkipRtHashes) {
+    if (-not $KeepRtShaders) {
         $rtHashesPath = Join-Path $PSScriptRoot 'rt_off_hashes.txt'
         if (Test-Path -LiteralPath $rtHashesPath) {
             $settings.VICTORY_SKIP_PIPELINES = (Get-Content -LiteralPath $rtHashesPath -Raw).Trim()
