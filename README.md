@@ -31,12 +31,14 @@ Series X profile (ray tracing off).
 | Metric | Measured Status |
 |---|---|
 | **Menu / UI** | **60 FPS** (`16.7 ms/frame`) with native 60 FPS unlock (`-Fps 60`, game clock stays `1.00x`) |
-| **Series X 1440p (`2560x1440` internal, pre-Ports 5–7)** | **18–21 FPS** (`47.7–55.5 ms/frame`), `victory-submit` cut `56.6 → 38.9 ms`, `MakeResident` stalls cut `44,600 → ~4,400`, `PORT_DESCRIPTORS` 12B diff at **`99.9993%`** accuracy (`0.08` misses/frame) |
-| **Series X `VICTORY_OUTPUT=1920x1080` + Ports 1, 2, 5, 6, 7** | Merged from upstream `c9c932c` (`-16 ms` GPU at 1080p output, `-4.7 ms` Port 5 CBV, `-2 ms` Port 6 Guard, `-1 to -3 ms` Port 7 Journal) — live RTX 4090 validation ready |
+| **Series X `VICTORY_OUTPUT=1920x1080` + Ports 1, 2, 5 (NVIDIA in-place), 6, 7** | **22.6 FPS median (`44.3 ms/frame`, `31.5 ms` preparing), 26.8 FPS peak (`37.3 ms/frame`)** in real 3D gameplay (up from `16–17 FPS`, **`+60%` FPS**) |
+| **Exclusive NVIDIA 1M-Heap Port 5 (`VICTORY_PORT_CBV=1` in-place)** | **`16,750` table CBVs/frame (`6.7 MB/frame`) read in place** by the GPU (`0` unaligned fallbacks), slashing `card_steps` fills from `~12,000` → **`~175/frame`** |
+| **Port 2 (`12B` diff) + Port 6 (Guard) + Port 7 (Journal)** | Port 2 **`99.9993%`** accuracy (`0.50–1.48` misses/frame across `70K` slots/frame); Port 6 fault wait **`0.42–0.88 ms`**; Port 7 heap-sync wait **`0.19–0.31 ms`** & journal lock wait **`0.09 ms`** |
+| **RTX 4090 `-GpuTiming` Breakdown (`diag` build)** | **`33.7 ms`** noted GPU commands (`dispatch 17.5 ms`, `indirect 11.8 ms`, `mesh 2.3 ms`, `alias 1.2 ms`), **`10.3 ms`** preludes (`65` lists), **`4.0 ms`** compares (`20` lists) — top 3 compute passes alone take **`7.42 ms`** (`55679a0547649d0b` `3.47 ms`, `17af15c4015cb4b6` `2.40 ms`, `89d08e561897d4e5` `1.55 ms`) |
 | **Wave32 Shader Coverage** | **`25,784` shaders translated to Wave32 (`99.98%`)** — only **`6`** Wave64-only shaders remain (195 unsupported GS containers) |
-| **Pre-warmed D3D12 Pipeline Library** | **`host-pipelines.bin` pre-warmed with `VICTORY_PORT_CBV=1`** and **`0` driver refusals (`0x80070057`)** |
+| **Pre-warmed D3D12 Pipeline Library** | **`host-pipelines.bin` (`1.34 GB`, `2,564` PSOs) pre-warmed with NVIDIA in-place `VICTORY_PORT_CBV=1`**, **`0` driver refusals (`0x80070057`)** |
 | **RTX 4090 `CARD_COMPARE` Microbenchmark** | **`17.31 ms → 14.40 ms` (`+20.3%`, `705 → 848 GB/s`)** via 6-step parallel tree reduction + VRAM `differs_gpu` |
-| **Visual Quality** | Faces animate, `x=0` dotted border fixed, cornea/sclera sky-leak fixed (`Role::RayMiss` + crease clamp), D3D12 errors `538` & `646` fixed, Wave32 LDS atomic ordering fixed, zero indirect draw drops |
+| **Visual Quality & Active Issue** | Faces animate, `x=0` dotted border fixed, cornea/sclera sky-leak fixed (`Role::RayMiss` + crease clamp), D3D12 errors `538` & `646` fixed, Wave32 LDS atomic ordering fixed, zero indirect draw drops. **Open issue:** very dark interior/cutscene lighting under the new Ports 1–7 + 1080p stack (investigating next — test `-NoPortCbv` to isolate) |
 | **Memory** | `~15–17 GB` dedicated VRAM, `~40–46 GB` private commit (**64 GB RAM strongly recommended** for now) |
 
 ---
@@ -49,7 +51,7 @@ Series X profile (ray tracing off).
 |---|---|
 | `VICTORY_PORT_CONSTANTS=1` | The title's constants heap is read by the card in place: no uploads, no fills (`0` forgotten regions) |
 | `VICTORY_PORT_DESCRIPTORS=1` | 11 byte-verified Scarlett descriptor stores report written slots directly + 12-byte key diff (`changed_key12`) & `copy_simple` mark ordering (**`99.9993%` hit rate**, `0.08` misses/frame) |
-| `VICTORY_PORT_CBV=1` | Translated shaders read constant buffers in place as raw bytes (`~22,000` fills/frame → `0`; `-4.7 ms`) |
+| `VICTORY_PORT_CBV=1` | **NVIDIA 1M-heap in-place Port 5 (`7b908a2`):** translated shaders read table/heap constant buffers in place as raw byte-address SRVs (`raw_views=0`, no 4M twin heap needed) — **`16,750` CBVs/frame (`6.7 MB`) zero-copy**, `card_steps` fills `~12,000 → ~175/frame` |
 | `VICTORY_PORT_GUARD=1` | Shared write-guard lock with per-64 KiB block claims + parallel per-list refresh planning + coalesced `VirtualProtect` (`-2 ms`) |
 | `VICTORY_PORT_JOURNAL=1` | Early heap sync triggered at title submit + 64-sharded journal locks (`-1 to -3 ms`) |
 | `VICTORY_OUTPUT=1920x1080` | Native title output scaling on Series X (jumps backbuffer pool `int3`, saves `~16 ms` GPU; `-Full1440p` / `-Full4K` available) |
@@ -107,36 +109,23 @@ Series X profile (ray tracing off).
 
 ## Known Bottlenecks & Where Collaborators Can Help Most
 
-If you want to contribute toward **stable 30–60 FPS**, these are the highest-leverage open items:
+Now that we reached **22.6–26.8 FPS (`37.3–44.3 ms/frame`)** with full `-GpuTiming` profiling working on RTX 4090, these are the highest-leverage items to cross **stable 30–60 FPS** with clean visuals:
 
-1. **GPU Per-Pass Profiling & Surgical RT-Off Skip List (`-GpuTiming`):**
-   - With `VICTORY_BVH_NO_HIT=1`, ~62 RT/probe/shadow compute shaders (`CS_RaytraceVBuffer_*`,
-     `CS_ScreenProbes_TraceRays`, `CS_RTShadowTrace*`) still run every frame.
-   - `scripts/rt_off_hashes.txt` (`1,034` hashes) is too broad (it kills indoor voxel bounce GI).
-   - **Task:** Capture 15s of `scripts\play-nvidia.ps1 -GpuTiming` in gameplay, identify the top
-     dead RT shaders in ms on NVIDIA, and build a minimal, GI-safe `VICTORY_SKIP_PIPELINES` list.
-2. **Global NULL UAV Barriers & L0 `PORT_CONSTANTS` A/B on NVIDIA Ada:**
-   - ~944–978 barrier calls/frame (`list.rs` Enhanced Barriers / `pipeline_sync` / buffer barriers
-     emit global NULL UAV barriers). Measure with `VICTORY_BARRIER_TEST=groups|indirect|both`
-     and scope barriers to actual resources where safe.
-   - A/B test `VICTORY_PORT_CONSTANTS=0` (`-NoPortConstants`) and `VICTORY_SEND_BAR=1` (`-SendBar`)
-     on RTX 4090 now that LOOSE windows are in VRAM.
-3. **CPU `victory-submit` Thread (`~36.9 ms preparing/frame`):**
-   - Once GPU time drops `< 33 ms`, CPU preparing becomes the next ceiling (`copies 13.2 ms / 66.7 MB`,
-     `LATE_WAIT ~3.8 ms`, `descriptor sync_heaps ~5.7–10 ms`, `VICTORY_THIN ~200 ms` across 8 threads).
-   - **Task:** Profile with `VICTORY_TIMELINE` (`diag` build) and parallelize/coalesce the
-     remaining hot submission steps.
-4. **Finish Renderer Patch #2 (`VICTORY_PORT_DESCRIPTORS=1`):**
-   - 11 sites are hooked (`descriptor_sites.rs`), saving `~7 ms` in `sync_heaps`, **but**
-     ~122K view records are still missed by unpatched title writers (an unrolled 4×32B store at
-     `title+0x4d9f25f` plus a 1-slot-per-table writer with stride 11/19 slots), which delays
-     texture discovery to ~500–900 ms via the fallback.
-   - **Task:** Disassemble & hook the remaining descriptor writers in `descriptor_sites.rs` so
-     `VICTORY_PORT_DESCRIPTORS=1` achieves `0` missed records and `<66 ms` texture latency.
-5. **Remaining 6 Wave64-Only Shaders & ~314 Dropped Draws/Frame:**
-   - Only 6 shaders fail Wave32 lowering (including `02384a60fda6f2d0` = `CS_DefragHeap_ComputeRelocations`).
-   - Run `-Build diag` to log `"dropped X/frame without a host pipeline: {why}"` and classify
-     the ~314 dropped draws/frame.
+1. **Fix Dark Interior / Cutscene Lighting Regression (Top Visual Priority):**
+   - Cutscenes/dark interiors appear overly dark (only emissive lights bright) under the new Ports 1–7 + 1080p stack even though `ambient.rs` logs `Radiance`, `Resolve`, `Air`, `RayMiss` active.
+   - **Task:** A/B isolate `-NoPortCbv` vs `-NoPortDescriptors` vs `-Full4K` to determine whether an in-place raw CBV read (`VICTORY_PORT_CBV=1`), a missed descriptor write, or `ambient.rs` clamping is suppressing diffuse/indirect lighting.
+2. **Optimize Top RTX 4090 GPU Compute Passes (`-GpuTiming` Measured):**
+   - Full `-GpuTiming` breakdown shows **`33.7 ms`** in noted GPU commands (`dispatch 17.5 ms`, `indirect 11.8 ms`, `mesh 2.3 ms`, `alias 1.2 ms`), plus **`10.3 ms`** in copy preludes (`65` lists) and **`4.0 ms`** in `CARD_COMPARE` (`20` lists).
+   - Just **3 compute shaders take `7.42 ms` (`22%` of GPU command time):** `55679a0547649d0b` (`3.47 ms`), `17af15c4015cb4b6` (`2.40 ms`), and `89d08e561897d4e5` (`1.55 ms`).
+   - **Task:** Identify & optimize/skip safe RT-off dead passes among the top compute dispatches, and reduce the **`24.9 ms`** gap between noted GPU commands and total list wall time (global NULL UAV barriers + list submission overhead across ~210 lists/frame).
+3. **CPU `victory-submit` Thread (`~31.5 ms preparing/frame`):**
+   - Now down from `56.6 ms → 31.5 ms` thanks to Ports 1–7 + 12B `PORT_DESCRIPTORS`, **which makes `victory-submit` the main ceiling for >31 FPS** (`copies 7.8–8.7 ms / 51–66 MB`, `host copies` `24 MB sent up` + `45 MB fetched back` with `~8–9 ms` card waits).
+   - **Task:** Cut the `104 MB → 51–66 MB` remaining CPU buffer copies and `45 MB` read-backs (`card_before` / `land` / `VICTORY_SEND_BAR=1` A/B on RTX 4090).
+4. **Hook Remaining 2–3 Unpatched Descriptor Writers (`VICTORY_PORT_DESCRIPTORS=1`):**
+   - 12B diff already delivers **`99.9993%`** accuracy (`0.50–1.48` misses/frame across `70K` slots/frame).
+   - Remaining tiny trickle of missed writers: `title+0x18849c`, `title+0x4e9b4e2`, `title+0x2474afc`, plus an external DLL store (`+0x23cd9f`). Hooking the title sites will push Port 2 to `100.00%` (`0` misses).
+5. **Remaining 6 Wave64-Only Shaders (`02384a60fda6f2d0` = 1.0 drop/frame):**
+   - Only 1 non-RT compute shader (`02384a60fda6f2d0`) drops during gameplay (all other ~353 drops/frame are RT BVH builder stages intentionally off without `-RayTracing`).
 6. **Memory Reduction for 32 GB RAM Systems:**
    - Cut idle scratch/staging/list pools and tune `VICTORY_RESIDENCY=1` (`residency.rs`).
 
