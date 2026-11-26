@@ -4950,14 +4950,10 @@ impl Host {
         let copy_queue = f.queue.clone();
         let waiting = std::time::Instant::now();
         // The flights the fetch runs behind: those in the line by now have
-        // been given to the queue. On the copy queue, order behind the direct
-        // queue's already-completed fence value (`~0 us` GPU wait) so `Had`
-        // (`VICTORY_LAND_SKIP=1`) knows which flights' writes are held.
+        // been given to the queue. On the copy queue, those landed here
+        // (avoids cross-engine WDDM fence waits on every landing).
         let ahead = match &copy_queue {
-            Some(_) => {
-                // SAFETY: a plain fence query.
-                unsafe { self.fence.GetCompletedValue() }
-            }
+            Some(_) => 0,
             None => line().target,
         };
         // SAFETY: the list's last run was waited for by this thread; live
@@ -4988,9 +4984,6 @@ impl Host {
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 let _fetching = crate::timeline::span("landing: fetching pieces");
                 if let Some(queue) = &copy_queue {
-                    if ahead > 0 {
-                        queue.Wait(&self.fence, ahead)?;
-                    }
                     queue.ExecuteCommandLists(&lists);
                     queue.Signal(&fence, sent)?;
                     meanwhile();

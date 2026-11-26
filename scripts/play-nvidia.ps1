@@ -102,7 +102,6 @@ $settings = @{
     VICTORY_RELAY               = '2'
     VICTORY_CARD_STEPS          = '2'
     VICTORY_WIDE_BACK           = '1'
-    VICTORY_WIDE_SPIN           = '80'
     VICTORY_CARD_REHASH_RUNS    = '1'
     VICTORY_JOIN_COPIES         = '1'
     VICTORY_JOIN_BARRIERS       = '1'
@@ -112,9 +111,6 @@ $settings = @{
     VICTORY_INDIRECT_REST       = '0'
     VICTORY_LAND_SKIP           = '1'
     VICTORY_LAND_THREADS        = '4'
-    VICTORY_ASK_NORESET         = '1'
-    VICTORY_ASK_SPREAD          = '1'
-    VICTORY_SYNC_FINE           = '1'
     VICTORY_MAP_THREADS         = '1'
     VICTORY_TITLE_PRIORITIES    = '0'
     VICTORY_CARD_AWAKE          = '1'
@@ -248,6 +244,21 @@ if (-not (Test-Path -LiteralPath $victory)) {
 if (-not (Test-Path -LiteralPath $Exe)) {
     throw "No executable at $Exe"
 }
+
+# Read-only pre-flight GPU check: warn if another CUDA/AI job is occupying the RTX 4090.
+try {
+    $gpuCsv = (& nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,power.draw --format=csv,noheader,nounits 2>$null | Select-Object -First 1)
+    if ($gpuCsv) {
+        $parts = $gpuCsv.Split(',') | ForEach-Object { $_.Trim() }
+        $util = [double]$parts[0]
+        $usedMb = [double]$parts[1]
+        $totalMb = [double]$parts[2]
+        $watts = $parts[3]
+        if ($util -ge 25 -or $usedMb -ge 4096) {
+            Write-Warning ("RTX 4090 is already busy before launch: {0:0}% GPU, {1:0}/{2:0} MiB VRAM, {3} W. Another CUDA/AI process may cut FPS and cause VRAM paging." -f $util, $usedMb, $totalMb, $watts)
+        }
+    }
+} catch {}
 
 if ($SmoothMotion) {
     $smCopy = Join-Path (Split-Path $victory -Parent) 'victory_sm.exe'
