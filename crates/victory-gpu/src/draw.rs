@@ -225,11 +225,6 @@ fn recheck_soon() -> bool {
 /// look reads 48 KiB, and a frame bakes up to sixteen times).
 const BAKE_AHEAD: [u64; 2] = [12, 2];
 
-/// What [`crate::descriptor::host::HostHeap::texture_news`] said when the
-/// pass before a bake last served all there was, plus one (0: it did not):
-/// until something is new, the next bakes of the frame need no pass.
-static BAKE_SERVED: AtomicU64 = AtomicU64::new(0);
-
 /// The pixel shaders of the title's decoration bake (the title:
 /// `PS_BakeDecorations_*`), by the first 16 hex digits of their hash as the
 /// frame listings print it. They draw into a 256x256 corner of 2048x2048
@@ -635,6 +630,10 @@ pub(crate) struct State {
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
     host_heaps_set: bool,
+    /// Host descriptor heaps (view, sampler) currently bound when `host_heaps_set`:
+    /// switching title heaps that map to the same host heaps skips redundant
+    /// `SetDescriptorHeaps` + root-signature resets (`VICTORY_SAME_HOST_HEAPS`).
+    host_heap_objs: [usize; 2],
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
@@ -1936,22 +1935,29 @@ impl State {
             if fallback && sampler_heap.is_none() {
                 sampler_heap = crate::host::host().and_then(|h| h.fallback_sampler_heap().cloned());
             }
-            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = Vec::with_capacity(2);
-            if let Some(h) = view_heap {
-                list.keep(&h);
-                heaps.push(Some(h));
-            }
-            if let Some(h) = sampler_heap {
-                list.keep(&h);
-                heaps.push(Some(h));
-            }
-            if !heaps.is_empty() {
-                // SAFETY: an open list and shader-visible heaps.
-                unsafe { l.SetDescriptorHeaps(&heaps) };
+            let objs = [
+                view_heap.as_ref().map_or(0, |h| h.as_raw() as usize),
+                sampler_heap.as_ref().map_or(0, |h| h.as_raw() as usize),
+            ];
+            if !(self.host_heaps_set && same_host_heaps() && objs == self.host_heap_objs) {
+                let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = Vec::with_capacity(2);
+                if let Some(h) = view_heap {
+                    list.keep(&h);
+                    heaps.push(Some(h));
+                }
+                if let Some(h) = sampler_heap {
+                    list.keep(&h);
+                    heaps.push(Some(h));
+                }
+                if !heaps.is_empty() {
+                    // SAFETY: an open list and shader-visible heaps.
+                    unsafe { l.SetDescriptorHeaps(&heaps) };
+                }
+                self.host_heap_objs = objs;
+                self.host_roots = [0; 2];
             }
             self.host_heaps = self.heaps;
             self.host_heaps_set = true;
-            self.host_roots = [0; 2];
         }
         // The depth target a draw only tests, for the views of it that the
         // draw's shaders read (`readable`).
@@ -2508,11 +2514,8 @@ impl State {
             return;
         };
         let bake = bake && left > 0;
-        if bake && !first && bake_exact() {
-            let (writes, noted) = host.texture_news();
-            if !noted && BAKE_SERVED.load(Ordering::Relaxed) == writes + 1 {
-                return;
-            }
+        if bake && !first && bake_exact() && host.bake_covered() {
+            return;
         }
         let n = EARLY_TEXTURE_PASSES[usize::from(bake)].fetch_add(1, Ordering::Relaxed) + 1;
         if bake && n.is_power_of_two() {
@@ -2529,7 +2532,9 @@ impl State {
         let began = std::time::Instant::now();
         PASS_BUDGET.set(Some((budget.0, budget.1, bake)));
         crate::texture::BAKING.set(bake && bake_exact());
-        self.heap_textures(list, heap, host);
+        if let Some(revision) = self.heap_textures(list, heap, host) {
+            host.finish_bake(revision);
+        }
         crate::texture::BAKING.set(false);
         PASS_BUDGET.set(None);
         if bake {
@@ -2826,16 +2831,18 @@ impl State {
     /// a second): uploaded again when more of it is mapped. Pages mapped
     /// in place of others, and contents changed with no descriptor write,
     /// are missed (hook the page-mapping events for those).
+    /// A complete exact bake returns the heap revision observed before it
+    /// gathered the due slots so its caller can certify coverage cleanly.
     /// `VICTORY_HEAP_TEXTURES=0` turns it off.
     fn heap_textures(
         &self,
         list: &HostList,
         heap: &crate::descriptor::Heap,
         host: &crate::descriptor::host::HostHeap,
-    ) {
+    ) -> Option<u64> {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
-            return;
+            return None;
         }
         let memory = crate::host::host().and_then(|h| h.video_memory());
         // `VICTORY_TEXTURE_STAGE_MB` sets it: a backlog of tens of thousands of
@@ -2878,6 +2885,7 @@ impl State {
             once!("textures picked by index: the card has no room for more; they wait");
         }
         let mut refused = 0;
+        let pass = (!only).then(|| host.begin_texture_pass());
         if !only {
             // Room again: the slots held back while the card was full are due
             // now (`full_card_pass`).
@@ -2901,17 +2909,20 @@ impl State {
             }
         }
         let baking = crate::texture::BAKING.get();
-        let (due, on_time) = match &sources {
-            Some(slots) => (host.texture_slots_queued(slots, bake_exact()), 0usize),
+        let (due, on_time, mut served) = match &sources {
+            Some(slots) => (host.texture_slots_queued(slots, bake_exact()), 0usize, false),
             None => {
                 let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 });
                 // (Those that are due later after all that are due.)
                 let on_time = due.len();
+                // A capped snapshot can leave due slots outside the pass.
+                let mut served = on_time as u64 == census[1];
                 if baking {
                     let known: std::collections::HashSet<u32> = due.iter().map(|&(index, _)| index).collect();
                     static AHEAD: AtomicU64 = AtomicU64::new(u64::MAX);
                     let again = AHEAD.swap(frame, Ordering::Relaxed) == frame;
-                    let (ahead, _) = host.texture_slots_due(frame + BAKE_AHEAD[usize::from(again)], 1 << 16);
+                    let (ahead, ahead_census) = host.texture_slots_due(frame + BAKE_AHEAD[usize::from(again)], 1 << 16);
+                    served &= ahead.len() as u64 == ahead_census[1];
                     due.extend(ahead.into_iter().filter(|(index, _)| !known.contains(index)));
                 }
                 HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
@@ -2922,7 +2933,7 @@ impl State {
                 // (`VICTORY_CARD_ACCOUNTING=1`; a line when the card first has no
                 // room, and every five seconds after it).
                 Self::card_accounting(heap, host, frame, room);
-                (due, on_time)
+                (due, on_time, served)
             }
         };
         let sourced_at_most = bake_sources_mode().1;
@@ -2998,10 +3009,6 @@ impl State {
             )
         };
         let began = std::time::Instant::now();
-        if !only {
-            BAKE_SERVED.store(0, Ordering::Relaxed);
-        }
-        let mut served = true;
         for (index, write) in due {
             if only {
                 if sourced_bytes >= sourced_at_most {
@@ -3354,7 +3361,7 @@ impl State {
                 let text: String = format!("{view:?}").chars().take(300).collect();
                 tracing::error!(why, slot = index, "the host device went while textures picked by index were made ready; last: {text}");
                 crate::host::log_removal_context();
-                return;
+                return None;
             }
             let (bytes, whole) = crate::texture::staged(resource, there.is_none()).unwrap_or((0, true));
             // Not all of it there: looked at again next frame, and from
@@ -3411,9 +3418,7 @@ impl State {
                 None => host.texture_slot_done(index, write, again),
             }
         }
-        if baking && !only && served {
-            BAKE_SERVED.store(host.texture_news().0 + 1, Ordering::Relaxed);
-        }
+        pass.and_then(|p| p.revision).filter(|_| baking && served)
     }
 
     /// For the frame listing, after a dropped dispatch's line: its group
@@ -3541,7 +3546,7 @@ impl State {
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, RAY_MISS, Role, Views};
+        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, RAY_MISS, REFLECTIONS, Role, Views};
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -3551,6 +3556,7 @@ impl State {
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
             Role::RayMiss => RAY_MISS,
+            Role::Reflect => REFLECTIONS,
         };
         let Some((of, image)) = entry(ResourceType::Uav, at) else {
             once!(?role, "no stand-in for the indirect light: missing image UAV");
@@ -3568,11 +3574,11 @@ impl State {
                 }
                 Some(depth)
             }
-            Role::Radiance | Role::Air | Role::RayMiss => None,
+            Role::Radiance | Role::Air | Role::RayMiss | Role::Reflect => None,
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT or R16G16B16A16_FLOAT for RayMiss.)
         let format_ok = match role {
-            Role::Resolve => of.Format.0 == 42,
+            Role::Resolve | Role::Reflect => of.Format.0 == 42,
             Role::RayMiss => matches!(of.Format.0, 10 | 26),
             Role::Radiance | Role::Air => of.Format.0 == 26,
         };
@@ -5380,6 +5386,17 @@ fn describe(view: Option<&View>) -> String {
         }
         Some(v) => format!("{v:?}").chars().take(60).collect(),
     }
+}
+
+/// Whether switching title heaps that resolve to the same host heaps skips
+/// redundant `SetDescriptorHeaps` and root-signature resets (on by default;
+/// `VICTORY_SAME_HOST_HEAPS=0` restores re-setting on every change; ported
+/// from ScarlettPort `1e726507`).
+fn same_host_heaps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_SAME_HOST_HEAPS").map_or(true, |v| v.trim() != "0")
+    })
 }
 
 /// The console's own primitive topologies.

@@ -180,6 +180,10 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && !placeholder {
         victory_gpu::title_memory_allocated(at as usize, size);
     }
+    // Write-combined: memory the title's CPU writes and does not read.
+    if !at.is_null() && asked & 0x400 != 0 {
+        victory_gpu::title_memory_write_combined(at as usize, size);
+    }
     // (Grand Theft Auto VI asks for its 32-bit heap with kind 0x42000,
     // without the 64 KiB page bits: not `placeholder` above, though the host
     // makes a placeholder of it all the same.)
@@ -366,6 +370,8 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            let _changing = victory_gpu::title_memory_remapping();
+            victory_gpu::title_memory_freed(address as usize, 0);
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
@@ -1985,7 +1991,8 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
 /// first: the address may be other memory's the moment it is free.
 extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u32) -> BOOL {
     const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
-    // Splitting and joining placeholders changes nothing they show.
+    // Returning a private allocation to its placeholder can remove live pages.
+    let _changing = victory_gpu::title_memory_remapping();
     if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
         victory_gpu::title_memory_freed(address as usize, size);
     }

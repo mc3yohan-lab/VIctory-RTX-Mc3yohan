@@ -450,6 +450,19 @@ fn fill_unlocked() -> bool {
 /// got less than was mapped (their slots are looked at again).
 pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Since the last frame-rate line, exact refreshes (for a bake) that found
+/// the runtime remapping title memory (`VICTORY_EXACT_NO_WAIT`): read whole
+/// through the kernel without waiting, and those that had to wait.
+pub(crate) static EXACT_UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether an exact refresh (`BAKING`) that finds the runtime remapping title
+/// memory reads the texture whole through the kernel first, waiting only if a
+/// page is missing (`VICTORY_EXACT_NO_WAIT=0`: always waits, as before).
+fn exact_unlocked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EXACT_NO_WAIT").is_none_or(|v| v != "0"))
+}
+
 /// Since the last frame-rate line, of texture refreshes on every thread, in
 /// microseconds: waiting for the texture's own lock (another thread is
 /// refreshing the same texture), asking the write watch and the guards,
@@ -893,10 +906,15 @@ impl PreludeUpload {
     /// list's prelude must record `CopyTextureRegion` into `self.copy.texture`.
     pub(crate) fn finish_refresh(&self) -> Option<bool> {
         use std::sync::atomic::Ordering::Relaxed;
-        let Some(first_upload) = claim_upload(&self.staging.uploaded, &self.staging.dirty) else {
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexSkipped, 1);
-            return None;
+        let has_prefill = self.copy.prefill.as_deref().is_some_and(Prefill::has_pending);
+        let first_upload = match claim_upload(&self.staging.uploaded, &self.staging.dirty) {
+            Some(first) => first,
+            None if has_prefill => false,
+            None => {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexSkipped, 1);
+                return None;
+            }
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexUploads, 1);
@@ -931,11 +949,15 @@ impl PreludeUpload {
     /// `D3D12_RESOURCE_STATE_COPY_DEST`.
     pub(crate) fn record(&self, host_list: &HostList, cmd_list: &ID3D12GraphicsCommandList) {
         let texture = &self.copy.texture;
-        let prefill = self.copy.prefill.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some((levels, bytes)) = prefill
-            && prefill_levels(host_list, cmd_list, &self.copy, levels, &bytes)
-        {
-            crate::texlate::whole(self.resource);
+        if let Some(claim) = self.copy.prefill.as_ref().and_then(Prefill::claim) {
+            record_prefill(
+                host_list,
+                cmd_list,
+                texture,
+                self.resource,
+                self.staging.memory as u64,
+                claim,
+            );
         }
         for (i, footprint) in self.staging.footprints.iter().enumerate() {
             let to = D3D12_TEXTURE_COPY_LOCATION {
@@ -963,25 +985,89 @@ impl PreludeUpload {
     }
 }
 
-/// Records copies of levels `0..levels` of `copy` (in the copy destination
-/// state) from `bytes`, laid out as the host lays out those subresources;
-/// its views show them from then on.
-fn prefill_levels(
+/// Cached larger levels (`crate::texstore`) waiting for a prelude to upload
+/// them; retries cleanly if a transient upload-buffer allocation fails.
+pub(crate) struct Prefill {
+    cached: Mutex<Option<(u32, Arc<Vec<u8>>)>>,
+    published: std::sync::atomic::AtomicU32,
+}
+
+impl Prefill {
+    pub(crate) fn new(cached: (u32, Arc<Vec<u8>>)) -> Arc<Self> {
+        Arc::new(Self {
+            cached: Mutex::new(Some(cached)),
+            published: std::sync::atomic::AtomicU32::new(0),
+        })
+    }
+
+    pub(crate) fn published(&self) -> u32 {
+        self.published.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn has_pending(&self) -> bool {
+        self.published() == 0
+            && self.cached.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
+    fn claim(self: &Arc<Self>) -> Option<PrefillClaim> {
+        if self.published() != 0 {
+            return None;
+        }
+        let (levels, bytes) = self.cached.lock().unwrap_or_else(|e| e.into_inner()).take()?;
+        Some(PrefillClaim {
+            owner: self.clone(),
+            levels,
+            bytes,
+            finished: false,
+        })
+    }
+}
+
+/// Owns a claimed prefill during prelude recording; restores `cached` on drop
+/// if the upload buffer allocation fails before publishing.
+struct PrefillClaim {
+    owner: Arc<Prefill>,
+    levels: u32,
+    bytes: Arc<Vec<u8>>,
+    finished: bool,
+}
+
+impl PrefillClaim {
+    fn publish(&mut self) {
+        self.finished = true;
+        self.owner.published.store(self.levels, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl Drop for PrefillClaim {
+    fn drop(&mut self) {
+        if !self.finished {
+            *self.owner.cached.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some((self.levels, self.bytes.clone()));
+        }
+    }
+}
+
+/// Records copies of cached sharp levels `0..levels` onto `cmd_list`, publishes
+/// them with Release ordering, and notifies descriptor slots to rebind.
+fn record_prefill(
     host_list: &HostList,
     cmd_list: &ID3D12GraphicsCommandList,
-    copy: &crate::resource::HostTexture,
-    levels: u32,
-    bytes: &[u8],
-) -> bool {
+    texture: &ID3D12Resource,
+    resource: usize,
+    start: u64,
+    mut claim: PrefillClaim,
+) {
     use std::sync::atomic::Ordering::Relaxed;
     let Some(host) = host() else {
-        return false;
+        return;
     };
-    let texture = &copy.texture;
+    let levels = claim.levels;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
     if levels == 0 || levels > u32::from(d.MipLevels) || d.DepthOrArraySize != 1 {
-        return false;
+        claim.finished = true;
+        return;
     }
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); levels as usize];
     let mut total = 0;
@@ -989,14 +1075,15 @@ fn prefill_levels(
     unsafe {
         host.device.GetCopyableFootprints(&d, 0, levels, 0, Some(footprints.as_mut_ptr()), None, None, Some(&mut total));
     }
-    if total as usize > bytes.len() {
-        return false;
+    if total as usize > claim.bytes.len() {
+        claim.finished = true;
+        return;
     }
     let Some((buffer, data)) = host.upload_buffer(total) else {
-        return false;
+        return; // Drop restores `cached` so the next upload retries cleanly.
     };
     // SAFETY: the mapping holds `total` bytes.
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, total as usize) };
+    unsafe { std::ptr::copy_nonoverlapping(claim.bytes.as_ptr(), data, total as usize) };
     host_list.keep(&buffer);
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
@@ -1014,9 +1101,10 @@ fn prefill_levels(
         // SAFETY: an open list; both locations name live resources.
         unsafe { cmd_list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
-    copy.prefilled.store(levels, Relaxed);
+    claim.publish();
     crate::texstore::PREFILLED.fetch_add(1, Relaxed);
-    true
+    crate::texlate::whole(resource);
+    crate::descriptor::host::levels_changed_after(start);
 }
 
 /// Levels on demand: the levels a list claimed for its zeros
@@ -1377,6 +1465,19 @@ impl Staging {
                 return self.refresh_unlocked(last, size);
             };
             mapped
+        } else if BAKING.get() && exact_unlocked() {
+            match crate::watch::title_memory_reading_now() {
+                Some(mapped) => mapped,
+                None => match self.refresh_exact_unlocked(last, size) {
+                    Some(changed) => {
+                        if changed {
+                            found_blind(last);
+                        }
+                        return size;
+                    }
+                    None => waited(2, crate::watch::title_memory_reading),
+                },
+            }
         } else {
             waited(2, crate::watch::title_memory_reading)
         };
@@ -1483,6 +1584,29 @@ impl Staging {
             last.asked = 0;
             0
         }
+    }
+
+    /// An exact refresh (for a bake) while the runtime is remapping title memory
+    /// (`VICTORY_EXACT_NO_WAIT`): reads whole through the kernel without the lock;
+    /// returns `None` if any page is unmapped so the caller waits for the lock.
+    fn refresh_exact_unlocked(&self, last: &mut Last, size: usize) -> Option<bool> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut changed = false;
+        let read = with_read(size, |read| {
+            if !crate::host::read_into(self.memory, read) {
+                return false;
+            }
+            let hash = digest(read);
+            if last.hash != Some(hash) {
+                last.hash = Some(hash);
+                self.detile(read);
+                self.keep_whole(read, hash.0);
+                changed = true;
+            }
+            true
+        });
+        EXACT_UNLOCKED[usize::from(!read)].fetch_add(1, Relaxed);
+        read.then_some(changed)
     }
 
     /// The first filling of the staging buffer while the runtime is

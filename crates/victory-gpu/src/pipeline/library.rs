@@ -581,6 +581,12 @@ pub(crate) fn pipeline(
 /// Writes the library and the early list if pipelines were added since the
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
+    // Lifecycle shutdown calls save(true); optionally skip periodic mid-game
+    // 1.7 GB library serialization checkpoints (`VICTORY_PIPELINE_SAVE_ON_EXIT_ONLY=1`).
+    static EXIT_ONLY: OnceLock<bool> = OnceLock::new();
+    if !now && *EXIT_ONLY.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_SAVE_ON_EXIT_ONLY").is_some_and(|v| v == "1")) {
+        return;
+    }
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     static SAVE_EVERY: OnceLock<std::time::Duration> = OnceLock::new();
     let save_every = *SAVE_EVERY.get_or_init(|| {

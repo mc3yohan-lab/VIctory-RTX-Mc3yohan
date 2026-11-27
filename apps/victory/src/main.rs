@@ -364,6 +364,7 @@ fn apply_nvidia_preset(run_console: Option<Console>) {
     };
     for (k, v) in [
         ("VICTORY_TEXTURE_NO_WAIT", "1"),
+        ("VICTORY_EXACT_NO_WAIT", "1"),
         ("VICTORY_TEXTURE_STAGE_MS", "25"),
         ("VICTORY_TEXTURE_CATCHUP", "1"),
         ("VICTORY_EARLY_TEXTURES_MS", "12"),
@@ -392,6 +393,12 @@ fn apply_nvidia_preset(run_console: Option<Console>) {
         ("VICTORY_D3D12_DRED", "light"),
         ("VICTORY_D3D12_BACKGROUND", "0"),
         ("VICTORY_MEMORY_MAP", "0"),
+        ("VICTORY_GUARD_HOT", "50"),
+        ("VICTORY_WRITE_JOBS", "1"),
+        ("VICTORY_WATCH_TEXTURES_JOINED", "1"),
+        ("VICTORY_READBACK_POOL", "1"),
+        ("VICTORY_BATCHED_SWEEP", "1"),
+        ("VICTORY_PIPELINE_SAVE_ON_EXIT_ONLY", "1"),
         ("VICTORY_TABLES_EARLY", "1"),
         ("VICTORY_DYNAMIC_SLOTS", "393216"),
         ("VICTORY_PIPELINE_LOWEST", "0"),
@@ -420,11 +427,14 @@ fn apply_nvidia_preset(run_console: Option<Console>) {
         set_default(k, v);
     }
     if !rt_on {
+        set_default("VICTORY_SKIP_PREFIXES", "CS_RaytracingResolve");
         set_default("VICTORY_AMBIENT", "1.0");
         set_default("VICTORY_AMBIENT_AIR", "1.5");
         set_default("VICTORY_AMBIENT_MOST", "2.0");
         set_default("VICTORY_AMBIENT_SHADE", "0.7,0.5");
         set_default("VICTORY_AMBIENT_REFL", "2.0");
+        set_default("VICTORY_AMBIENT_REFLECT", "0.5");
+        set_default("VICTORY_AMBIENT_REFLECT_LEAST", "0.25");
     }
     let fsr_on = std::env::var("VICTORY_FSR_4K").is_ok_and(|v| !v.is_empty() && v != "0");
     if !fsr_on {

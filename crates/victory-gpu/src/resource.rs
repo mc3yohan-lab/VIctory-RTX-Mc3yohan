@@ -1201,11 +1201,8 @@ pub(crate) struct HostTexture {
     pub(crate) holds: std::sync::Arc<Holds>,
     /// Who makes its first upload (`crate::texture::ahead`).
     pub(crate) ahead: std::sync::atomic::AtomicU8,
-    /// Made whole from the store (`crate::texstore`): its levels below the
-    /// first one title memory holds, until a list copies them; then how
-    /// many levels the copy put in (its views show them).
-    pub(crate) prefill: std::sync::Mutex<Option<(u32, std::sync::Arc<Vec<u8>>)>>,
-    pub(crate) prefilled: std::sync::atomic::AtomicU32,
+    /// Cached levels to upload (`crate::texstore`), and levels published by a submission.
+    pub(crate) prefill: Option<std::sync::Arc<crate::texture::Prefill>>,
     /// The texture's flags (asked once: the runtime takes 100 ns to say, and
     /// every texture of every draw is asked about).
     flags: u32,
@@ -1768,7 +1765,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             None => HostTexture::new(texture, state),
         };
         host.base = base;
-        *host.prefill.get_mut().unwrap_or_else(|e| e.into_inner()) = prefill;
+        host.prefill = prefill.map(crate::texture::Prefill::new);
         host.grown.store(r.host.grown.swap(false, Relaxed), Relaxed);
         if base > 0 {
             HELD[0].fetch_add(1, Relaxed);
@@ -2466,8 +2463,7 @@ impl HostTexture {
             grown: Default::default(),
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
-            prefill: Default::default(),
-            prefilled: Default::default(),
+            prefill: None,
             flags,
         }
     }
@@ -2493,8 +2489,7 @@ impl HostTexture {
             grown: Default::default(),
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
-            prefill: Default::default(),
-            prefilled: Default::default(),
+            prefill: None,
             flags,
         }
     }
@@ -2652,8 +2647,11 @@ fn host_texture_as(
     };
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
-    // in no texel).
-    if fills(desc)
+    // in no texel). Skip the pool when `reserved` is requested (levels on
+    // demand, `crate::tiles`): a pooled resource is committed and cannot be
+    // mapped tile-by-tile (ScarlettPort 1deb0be4).
+    if !reserved
+        && fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
         && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())

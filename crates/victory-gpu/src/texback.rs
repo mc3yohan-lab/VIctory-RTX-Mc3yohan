@@ -138,14 +138,97 @@ impl Target {
     pub(crate) fn fresh(&self) -> bool { self.ticket.valid.load(Ordering::Acquire) }
 }
 
+/// A read-back buffer nothing holds (`VICTORY_READBACK_POOL=1`, fxceless #1359).
+struct Spare(ID3D12Resource);
+
+// SAFETY: a D3D12 buffer (free-threaded), untouched while spare.
+unsafe impl Send for Spare {}
+
+/// Spare read-back buffers by power-of-two size, and total cached bytes.
+static SPARE: Mutex<(std::collections::BTreeMap<u64, Vec<Spare>>, u64)> =
+    Mutex::new((std::collections::BTreeMap::new(), 0));
+/// Default max pooled bytes (256 MiB) and max single pooled buffer (16 MiB).
+const SPARE_MOST: (u64, u64) = (256 << 20, 16 << 20);
+static SPARE_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+fn pool_on() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_READBACK_POOL") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_READBACK_POOL").is_some_and(|v| v == "1"))
+}
+
+fn spare_most() -> u64 {
+    if crate::residency::pressured() {
+        return 0;
+    }
+    static MOST: OnceLock<u64> = OnceLock::new();
+    let base = *MOST.get_or_init(|| {
+        std::env::var("VICTORY_READBACK_POOL_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(SPARE_MOST.0, |mb| mb << 20)
+    });
+    if crate::ram_profile::enabled() {
+        base.min(32 << 20)
+    } else {
+        base
+    }
+}
+
+fn pool_size(total: u64, on: bool) -> u64 {
+    let size = total.max(64 << 10).next_power_of_two();
+    if on && size <= SPARE_MOST.1 { size } else { 0 }
+}
+
+fn read_back_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, u64)> {
+    let size = pool_size(total, pool_on());
+    if size == 0 {
+        return Some((host.read_back_buffer(total)?, 0));
+    }
+    let spare = {
+        let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        let taken = all.0.get_mut(&size).and_then(Vec::pop);
+        if taken.is_some() {
+            all.1 -= size;
+        }
+        taken
+    };
+    if let Some(Spare(buffer)) = spare {
+        SPARE_STATS[0].fetch_add(1, Ordering::Relaxed);
+        return Some((buffer, size));
+    }
+    let buffer = host.read_back_buffer(size)?;
+    SPARE_STATS[1].fetch_add(1, Ordering::Relaxed);
+    Some((buffer, size))
+}
+
 /// The readback resources and the allocation the pixels belong to.
 pub(crate) struct Back {
     buffer: ID3D12Resource,
+    pooled: u64,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     mips: u32,
     layout: victory_formats::texture::Layout,
     ticket: Arc<Ticket>,
+}
+
+impl Drop for Back {
+    fn drop(&mut self) {
+        if self.pooled != 0 && pool_on() {
+            let cap = spare_most();
+            if cap > 0 {
+                let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+                if all.1 + self.pooled <= cap {
+                    all.1 += self.pooled;
+                    all.0.entry(self.pooled).or_default().push(Spare(self.buffer.clone()));
+                }
+            }
+        }
+    }
 }
 
 impl Back {
@@ -191,7 +274,7 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
             .checked_mul(u64::from(format.Depth))?;
         total = total.max(footprint.Offset.checked_add(pitched)?);
     }
-    let buffer = host.read_back_buffer(total)?;
+    let (buffer, pooled) = read_back_buffer(host, total)?;
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
@@ -208,7 +291,7 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
         // SAFETY: an open list; the texture is in the copy-source state.
         unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
-    Some(Back { buffer, footprints, rows, mips, layout: target.layout, ticket: target.ticket })
+    Some(Back { buffer, pooled, footprints, rows, mips, layout: target.layout, ticket: target.ticket })
 }
 
 /// Whether texture read-backs are written into title memory by a thread of

@@ -34,6 +34,8 @@
 #   scripts\play-nvidia.ps1 -NoPortGuard           # Disable Renderer Port 6 (shared guard lock + parallel planning)
 #   scripts\play-nvidia.ps1 -NoPortJournal         # Disable Renderer Port 7 (early heap sync + 64-sharded journal)
 #   scripts\play-nvidia.ps1 -NoPortConstants       # Disable Renderer Port 1 (VICTORY_PORT_CONSTANTS)
+#   scripts\play-nvidia.ps1 -NoSkipRtResolve       # Keep CS_RaytracingResolve running when RT is off (A/B compare)
+#   scripts\play-nvidia.ps1 -WcNoBack              # Opt-in VICTORY_WC_NO_BACK=1 (min 16 MiB) for write-combined VRAM buffers
 #   scripts\play-nvidia.ps1 -Safe                  # Safe fallback path (disables port patches, ReBAR windows, and thin lists)
 #   scripts\play-nvidia.ps1 -NoLog                 # Disable automatic log capture
 #
@@ -52,9 +54,12 @@ param(
     [switch]$TexStore,
     [switch]$SkipRtHashes,
     [switch]$SkipRtAggressive,
+    [switch]$NoSkipRtResolve,
     [switch]$LaneCore,
     [switch]$Thin,
     [switch]$NoThin,
+    [int]$ThinThreads = -1,
+    [int]$WideThreads = -1,
     [switch]$NoAmbient,
     [switch]$NoPortConstants,
     [switch]$PortDescriptors,
@@ -67,6 +72,8 @@ param(
     [switch]$SweepPerHeap,
     [switch]$XmaRefill,
     [switch]$SendBar,
+    [switch]$WcNoBack,
+    [switch]$WcBar,
     [switch]$Residency,
     [switch]$Ram16,
     [switch]$NoRam16,
@@ -144,7 +151,10 @@ if ($gpuTotalMb -gt 0 -and $gpuTotalMb -lt 10000) {
     if ($CardBuffersMinKb -lt 0) { $CardBuffersMinKb = 64 }
     $autoCardBuffersMb = 4096
 } else {
-    if ($WindowsBarMb -lt 0)     { $WindowsBarMb = 4096 }
+    # 24 GB+ VRAM (e.g., RTX 4090 / 3090 / 5090): 8 GiB ReBAR window cap pulls hot loose
+    # mesh/vertex windows out of 25 GB/s Shared System RAM into 1,008 GB/s GDDR6X
+    # (auto-guarded at 80% of DXGI local budget in shadow.rs).
+    if ($WindowsBarMb -lt 0)     { $WindowsBarMb = 8192 }
     if ($MipDrop -lt 0)          { $MipDrop = 0 }
     if ($CardBuffersMinKb -lt 0) { $CardBuffersMinKb = 64 }
 }
@@ -160,63 +170,87 @@ try {
     $freeCommitGb = [math]::Round($os.FreeVirtualMemory / 1MB, 1)
     $ram16Tag = if ($Ram16) { ', 16 GiB RAM profile: forced ON' } elseif ($NoRam16) { ', 16 GiB RAM profile: forced OFF' } elseif ($totalPhysGb -le 16.5) { ', 16 GiB RAM profile: auto ON' } else { '' }
     Write-Host ("Memory check: {0} GB free / {1} GB total RAM, {2} GB free commit{3}" -f $freePhysGb, $totalPhysGb, $freeCommitGb, $ram16Tag)
+    if ($Ram16 -and $totalPhysGb -ge 24.0) {
+        Write-Warning "-Ram16 is forced ON on a ${totalPhysGb} GB RAM system. This caps pools for 16 GB PCs and can hurt FPS; omit -Ram16 on 32/64 GB RAM."
+    }
     if ($freeCommitGb -lt 44) {
         Write-Warning "Free Windows commit ($freeCommitGb GB) is tight for open-world play (needs ~40-46 GB). Close heavy apps if crashes.log shows error 1455."
     }
 } catch {}
 
+$logicalCpus = [Environment]::ProcessorCount
+$autoWideThreads = if ($WideThreads -gt 0) {
+    $WideThreads
+} elseif ($logicalCpus -ge 16) {
+    8
+} elseif ($logicalCpus -ge 12) {
+    6
+} else {
+    0
+}
+
 $settings = @{
     # --- Core fast path (avatarmanz latest + RTX 4090 ReBAR tuning) ---
     # NO_WAIT=1 keeps texture streaming non-blocking; 25 ms stage + CATCHUP=1 + 12 ms early
     # drain scene-entry backlogs without 250 ms hitches or perpetually missing textures.
-    VICTORY_TEXTURE_NO_WAIT     = $(if ($WaitTextures) { '0' } else { '1' })
-    VICTORY_TEXTURE_STAGE_MS    = '25'
-    VICTORY_TEXTURE_CATCHUP     = '1'
-    VICTORY_EARLY_TEXTURES_MS   = '12'
-    VICTORY_BAKE_EXACT          = '1'
-    VICTORY_BAKE_SOURCES        = '1'
-    VICTORY_FAIR_DUE            = '1'
-    VICTORY_SHOW_NEW_LATER      = '1'
-    VICTORY_UPLOAD_AHEAD        = '1'
-    VICTORY_SHOW_AFTER          = '1'
-    VICTORY_VIDEO_PLANES        = '1'
-    VICTORY_RELAY               = '2'
-    VICTORY_CARD_STEPS          = '2'
-    VICTORY_WIDE_BACK           = '1'
-    VICTORY_CARD_REHASH_RUNS    = '1'
-    VICTORY_JOIN_COPIES         = '1'
-    VICTORY_JOIN_BARRIERS       = '1'
-    VICTORY_INDIRECT_WINDOW     = '1'
-    VICTORY_RELAY_COPY          = '1'
-    VICTORY_INDIRECT_BATCH      = '2'
-    VICTORY_INDIRECT_REST       = '0'
-    VICTORY_LAND_SKIP           = '1'
-    VICTORY_LAND_THREADS        = '6'
-    VICTORY_MAP_THREADS         = '1'
-    VICTORY_TITLE_PRIORITIES    = '0'
-    VICTORY_CARD_AWAKE          = 'idle'
-    VICTORY_D3D12_DRED          = 'light'
-    VICTORY_D3D12_BACKGROUND    = '0'
-    VICTORY_MEMORY_MAP          = '0'
+    VICTORY_TEXTURE_NO_WAIT            = $(if ($WaitTextures) { '0' } else { '1' })
+    VICTORY_EXACT_NO_WAIT              = $(if ($WaitTextures) { '0' } else { '1' })
+    VICTORY_TEXTURE_STAGE_MS           = '25'
+    VICTORY_TEXTURE_CATCHUP            = '1'
+    VICTORY_EARLY_TEXTURES_MS          = '12'
+    VICTORY_BAKE_EXACT                 = '1'
+    VICTORY_BAKE_SOURCES               = '1'
+    VICTORY_FAIR_DUE                   = '1'
+    VICTORY_SHOW_NEW_LATER             = '1'
+    VICTORY_UPLOAD_AHEAD               = '1'
+    VICTORY_SHOW_AFTER                 = '1'
+    VICTORY_VIDEO_PLANES               = '1'
+    VICTORY_RELAY                      = '2'
+    VICTORY_CARD_STEPS                 = '2'
+    VICTORY_WIDE_BACK                  = '1'
+    VICTORY_CARD_REHASH_RUNS           = '1'
+    VICTORY_JOIN_COPIES                = '1'
+    VICTORY_JOIN_BARRIERS              = '1'
+    VICTORY_INDIRECT_WINDOW            = '1'
+    VICTORY_RELAY_COPY                 = '1'
+    VICTORY_INDIRECT_BATCH             = '2'
+    VICTORY_INDIRECT_REST              = '0'
+    VICTORY_LAND_SKIP                  = '1'
+    VICTORY_LAND_THREADS               = '6'
+    VICTORY_MAP_THREADS                = '1'
+    VICTORY_TITLE_PRIORITIES           = '0'
+    VICTORY_CARD_AWAKE                 = 'idle'
+    VICTORY_D3D12_DRED                 = 'light'
+    VICTORY_D3D12_BACKGROUND           = '0'
+    VICTORY_MEMORY_MAP                 = '0'
+    VICTORY_GUARD_HOT                  = '50'
+    VICTORY_WRITE_JOBS                 = '1'
+    VICTORY_WATCH_TEXTURES_JOINED      = '1'
+    VICTORY_READBACK_POOL              = '1'
+    VICTORY_BATCHED_SWEEP              = '1'
+    VICTORY_PIPELINE_SAVE_ON_EXIT_ONLY = '1'
 
     # --- NVIDIA 1M view heap: zero refused tables / zero dropped draws ---
-    VICTORY_TABLES_EARLY        = '1'
-    VICTORY_DYNAMIC_SLOTS       = "$DynamicSlots"
+    VICTORY_TABLES_EARLY               = '1'
+    VICTORY_DYNAMIC_SLOTS              = "$DynamicSlots"
 
     # --- Pipeline workers, format variants & watchdog safety ---
-    VICTORY_PIPELINE_LOWEST     = '0'
-    VICTORY_PIPELINE_WORKERS    = '8'
-    VICTORY_PIPELINE_WAIT_ONCE  = '1'
-    VICTORY_TARGET_VARIANTS     = '1'
-    VICTORY_NO_WATCHDOG         = '1'
-    VICTORY_XMA_REFILL          = '1'
+    VICTORY_PIPELINE_LOWEST            = '0'
+    VICTORY_PIPELINE_WORKERS           = '8'
+    VICTORY_PIPELINE_WAIT_ONCE         = '1'
+    VICTORY_TARGET_VARIANTS            = '1'
+    VICTORY_NO_WATCHDOG                = '1'
+    VICTORY_XMA_REFILL                 = '1'
 
     # --- Shader translator (MUST match `victory shaders` and `victory warm`) ---
     # Default SHADER_OPT=63 (bit 64 grouped 4-dword scalar loads blackened water in fxceless run 277 with 0 ms gain).
-    VICTORY_SHADER_OPT          = $(if ($WideShaderOpt) { '127' } else { '63' })
-    VICTORY_WAVE_WIDE           = 'last'
-    VICTORY_NAN_SCRUB           = '1'
-    VICTORY_SMALL_RECHECK       = '0'
+    VICTORY_SHADER_OPT                 = $(if ($WideShaderOpt) { '127' } else { '63' })
+    VICTORY_WAVE_WIDE                  = 'last'
+    VICTORY_NAN_SCRUB                  = '1'
+    VICTORY_SMALL_RECHECK              = '0'
+}
+if ($autoWideThreads -gt 0) {
+    $settings.VICTORY_WIDE_THREADS = "$autoWideThreads"
 }
 
 if (-not $NoPortConstants -and -not $Safe) {
@@ -278,6 +312,15 @@ if ($WindowKb -gt 0 -and -not $Safe) {
 if ($SendBar -and -not $Safe) {
     $settings.VICTORY_SEND_BAR = '1'
 }
+if ($WcNoBack -and -not $Safe) {
+    # Skip GPU->CPU compare/readback for large (>=16 MiB) write-combined buffers that the
+    # title CPU does not read back (leaving small exposure/stats buffers untouched).
+    $settings.VICTORY_WC_NO_BACK        = '1'
+    $settings.VICTORY_WC_NO_BACK_MIN_KB = '16384'
+}
+if ($WcBar -and -not $Safe) {
+    $settings.VICTORY_WC_BAR = '1'
+}
 if ($Residency) {
     $settings.VICTORY_RESIDENCY = '1'
 }
@@ -338,7 +381,7 @@ if ($Safe) {
     $useThin = if ($Thin) { $true } elseif ($NoThin) { $false } else { -not $isBlackwell }
     if ($useThin) {
         $settings.VICTORY_THIN         = '1'
-        $settings.VICTORY_THIN_THREADS = '8'
+        $settings.VICTORY_THIN_THREADS = $(if ($ThinThreads -gt 0) { "$ThinThreads" } else { '8' })
     } else {
         $settings.VICTORY_THIN         = '0'
     }
@@ -355,12 +398,15 @@ if ($Quality) {
 }
 
 if (-not $NoAmbient -and -not $RayTracing) {
-    $settings.VICTORY_AMBIENT       = '1.0'
-    $settings.VICTORY_AMBIENT_AIR   = '1.5'
+    $settings.VICTORY_AMBIENT               = '1.0'
+    $settings.VICTORY_AMBIENT_AIR           = '1.5'
     # Cap at 2.0 (matches ambient.rs / megafork) to prevent overbright glare near indoor windows.
-    $settings.VICTORY_AMBIENT_MOST  = '2.0'
-    $settings.VICTORY_AMBIENT_SHADE = '0.7,0.5'
-    $settings.VICTORY_AMBIENT_REFL  = '2.0'
+    $settings.VICTORY_AMBIENT_MOST          = '2.0'
+    $settings.VICTORY_AMBIENT_SHADE         = '0.7,0.5'
+    $settings.VICTORY_AMBIENT_REFL          = '2.0'
+    # Clamp CS_UpdateHistory (Role::Reflect) to eliminate HDR bloom orange/white square halos.
+    $settings.VICTORY_AMBIENT_REFLECT       = '0.5'
+    $settings.VICTORY_AMBIENT_REFLECT_LEAST = '0.25'
 }
 
 if ($RayTracing) {
@@ -373,6 +419,10 @@ if ($RayTracing) {
         # Tier B RT skip (adds ray-binning + RaytracingResolve on top of auto Tier-A pure-BVH skips;
         # ambient.rs hooks CS_ScreenProbes_TemporalResolve / CS_RayMiss remain immune in pipeline.rs).
         $settings.VICTORY_SKIP_PREFIXES = 'CS_RaytracingResolve,CS_RayBudgeting_,CS_RaytraceVBuffer_,CS_ScreenProbes_TraceRays_,CS_GenerateRayCoords,CS_GenerateRayBins,CS_GenerateRayBinOffsets,CS_ClassifyRayTiles,CS_SortRayTiles,CS_ResetRayTileArgs,CS_ClearRayBins,CS_ClearRayCounts'
+    } elseif (-not $NoSkipRtResolve) {
+        # Skip 328 CS_RaytracingResolve_* compute shaders that run ~18 ms/frame on RT-off runs
+        # despite 0 BVH hits, while leaving mixed/screen-space shadows and ambient.rs hooks intact.
+        $settings.VICTORY_SKIP_PREFIXES = 'CS_RaytracingResolve'
     }
     if ($SkipRtHashes) {
         $rtHashesPath = Join-Path $PSScriptRoot 'rt_off_hashes.txt'

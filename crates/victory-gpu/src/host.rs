@@ -539,9 +539,56 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
     }
 }
 
+type SweepPass = (&'static str, fn(bool));
+const SWEEP_PASSES: &[SweepPass] = &[
+    ("snapshot_and_scratch", |pressured| {
+        crate::shadow::trim_snapshot_pool();
+        if pressured {
+            trim_spare_chunks();
+        }
+    }),
+    ("pools", |_| {
+        crate::pool::room(host().and_then(|h| h.video_memory()));
+        crate::pipeline::trim_library();
+    }),
+    ("buffer_shadows", |_| crate::shadow::let_go_idle()),
+    ("texture_staging", |_| crate::texture::let_go_idle()),
+    ("texture_copies", |_| crate::resource::let_go_idle()),
+];
+
+struct SweepSchedule {
+    next: usize,
+    last_frame: Option<u64>,
+}
+
+impl SweepSchedule {
+    const fn new() -> Self {
+        Self { next: SWEEP_PASSES.len(), last_frame: None }
+    }
+
+    fn take(&mut self, tick: bool, urgent: bool, frame: u64) -> std::ops::Range<usize> {
+        let end = SWEEP_PASSES.len();
+        let pending = self.next < end;
+        if tick && (urgent || !pending) {
+            self.next = 0;
+        }
+        let start = self.next;
+        if tick && (urgent || pending) {
+            self.next = end;
+        } else if start < end && (tick || self.last_frame != Some(frame)) {
+            self.next += 1;
+        }
+        if self.next != start {
+            self.last_frame = Some(frame);
+        }
+        start..self.next
+    }
+}
+
 /// Once a second, before a submission starts: lets go of what nothing
 /// names any more (copies of windows of title memory, staging buffers,
-/// host copies of textures the title fills).
+/// host copies of textures the title fills). `VICTORY_BATCHED_SWEEP=1`
+/// spreads ordinary cleanup across safe frames to prevent 1s hitch spikes.
 /// `VICTORY_SWEEP=0` keeps everything, as before.
 fn sweep() {
     // The in-place probe and census, if asked for (`VICTORY_INPLACE_PROBE`).
@@ -551,27 +598,36 @@ fn sweep() {
         return;
     }
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static BATCHED: OnceLock<bool> = OnceLock::new();
+    let batched = *BATCHED.get_or_init(|| std::env::var_os("VICTORY_BATCHED_SWEEP").is_some_and(|v| v == "1"));
     let now = now_ms();
     let last = LAST.load(Ordering::Relaxed);
-    if now < last + 1000
-        || LAST
+    let tick = now >= last + 1000
+        && LAST
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-            .is_err()
-    {
+            .is_ok();
+    if !tick && !batched {
         return;
     }
-    #[cfg(feature = "diagnostics")]
-    crate::book::check();
-    crate::residency::refresh();
-    crate::shadow::trim_snapshot_pool();
-    if crate::residency::pressured() {
-        trim_spare_chunks();
+    if tick {
+        #[cfg(feature = "diagnostics")]
+        crate::book::check();
+        crate::residency::refresh();
     }
-    crate::pool::room(host().and_then(|h| h.video_memory()));
-    crate::pipeline::trim_library();
-    crate::shadow::let_go_idle();
-    crate::texture::let_go_idle();
-    crate::resource::let_go_idle();
+    let pressured = crate::residency::pressured();
+    let passes = if batched {
+        static SCHEDULE: Mutex<SweepSchedule> = Mutex::new(SweepSchedule::new());
+        let range = SCHEDULE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take(tick, pressured, crate::frame::current());
+        &SWEEP_PASSES[range]
+    } else {
+        SWEEP_PASSES
+    };
+    for &(_stage, run) in passes {
+        run(pressured);
+    }
 }
 
 /// The number of the newest submission begun, and of the newest of which all
@@ -1258,6 +1314,64 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn batched_sweep_visits_each_pass_once_across_frames() {
+        let mut schedule = SweepSchedule::new();
+        assert!(schedule.take(false, false, 0).is_empty());
+        for i in 0..SWEEP_PASSES.len() {
+            assert_eq!(schedule.take(i == 0, false, i as u64), i..i + 1);
+            assert!(schedule.take(false, false, i as u64).is_empty());
+        }
+        assert!(schedule.take(false, false, 20).is_empty());
+        assert_eq!(schedule.take(true, false, 21), 0..1);
+    }
+
+    #[test]
+    fn batched_sweep_finishes_overdue_work_even_without_a_new_frame() {
+        let mut schedule = SweepSchedule::new();
+        assert_eq!(schedule.take(true, false, 0), 0..1);
+        assert_eq!(schedule.take(true, false, 0), 1..SWEEP_PASSES.len());
+        assert_eq!(schedule.take(true, false, 0), 0..1);
+    }
+
+    #[test]
+    fn batched_sweep_reclaims_all_owners_on_a_critical_tick() {
+        let mut schedule = SweepSchedule::new();
+        assert_eq!(schedule.take(true, false, 1), 0..1);
+        assert_eq!(schedule.take(true, true, 1), 0..SWEEP_PASSES.len());
+        assert!(schedule.take(false, false, 2).is_empty());
+        assert_eq!(schedule.take(true, true, 3), 0..SWEEP_PASSES.len());
+    }
+
+    /// An object kept many times is held once until the reset.
+    #[test]
+    fn an_object_kept_again_is_held_once_until_the_reset() {
+        let Some(host) = host() else {
+            eprintln!("no D3D12 device; keep test skipped");
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let (a, _) = host.upload_buffer(256).unwrap();
+        let (b, _) = host.upload_buffer(256).unwrap();
+        for _ in 0..1000 {
+            list.keep(&a);
+        }
+        let counts = |list: &HostList| {
+            let d = list.deferred();
+            (d.kept.len(), d.kept_at.len())
+        };
+        assert_eq!(counts(&list), (1, 1));
+        list.keep(&b);
+        assert_eq!(counts(&list), (2, 2));
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        assert_eq!(counts(&list), (0, 0));
+        list.keep(&a);
+        assert_eq!(list.deferred().kept.len(), 1);
+        list.close();
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {
@@ -2498,11 +2612,10 @@ enum Step {
     /// the card could bring the bytes instead.
     Fill(usize, usize, usize, Option<card_steps::FillTo>),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
-    /// once per submission, whichever lists ask, until a `Copy` or `Run`
-    /// intervenes.
+    /// once per submission, whichever lists ask, until a title copy intervenes.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
-    /// Work that may write title memory.
-    Run(Box<dyn Fn() + Send>),
+    /// A submission-time title copy whose placed route did not apply.
+    RawCopy { dst: usize, src: usize, len: usize },
     /// Work that writes host memory only, and the title memory it reads
     /// (from, to; empty for none).
     Host(Box<dyn Fn() + Send>, (usize, usize)),
@@ -2510,7 +2623,7 @@ enum Step {
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date and uploads it on the
     /// list's prelude when changed: once per submission, whichever lists
-    /// sample it, until a `Copy` or `Run` intervenes.
+    /// sample it, until a title copy intervenes.
     Texture(crate::texture::PreludeUpload),
     /// A title buffer copy that the list does on the card ([`place`]): what
     /// is done on the CPU for it.
@@ -2531,6 +2644,9 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// The interfaces [`HostList::keep`] put in `kept`, by address: binding
+    /// the same heap's tables at every draw keeps it once, not once a draw.
+    kept_at: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// The pipelines [`HostList::bind_pipeline`] kept, by address.
     bound: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
@@ -3285,7 +3401,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                Step::Run(_) => return Some(WHY_RUN),
+                Step::RawCopy { .. } => return Some(WHY_RUN),
                 Step::Placed(p) => match p.waits(written) {
                     place::Waits::No => {}
                     place::Waits::ForReaders => placed = true,
@@ -3393,12 +3509,28 @@ fn joins_asked() -> (usize, usize) {
     (parts, lists)
 }
 
+/// Whether a submission's one write-watch asking (`VICTORY_ASK_ONCE`) also
+/// covers the memory of the staged textures its lists sample
+/// (`VICTORY_WATCH_TEXTURES_JOINED=1`; off by default).
+fn textures_joined() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_WATCH_TEXTURES_JOINED") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_TEXTURES_JOINED").is_some_and(|v| v == "1"))
+}
+
+/// With [`textures_joined`], since the last frame line: texture ranges put
+/// into submissions' one asking.
+static TEXTURES_ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Whether the part `next` can be prepared together with `ahead`, which goes
 /// before it and has not been sent: nothing done on the CPU for it reads what
 /// those give their shaders, write back or write when they are done, and it
-/// changes no title memory that they read ([`Step::Copy`], [`Step::Run`]).
+/// changes no title memory that they read ([`Step::Copy`], [`Step::RawCopy`]).
 pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&HostList]) -> bool {
-    if next.iter().any(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Copy(..) | Step::Run(_)))) {
+    if next.iter().any(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Copy(..) | Step::RawCopy { .. }))) {
         return false;
     }
     let ahead: Vec<&HostList> = ahead.collect();
@@ -3999,6 +4131,14 @@ fn late_line(frames: f64) {
         );
     }
     card_steps::log(frames);
+    {
+        let textures = TEXTURES_ASKED.swap(0, Ordering::Relaxed) as f64 / frames;
+        if textures_joined() {
+            tracing::info!(
+                "staged textures put into submissions' one write-watch asking per frame (VICTORY_WATCH_TEXTURES_JOINED=1): {textures:.0}"
+            );
+        }
+    }
     crate::port::log(frames);
     crate::port_cbv::log(frames);
     crate::watch::port_guard_line(frames);
@@ -6072,7 +6212,21 @@ impl Host {
                     }
                 }
             }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            let mut ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            if textures_joined() {
+                let before = ranges.len();
+                for list in runs {
+                    for step in &list.deferred().copies {
+                        if let Step::Texture(upload) = step {
+                            let (at, len) = upload.staging.memory();
+                            if len > 0 {
+                                ranges.push((at, at + len));
+                            }
+                        }
+                    }
+                }
+                TEXTURES_ASKED.fetch_add((ranges.len() - before) as u64, Ordering::Relaxed);
+            }
             #[cfg(feature = "diagnostics")]
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
@@ -7560,7 +7714,7 @@ impl HostList {
             Step::Placed(p) => crate::port_rt::Seen::Placed { dst: p.dst, src: p.src, len: p.len, from_upload: p.from_upload() },
             &Step::Copy(d, _, n) => crate::port_rt::Seen::Writes(d, d + n),
             &Step::GpuWrite(_, a, n) => crate::port_rt::Seen::Writes(a, a + n),
-            Step::Run(_) => crate::port_rt::Seen::Anything,
+            Step::RawCopy { .. } => crate::port_rt::Seen::Anything,
             _ => crate::port_rt::Seen::Nothing,
         });
         match crate::port_rt::forwarded(seen, src, len) {
@@ -7947,9 +8101,17 @@ impl HostList {
     }
 
     /// Keeps `object` alive until the list is reset.
+    /// Once per object and reset (Marvisak/VIctory PR #3379).
     pub(crate) fn keep(&self, object: &impl Interface) {
+        let at = object.as_raw() as usize;
+        let mut deferred = self.deferred();
+        if !deferred.kept_at.insert(at) {
+            return;
+        }
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
-            self.deferred().kept.push(object);
+            deferred.kept.push(object);
+        } else {
+            deferred.kept_at.remove(&at);
         }
     }
 
@@ -7965,17 +8127,19 @@ impl HostList {
         self.deferred().textures.contains(&key)
     }
 
-    /// Runs `work` when the list is submitted, in order with its copies.
-    /// `work` may write title memory (refreshes after it copy again).
-    pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
+    /// Records a raw title-memory copy in the order of the list's steps.
+    pub(crate) fn defer_raw_copy(&self, dst: usize, src: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
         let mut deferred = self.deferred();
-        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.copies.push(Step::RawCopy { dst, src, len });
         deferred.title_written();
         drop(deferred);
         self.changed_something();
     }
 
-    /// As [`HostList::defer`], for work that writes only host memory.
+    /// Runs work that writes only host memory when the list is submitted.
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
         self.deferred().copies.push(Step::Host(Box::new(work), (0, 0)));
     }
@@ -8088,25 +8252,35 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
-                Step::Run(work) | Step::Host(work, _) => {
+                &Step::RawCopy { dst, src, len } => {
                     batch.fill();
                     #[cfg(feature = "diagnostics")]
                     let started = std::time::Instant::now();
-                    if matches!(step, Step::Run(_)) {
-                        if !batch.due.is_empty() {
-                            batch.refresh_textures();
-                        }
-                        batch.title_written();
-                        // (It may write anywhere, a heap's records too.)
-                        crate::port_journal::prep_wrote();
+                    if !batch.due.is_empty() {
+                        batch.refresh_textures();
+                    }
+                    batch.title_written();
+                    // The destination can alias a heap's descriptor records.
+                    crate::port_journal::prep_wrote();
+                    let _step = crate::timeline::span("a step of ours");
+                    copy_raw_title(dst, src, len);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        add(C::Runs, 1);
+                        add(C::RunUs, started.elapsed().as_micros() as u64);
+                    }
+                    continue;
+                }
+                Step::Host(work, _) => {
+                    batch.fill();
+                    #[cfg(feature = "diagnostics")]
+                    let started = std::time::Instant::now();
+                    if !batch.jobs.is_empty() {
+                        WRITE_JOB_STATS[4].fetch_add(1, Ordering::Relaxed);
+                        batch.run_jobs();
                     }
                     let _step = crate::timeline::span("a step of ours");
                     work();
-                    // It wrote title memory, where is not known here: the
-                    // submission's one asking ends, later refreshes ask anew.
-                    if matches!(step, Step::Run(_)) {
-                        crate::watch::ask_once_end();
-                    }
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
@@ -8115,6 +8289,14 @@ impl HostList {
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
+                    // `VICTORY_WRITE_JOBS`: defer per-copy refresh + `writing()` into
+                    // parallel jobs executed on `wide` threads at the next flush.
+                    if batch.writes_as_jobs() {
+                        batch.defer_write(shadow, *address, *len);
+                        #[cfg(feature = "diagnostics")]
+                        add(C::GpuWrites, 1);
+                        continue;
+                    }
                     // The shaders start from the title's data: this copy's
                     // pending refresh first. The other copies' wait for
                     // the next flush of all (flushing all of them at every
@@ -8243,6 +8425,7 @@ impl Split {
 /// The split of the preparing, per frame, for the frame-rate line.
 #[cfg(feature = "diagnostics")]
 fn split_line(frames: f64) {
+    write_jobs_line(frames);
     let ms: Vec<f64> = SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
     let f: Vec<f64> = FLUSHES.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     let e: Vec<f64> = crate::watch::early_asks().iter().map(|&n| n as f64 / frames).collect();
@@ -8389,9 +8572,54 @@ struct Batch {
     /// Copies (by address) brought up to date ahead of the steps, and the
     /// range (from, to) ([`Batch::refresh_ahead`]).
     ahead: ByCopy<(usize, usize)>,
+    /// The entry of `ahead` last looked up (copy, from, to); copy 0: none.
+    last_ahead: (usize, usize, usize),
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
+    /// [`write_jobs`], read at the batch's first shader write and kept for it.
+    write_jobs_on: Option<bool>,
+    /// With [`write_jobs`]: per copy (by address), refreshes and shader writes
+    /// to execute in order at the next flush (`Batch::run_jobs`).
+    jobs: ByCopy<(std::sync::Arc<crate::shadow::Shadow>, Vec<WriteStep>)>,
+}
+
+/// One thing a copy's job does ([`write_jobs`]), in the order of the steps.
+enum WriteStep {
+    /// `[from, to)` brought up to date, unless known to copy nothing.
+    Refresh(usize, usize),
+    /// Shaders are given `[address, address + len)`: `Shadow::writing`.
+    Write(usize, usize),
+}
+
+/// Whether `Step::GpuWrite` defers per-copy refresh + `Shadow::writing` into
+/// parallel jobs run at the next batch flush (`VICTORY_WRITE_JOBS=1`; off by default).
+fn write_jobs() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_WRITE_JOBS") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WRITE_JOBS").is_some_and(|v| v == "1"))
+}
+
+static WRITE_JOB_STATS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+fn write_jobs_line(frames: f64) {
+    let s: Vec<f64> = WRITE_JOB_STATS.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    if write_jobs() {
+        tracing::info!(
+            "shader writes per frame left to copies' jobs (VICTORY_WRITE_JOBS=1): {:.0} writes, {:.0} refreshes in {:.0} jobs \
+             of {:.0} flushes ({:.0} of them before a step of ours), {:.2} ms on the submitting thread",
+            s[0],
+            s[1],
+            s[2],
+            s[3],
+            s[4],
+            s[5] / 1000.0,
+        );
+    }
 }
 
 /// Whether the copies that a submission's shaders write are brought up to
@@ -8786,8 +9014,14 @@ impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
-        if self.ahead.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
+        if self.last_ahead.0 == key && self.last_ahead.1 <= address && end <= self.last_ahead.2 {
             return;
+        }
+        if let Some(&(from, to)) = self.ahead.get(&key) {
+            self.last_ahead = (key, from, to);
+            if from <= address && end <= to {
+                return;
+            }
         }
         match self.index.get(&key) {
             Some(&at) => {
@@ -8808,6 +9042,7 @@ impl Batch {
         // is in front of all the steps was, up to here.)
         if !self.front {
             self.ahead.remove(&(std::sync::Arc::as_ptr(shadow) as usize));
+            self.forget_ahead();
         }
         let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
             return;
@@ -8829,6 +9064,95 @@ impl Batch {
             SPLIT[9].fetch_add(ns, Ordering::Relaxed);
             SPLIT[10].fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Whether [`write_jobs`] is on for this batch.
+    fn writes_as_jobs(&mut self) -> bool {
+        *self.write_jobs_on.get_or_insert_with(write_jobs)
+    }
+
+    /// The pending refresh of the copy `key`, out of `refreshes`.
+    fn take_refresh(&mut self, key: usize) -> Option<(usize, usize)> {
+        let at = self.index.remove(&key)?;
+        let (_, from, to) = self.refreshes.swap_remove(at);
+        if let Some(moved) = self.refreshes.get(at) {
+            self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
+        }
+        Some((from, to))
+    }
+
+    /// [`write_jobs`]: queue pending refresh + shader write for `shadow` in order.
+    fn defer_write(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        if !self.front {
+            self.ahead.remove(&key);
+            self.forget_ahead();
+        }
+        let before = self.take_refresh(key);
+        WRITE_JOB_STATS[0].fetch_add(1, Ordering::Relaxed);
+        if before.is_some() {
+            WRITE_JOB_STATS[1].fetch_add(1, Ordering::Relaxed);
+        }
+        let job = &mut self.jobs.entry(key).or_insert_with(|| (shadow.clone(), Vec::new())).1;
+        if let Some((from, to)) = before {
+            job.push(WriteStep::Refresh(from, to));
+        }
+        job.push(WriteStep::Write(address, len));
+    }
+
+    /// [`write_jobs`]: execute per-copy refresh + `Shadow::writing` jobs across
+    /// `wide` threads when >= 4 copies have queued writes.
+    fn run_jobs(&mut self) {
+        if self.jobs.is_empty() {
+            return;
+        }
+        let _jobs = crate::timeline::span("copies' refreshes and shader writes");
+        let started = std::time::Instant::now();
+        let mut jobs: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<WriteStep>)> =
+            std::mem::take(&mut self.jobs).into_values().collect();
+        for (shadow, steps) in &mut jobs {
+            if let Some((from, to)) = self.take_refresh(std::sync::Arc::as_ptr(shadow) as usize) {
+                WRITE_JOB_STATS[1].fetch_add(1, Ordering::Relaxed);
+                steps.push(WriteStep::Refresh(from, to));
+            }
+        }
+        WRITE_JOB_STATS[2].fetch_add(jobs.len() as u64, Ordering::Relaxed);
+        WRITE_JOB_STATS[3].fetch_add(1, Ordering::Relaxed);
+        let light = crate::watch::light();
+        fn job(shadow: &crate::shadow::Shadow, steps: &[WriteStep], light: bool) {
+            for step in steps {
+                match *step {
+                    WriteStep::Refresh(from, to) => {
+                        if !(light && shadow.nothing_new(from, to - from)) {
+                            Batch::update(shadow, from, to);
+                        }
+                    }
+                    WriteStep::Write(address, len) => shadow.writing(address, len),
+                }
+            }
+        }
+        let before = PREPARING[0].load(Ordering::Relaxed);
+        if wide_refresh() && jobs.len() >= 4 {
+            crate::shadow::wide_each(jobs.len(), move |i| job(&jobs[i].0, &jobs[i].1, light));
+        } else {
+            for (shadow, steps) in &jobs {
+                job(shadow, steps, light);
+            }
+        }
+        let took = started.elapsed();
+        let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
+        PREPARING[0].fetch_sub(summed.saturating_sub(took.as_micros() as u64), Ordering::Relaxed);
+        WRITE_JOB_STATS[5].fetch_add(took.as_micros() as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        {
+            SPLIT[6].fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+            SPLIT[9].fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// `ahead` changed: [`Batch::last_ahead`] may not hold any more.
+    fn forget_ahead(&mut self) {
+        self.last_ahead = (0, 0, 0);
     }
 
     /// Brings `[from, to)` of a copy up to date, timed.
@@ -8854,6 +9178,7 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.ahead.clear();
+        self.forget_ahead();
         self.textures.clear();
     }
 
@@ -8865,6 +9190,7 @@ impl Batch {
         if len > 0 {
             let end = dst.saturating_add(len);
             self.ahead.retain(|_, &mut (from, to)| to <= dst || from >= end);
+            self.forget_ahead();
             self.textures.clear();
         }
     }
@@ -8961,6 +9287,7 @@ impl Batch {
         for (shadow, from, to) in &spans {
             self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
         }
+        self.forget_ahead();
         #[cfg(feature = "diagnostics")]
         {
             FLUSHES[0].fetch_add(1, Ordering::Relaxed);
@@ -9031,7 +9358,7 @@ impl Batch {
                     }
                     Step::GpuWrite(shadow, ..) => Touch::Write(std::sync::Arc::as_ptr(shadow) as usize),
                     Step::Copy(..) if taken(list, i) => Touch::Nothing,
-                    Step::Copy(..) | Step::Run(_) | Step::Placed(_) => break 'steps,
+                    Step::Copy(..) | Step::RawCopy { .. } | Step::Placed(_) => break 'steps,
                     _ => Touch::Nothing,
                 });
             }
@@ -9043,6 +9370,7 @@ impl Batch {
         for (shadow, from, to) in &due {
             self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
         }
+        self.forget_ahead();
         #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
         let started = std::time::Instant::now();
@@ -9109,6 +9437,7 @@ impl Batch {
 
     fn flush(&mut self) {
         self.refresh_textures();
+        self.run_jobs();
         self.index.clear();
         if self.refreshes.is_empty() {
             return;
@@ -9190,6 +9519,30 @@ impl Batch {
             crate::watch::ask_ahead_done();
         }
     }
+}
+
+/// Performs a raw copy only when both spans are mapped. An exact private
+/// write can be noted without ending the standing write-watch query.
+fn copy_raw_title(dst: usize, src: usize, len: usize) {
+    let reading = if len <= crate::watch::RAW_COPY_WATCH_LIMIT {
+        crate::watch::title_memory_reading_now()
+    } else {
+        None
+    };
+    let note = reading
+        .as_ref()
+        .and_then(|reading| crate::watch::prepare_raw_copy_note(reading, dst, len));
+    let reading = reading.filter(|_| note.is_some());
+    if crate::texture::committed(src as *const u8, len) && crate::texture::committed(dst as *const u8, len) {
+        // SAFETY: the raw title copy accepts overlapping mapped spans.
+        unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
+        if let (Some(note), Some(reading)) = (note, reading)
+            && note.written(&reading)
+        {
+            return;
+        }
+    }
+    crate::watch::ask_once_end();
 }
 
 /// Copies title memory at submission. The ranges were checked against their
@@ -9769,10 +10122,12 @@ impl Meter {
             split_line(frames);
             {
                 let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
-                if passes + compares > 0.0 {
+                let wc_left = crate::shadow::WC_LEFT.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
+                if passes + compares + wc_left > 0.0 {
                     tracing::info!(
                         "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                         ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
+                         ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes; \
+                         {wc_left:.1} MB declared written in write-combined memory left on the card (VICTORY_WC_NO_BACK)",
                         if rehash_runs() { "on" } else { "off" }
                     );
                 }
@@ -9795,6 +10150,15 @@ impl Meter {
                          {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there), \
                          {filled:.1} first fillings from the pages there (VICTORY_TEXTURE_FILL=0: left empty), {short:.1} of them \
                          with less than was mapped (looked at again)"
+                    );
+                }
+                let [read, waited] =
+                    [0, 1].map(|i| crate::texture::EXACT_UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                if read + waited > 0.0 {
+                    tracing::info!(
+                        "exact texture refreshes (uploads before a bake) that found title memory being remapped, per frame: \
+                         {read:.1} read whole through the kernel without waiting, {waited:.1} waited (a page was not there) \
+                         (VICTORY_EXACT_NO_WAIT=0: all wait)"
                     );
                 }
             }

@@ -97,6 +97,9 @@ pub(crate) struct Shadow {
     /// Of a copy with two sides: only the dwords the title changed go up,
     /// as with [`send_changed`] ([`by_address`]).
     changes_only: std::sync::atomic::AtomicBool,
+    /// Whether its title memory is write-combined ([`Shadow::write_combined`]):
+    /// 0 not known yet, 1 no, 2 yes.
+    wc: AtomicU8,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
@@ -1683,9 +1686,25 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`].
+/// How many threads are kept for [`wide`] (`VICTORY_WIDE_THREADS=<n>`, 1 to
+/// 16; by default a quarter of the logical processors, 2 to 6).
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let asked = std::env::var("VICTORY_WIDE_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok());
+        let n = asked.map_or_else(
+            || {
+                std::thread::available_parallelism()
+                    .map_or(4, |n| n.get() / 4)
+                    .clamp(2, 6)
+            },
+            |n| n.clamp(1, 16),
+        );
+        tracing::info!(threads = n, "threads kept for work spread over threads (VICTORY_WIDE_THREADS)");
+        n
+    })
 }
 
 fn workers() -> &'static Workers {
@@ -2251,6 +2270,98 @@ fn land_echo() -> bool {
 /// Since the last frame-rate line: bytes found to be a landing's alone, and
 /// bytes a landing was noted in that were the title's too.
 pub(crate) static ECHO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Title memory the title asked for write-combined (the console's 0x400
+/// protection bit), as `[start, end)` ([`title_memory_write_combined`]).
+static WRITE_COMBINED: RwLock<Vec<(u64, u64)>> = RwLock::new(Vec::new());
+
+/// The title asked for `[at, at + len)` write-combined: its CPU writes the
+/// memory and does not read it.
+pub fn title_memory_write_combined(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let mut all = WRITE_COMBINED.write().unwrap_or_else(|e| e.into_inner());
+    all.push((at as u64, (at + len) as u64));
+}
+
+/// The title let go of `[at, at + len)` (`len` 0: of the allocation at `at`):
+/// write-combined regions in it are forgotten.
+pub(crate) fn write_combined_freed(at: usize, len: usize) {
+    let (at, end) = (at as u64, at.saturating_add(len) as u64);
+    let mut all = WRITE_COMBINED.write().unwrap_or_else(|e| e.into_inner());
+    all.retain(|&(from, to)| {
+        if len == 0 {
+            from != at
+        } else {
+            to <= at || from >= end
+        }
+    });
+}
+
+/// Whether all of `[start, start + len)` lies in write-combined title memory.
+fn is_write_combined(start: u64, len: u64) -> bool {
+    let all = WRITE_COMBINED.read().unwrap_or_else(|e| e.into_inner());
+    all.iter()
+        .any(|&(from, to)| from <= start && start + len <= to)
+}
+
+/// Whether shader writes into card-memory copies of write-combined title
+/// memory stay on the card without compare/readback (`VICTORY_WC_NO_BACK=1`;
+/// opt-in).
+fn wc_no_back() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WC_NO_BACK").is_some_and(|v| v == "1"))
+}
+
+/// Minimum copy size in bytes eligible for [`wc_no_back`]
+/// (`VICTORY_WC_NO_BACK_MIN_KB`, 0 unset: all). Leaving small readbacks
+/// (exposure/stats) enabled avoids dark cutscenes while skipping huge buffers.
+fn wc_no_back_min() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("VICTORY_WC_NO_BACK_MIN_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+            * 1024
+    })
+}
+
+/// Bytes shaders were declared to write in write-combined copies and left on
+/// the card ([`wc_no_back`]), since the last frame-rate line.
+pub(crate) static WC_LEFT: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a title buffer in write-combined memory gets one ReBAR CPU-mapped
+/// VRAM buffer (`D3D12_HEAP_TYPE_GPU_UPLOAD`, `VICTORY_WC_BAR=1`; opt-in).
+fn wc_bar() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WC_BAR").is_some_and(|v| v == "1"))
+}
+
+/// A CPU-mapped VRAM buffer of `size` bytes for [`wc_bar`], counted with card
+/// sides ([`card_limits`]) and guarded at 80% DXGI local VRAM budget.
+fn wc_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    let (_, most) = card_limits();
+    if size >= 1 << 30 {
+        return None;
+    }
+    let host = host()?;
+    if let Some([budget, used, ..]) = host.video_memory()
+        && used + size > budget / 10 * 8
+    {
+        return None;
+    }
+    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
+        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        return None;
+    }
+    let made = host.mapped_card_buffer(size, true);
+    if made.is_none() {
+        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+    }
+    made
+}
 
 /// Whether a refresh of a copy in the card's memory takes, and sends up,
 /// the dwords that title memory changed and no others
@@ -2823,8 +2934,11 @@ impl Drop for Shadow {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
         let window = self.window;
-        if self.mapped {
+        if self.mapped && window {
             WINDOW_MAPPED_BYTES.fetch_sub(self.len, Ordering::Relaxed);
+        } else if self.mapped {
+            // A write-combined buffer's (`wc_bar`), counted with card sides.
+            CARD_BYTES[0].fetch_sub(self.width(), Ordering::Relaxed);
         }
         if let Some(card) = &mut self.card {
             if window {
@@ -3139,28 +3253,42 @@ fn window_budget() -> Option<u64> {
     })
 }
 
-/// Oldest eligible copies to remove until their unique bytes fit `keep`.
-/// Entries are `(last-used moment, bytes, unique copy identity)`, already
-/// sorted oldest first; one copy standing under several keys counts once.
-fn window_victims(entries: &[(u64, u64, usize)], keep: u64) -> Vec<usize> {
-    let mut left = 0u64;
+/// The bytes of title memory a loose copy holds a copy of: none for one in
+/// place (`crate::inplace`), which is the title's own memory.
+fn copy_bytes(shadow: &Shadow) -> u64 {
+    if shadow.in_place() { 0 } else { shadow.len }
+}
+
+/// The unique bytes of every loose copy, eligible to go or not
+/// ([`copy_bytes`]); one copy standing under several keys counts once.
+fn loose_bytes<'a>(copies: impl Iterator<Item = &'a Arc<Shadow>>) -> u64 {
     let mut seen = std::collections::HashSet::new();
-    for &(_, bytes, id) in entries {
-        if seen.insert(id) {
-            left = left.saturating_add(bytes);
+    copies
+        .filter(|s| seen.insert(Arc::as_ptr(s) as usize))
+        .map(|s| copy_bytes(s))
+        .sum()
+}
+
+/// Eligible copies that go, by index. Entries are `(bytes, unique copy id, due)`
+/// sorted oldest first. `due` copies always go; others go oldest first while
+/// `total` (unique bytes of all loose copies, held or idle, #450) exceeds `keep`.
+fn window_victims(entries: &[(u64, usize, bool)], total: u64, keep: u64) -> Vec<usize> {
+    let mut left = total;
+    let mut gone = std::collections::HashSet::new();
+    for &(bytes, id, due) in entries {
+        if due && gone.insert(id) {
+            left = left.saturating_sub(bytes);
         }
     }
-    let mut out = Vec::new();
-    for (i, &(_, bytes, id)) in entries.iter().enumerate() {
+    for &(bytes, id, _) in entries {
         if left <= keep {
             break;
         }
-        if seen.remove(&id) {
+        if bytes > 0 && gone.insert(id) {
             left = left.saturating_sub(bytes);
-            out.push(i);
         }
     }
-    out
+    (0..entries.len()).filter(|&i| gone.contains(&entries[i].1)).collect()
 }
 
 /// Kept between sweeps so one sample near a watermark does not toggle the
@@ -3185,7 +3313,8 @@ static WINDOW_BAND: std::sync::Mutex<crate::host::RamBand> =
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
     let budget = window_budget();
-    let mut idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let due_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let mut idle_ms = due_ms;
     let mut keep = u64::MAX;
     if let Some(bytes) = budget
         && let Some((working, private, free, commit, total, limit)) = crate::host::ram_sample()
@@ -3211,7 +3340,7 @@ pub(crate) fn let_go_idle() {
         if map.is_empty() {
             return;
         }
-        let mut eligible: Vec<(u64, (u64, u64), usize, u64)> = map
+        let mut eligible: Vec<(u64, (u64, u64), usize, u64, bool)> = map
             .iter()
             .filter(|(_, s)| {
                 Arc::strong_count(s) == 1
@@ -3219,18 +3348,20 @@ pub(crate) fn let_go_idle() {
                     && crate::host::references(&s.buffer) == 1
             })
             .map(|(&key, s)| {
-                (s.used.load(Ordering::Relaxed), key, Arc::as_ptr(s) as usize, s.len)
+                let used = s.used.load(Ordering::Relaxed);
+                let due = crate::host::long_ago(used, due_ms, IDLE_FRAMES);
+                (used, key, Arc::as_ptr(s) as usize, copy_bytes(s), due)
             })
             .collect();
-        eligible.sort_unstable_by_key(|&(used, _, _, _)| used);
+        eligible.sort_unstable_by_key(|&(used, ..)| used);
         let victims = if keep == u64::MAX {
             (0..eligible.len()).collect()
         } else {
-            let entries: Vec<(u64, u64, usize)> = eligible
+            let entries: Vec<(u64, usize, bool)> = eligible
                 .iter()
-                .map(|&(used, _, id, len)| (used, len, id))
+                .map(|&(_, _, id, bytes, due)| (bytes, id, due))
                 .collect();
-            window_victims(&entries, keep)
+            window_victims(&entries, loose_bytes(map.values()), keep)
         };
         victims.into_iter().filter_map(|i| map.remove(&eligible[i].1)).collect()
     };
@@ -3398,6 +3529,7 @@ impl Shadow {
             card: None,
             window: false,
             changes_only: Default::default(),
+            wc: AtomicU8::new(0),
             mapped: false,
             place: None,
         }
@@ -3428,9 +3560,39 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        // Write-combined title memory (`VICTORY_WC_NO_BACK`, and always for
+        // `VICTORY_WC_BAR` copies): shader writes stay on the card.
+        if (self.card.is_some() && wc_no_back() && self.len >= wc_no_back_min() || self.mapped && !self.window)
+            && self.write_combined()
+        {
+            self.written.store(true, Ordering::Relaxed);
+            WC_LEFT.fetch_add(len.min(self.left(address)), Ordering::Relaxed);
+            return;
+        }
         self.written.store(true, Ordering::Relaxed);
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
+    }
+
+    /// Whether all of the copy's title memory was asked for write-combined
+    /// ([`title_memory_write_combined`]); found once.
+    fn write_combined(&self) -> bool {
+        match self.wc.load(Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let wc = is_write_combined(self.start, self.len);
+                self.wc.store(if wc { 2 } else { 1 }, Ordering::Relaxed);
+                if wc {
+                    tracing::info!(
+                        start = format_args!("{:#x}", self.start),
+                        len = format_args!("{:#x}", self.len),
+                        "write-combined title memory: what shaders write in its copy is not copied back (VICTORY_WC_NO_BACK)"
+                    );
+                }
+                wc
+            }
+        }
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
@@ -5510,6 +5672,28 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
+        // Write-combined memory with `VICTORY_WC_BAR`: one ReBAR buffer in card
+        // memory that the CPU maps, no CPU side, nothing sent, shader writes stay.
+        if wc_bar()
+            && is_write_combined(key.0, len)
+            && let Some((buffer, data)) = wc_mapped_for(size)
+        {
+            crate::host::name(&buffer, || {
+                format!("title buffer {:#x}+{len:#x} mapped on the card", key.0)
+            });
+            tracing::info!(
+                start = format_args!("{:#x}", key.0),
+                len,
+                "a write-combined buffer's host copy is in card memory the CPU maps"
+            );
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
+            shadow.mapped = true;
+            *shadow.wc.get_mut() = 2;
+            entry.shadow = Some(Arc::new(shadow));
+            return entry.shadow.clone();
+        }
         let host = host()?;
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the CPU side lives in plain OS RAM when `send::own()` is active.
@@ -5978,6 +6162,29 @@ pub(crate) fn exact_line(frames: f64) {
 }
 
 #[cfg(test)]
+mod write_combined_tests {
+    use super::{is_write_combined, title_memory_write_combined, write_combined_freed};
+
+    /// A copy counts as write-combined only inside one such region, and not
+    /// after the region is let go (part of it or the whole allocation).
+    #[test]
+    fn write_combined_regions() {
+        let base = 0x7f00_0000_0000usize;
+        title_memory_write_combined(base, 0x100_0000);
+        assert!(is_write_combined(base as u64, 0x1000));
+        assert!(is_write_combined(base as u64 + 0xff_f000, 0x1000));
+        assert!(!is_write_combined(base as u64 + 0xff_f000, 0x2000), "past its end");
+        assert!(!is_write_combined(base as u64 - 0x1000, 0x2000), "before its start");
+        write_combined_freed(base + 0x10_0000, 0x1000);
+        assert!(!is_write_combined(base as u64, 0x1000), "part of it decommitted");
+        let other = base + 0x1000_0000;
+        title_memory_write_combined(other, 0x10_0000);
+        write_combined_freed(other, 0);
+        assert!(!is_write_combined(other as u64, 0x1000), "the allocation released");
+    }
+}
+
+#[cfg(test)]
 mod window_tests {
     use super::{
         WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
@@ -5987,21 +6194,42 @@ mod window_tests {
     #[test]
     fn window_budget_evicts_oldest_only_until_it_fits() {
         const M: u64 = 1 << 20;
-        // Oldest first: 10, 20 and 30 MiB. Keeping 50 MiB must free only the
-        // oldest copy (60 MiB left before, 50 MiB after).
-        let entries = [(1u64, 10 * M, 1usize), (2, 20 * M, 2), (3, 30 * M, 3)];
-        assert_eq!(window_victims(&entries, 50 * M), vec![0]);
-        // A tighter cap takes the newest as well.
-        assert_eq!(window_victims(&entries, 20 * M), vec![0, 1, 2]);
+        let entries = [(10 * M, 1usize, false), (20 * M, 2, false), (30 * M, 3, false)];
+        assert_eq!(window_victims(&entries, 60 * M, 50 * M), vec![0]);
+        assert_eq!(window_victims(&entries, 60 * M, 20 * M), vec![0, 1, 2]);
     }
 
     #[test]
     fn window_budget_counts_one_copy_under_several_keys_once() {
         const M: u64 = 1 << 20;
-        // The first two entries are one copy; 50 MiB is live, not 80.
-        // Without dedupe both would be picked to reach a 40 MiB cap.
-        let entries = [(1u64, 30 * M, 7usize), (2, 30 * M, 7), (3, 20 * M, 8)];
-        assert_eq!(window_victims(&entries, 40 * M), vec![0]);
+        let entries = [(30 * M, 7usize, false), (30 * M, 7, false), (20 * M, 8, false)];
+        assert_eq!(window_victims(&entries, 50 * M, 40 * M), vec![0, 1]);
+    }
+
+    #[test]
+    fn window_budget_counts_the_copies_that_cannot_go() {
+        const M: u64 = 1 << 20;
+        let held = 3_072 * M;
+        let idle = [(512 * M, 1usize, false), (512 * M, 2, false), (512 * M, 3, false)];
+        let total = held + idle.iter().map(|e| e.0).sum::<u64>();
+        assert_eq!(window_victims(&idle, total, 2_048 * M), vec![0, 1, 2]);
+        assert_eq!(window_victims(&idle, total, 4_096 * M), vec![0]);
+        assert!(window_victims(&idle, total, 8_192 * M).is_empty());
+    }
+
+    #[test]
+    fn window_budget_never_keeps_what_the_sweep_lets_go_without_one() {
+        const M: u64 = 1 << 20;
+        let entries = [(100 * M, 1usize, true), (100 * M, 2, false), (100 * M, 3, true)];
+        assert_eq!(window_victims(&entries, 300 * M, 2_048 * M), vec![0, 2]);
+        assert_eq!(window_victims(&entries, 300 * M, 50 * M), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn window_budget_passes_over_copies_in_place() {
+        const M: u64 = 1 << 20;
+        let entries = [(0, 1usize, false), (64 * M, 2, false), (0, 3, true)];
+        assert_eq!(window_victims(&entries, 64 * M, 0), vec![1, 2]);
     }
 
     #[test]
