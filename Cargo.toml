@@ -43,6 +43,9 @@ walkdir = "2.5.1"
 tempfile = "3.27.0"
 # Opus decoding for the console's audio decoder (BSD-3-Clause, pure Rust).
 opus-pure = "0.2.4"
+# Per-thread cached allocator so Rust allocations avoid contending on the
+# Windows process heap shared with the title and NVIDIA driver (MIT license).
+mimalloc = { version = "0.1", default-features = false }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

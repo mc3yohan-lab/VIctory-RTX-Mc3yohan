@@ -30,6 +30,14 @@ mod compose;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+
+/// Release builds with the `mimalloc` feature: the Rust side allocates
+/// through mimalloc (per-thread caches) instead of the process heap, which
+/// it shares with the title and the drivers. Diagnostics builds count every
+/// block through `copystat`'s allocator, which then uses mimalloc too.
+#[cfg(all(feature = "mimalloc", not(all(windows, feature = "diagnostics"))))]
+#[global_allocator]
+static MIMALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod faultbook;
 #[cfg(windows)]

@@ -410,6 +410,7 @@ fn apply_nvidia_preset(run_console: Option<Console>) {
         ("VICTORY_WINDOWS_BAR_MB", "4096"),
         ("VICTORY_WINDOW_KB", "4096"),
         ("VICTORY_SMALL_RECHECK", "0"),
+        ("VICTORY_ASYNC_SUBMIT", "1"),
         ("VICTORY_THIN", "1"),
         ("VICTORY_THIN_THREADS", "8"),
         ("VICTORY_JOIN_PARTS", "8"),
@@ -419,7 +420,7 @@ fn apply_nvidia_preset(run_console: Option<Console>) {
     if !rt_on {
         set_default("VICTORY_AMBIENT", "1.0");
         set_default("VICTORY_AMBIENT_AIR", "1.5");
-        set_default("VICTORY_AMBIENT_MOST", "3.0");
+        set_default("VICTORY_AMBIENT_MOST", "2.0");
         set_default("VICTORY_AMBIENT_SHADE", "0.7,0.5");
         set_default("VICTORY_AMBIENT_REFL", "2.0");
     }

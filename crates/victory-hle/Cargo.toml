@@ -47,6 +47,7 @@ tempfile.workspace = true
 
 [features]
 # Debugging switches (scripted keys and the like).
+mimalloc = ["victory-gpu/mimalloc"]
 diagnostics = [
     "victory-gpu/diagnostics",
     "victory-loader/diagnostics",

@@ -16,8 +16,9 @@
 #   O(dirty), Tier-A pure-BVH auto-skip, Role::RayMiss eye fix, coalesced VirtualProtect.
 #
 # Usage:
-#   scripts\play-nvidia.ps1                        # Series X 1080p output + Ports 1,2,5,6,7 + ReBAR + 60 FPS unlock (fastest)
-#   scripts\play-nvidia.ps1 -Scale 1.0             # Series X native 1920x1080 internal + 1080p output
+#   scripts\play-nvidia.ps1                        # Series X 1080p output (720p internal -> 1080p native upscaler, NO FSR, fastest)
+#   scripts\play-nvidia.ps1 -Scale 1.0             # Series X native 1920x1080 internal -> 1080p output (sharpest 1080p, NO FSR)
+#   scripts\play-nvidia.ps1 -Full720p -Scale 1.0   # Series X native 1280x720 internal -> 720p output (lightest VRAM/GPU load)
 #   scripts\play-nvidia.ps1 -Full1440p             # Series X 2560x1440 output (1706x960 internal -> 1440p upscaled)
 #   scripts\play-nvidia.ps1 -Full4K                # Series X 3840x2160 output (2560x1440 internal, console default)
 #   scripts\play-nvidia.ps1 -SmoothMotion          # Launches victory_sm.exe for NVIDIA App Smooth Motion (2x visual FPS)
@@ -27,6 +28,7 @@
 #   scripts\play-nvidia.ps1 -RayTracing            # Test real Wave32 NVIDIA Ray Tracing + exact cascade shadows
 #   scripts\play-nvidia.ps1 -SeriesS               # Series S 1080p + 4K sharp HUD @ 720p internal (0.667)
 #   scripts\play-nvidia.ps1 -WaitTextures          # Sets VICTORY_TEXTURE_NO_WAIT=0 (slower streaming, avoids partial BCn blocks)
+#   scripts\play-nvidia.ps1 -Thin / -NoThin        # Override deferred thin lists (auto: ON on RTX 30/40, OFF on RTX 50 Blackwell)
 #   scripts\play-nvidia.ps1 -NoPortCbv             # Disable Renderer Port 5 (uses non-CBV shader cache key)
 #   scripts\play-nvidia.ps1 -NoPortDescriptors     # Disable Renderer Port 2 (full view-heap scan fallback)
 #   scripts\play-nvidia.ps1 -NoPortGuard           # Disable Renderer Port 6 (shared guard lock + parallel planning)
@@ -42,6 +44,7 @@ param(
     [switch]$SeriesX,
     [double]$Scale = 0.0,
     [double]$Fps = 60.0,
+    [switch]$Full720p,
     [switch]$Full1440p,
     [switch]$Full4K,
     [switch]$FidelityFx,
@@ -51,6 +54,7 @@ param(
     [switch]$SkipRtAggressive,
     [switch]$LaneCore,
     [switch]$Thin,
+    [switch]$NoThin,
     [switch]$NoAmbient,
     [switch]$NoPortConstants,
     [switch]$PortDescriptors,
@@ -121,7 +125,7 @@ if ($gpuTotalMb -gt 0 -and $gpuTotalMb -lt 10000) {
     if ($WindowsBarMb -lt 0)     { $WindowsBarMb = 1536 }
     if ($MipDrop -lt 0)          { $MipDrop = 2 }
     if ($CardBuffersMinKb -lt 0) { $CardBuffersMinKb = 1024 }
-    if (-not $SeriesX -and -not $Full1440p -and -not $Full4K -and -not $Fsr4K) {
+    if (-not $SeriesX -and -not $Full720p -and -not $Full1440p -and -not $Full4K -and -not $Fsr4K) {
         $SeriesS = $true
     }
 } elseif ($gpuTotalMb -ge 10000 -and $gpuTotalMb -lt 14000) {
@@ -297,16 +301,23 @@ if ($Fps -gt 0.0) {
 }
 
 if ($Safe) {
-    $settings.VICTORY_UNDER_WIDE = '0'
-    $settings.VICTORY_LAND_ECHO  = '0'
-    $settings.VICTORY_CARD_STEPS = '0'
-    $settings.VICTORY_THIN       = '0'
+    $settings.VICTORY_UNDER_WIDE   = '0'
+    $settings.VICTORY_LAND_ECHO    = '0'
+    $settings.VICTORY_CARD_STEPS   = '0'
+    $settings.VICTORY_ASYNC_SUBMIT = '0'
+    $settings.VICTORY_THIN         = '0'
     $settings.Remove('VICTORY_UPLOAD_AHEAD')
 } else {
-    # Direct list recording by default on NVIDIA: deferred thin lists (`VICTORY_THIN=1`)
-    # can wash out / blur the 3D scene on RTX 5060 Ti / 5070 Ti (megafork 79f36b3b,
-    # avatarmanz #112/#62). Pass -Thin to opt in for benchmarking.
-    if ($Thin) {
+    # Always keep the dedicated async submission thread (`VICTORY_ASYNC_SUBMIT=1`) active so
+    # title render threads never block on preparing and Port 7 early heap-sync marks always fire
+    # (even when deferred thin lists are disabled).
+    $settings.VICTORY_ASYNC_SUBMIT = '1'
+    # GPU-aware thin lists: deferred thin lists (`VICTORY_THIN=1`, 8 threads) save 15-20 ms/frame
+    # on RTX 30/40-series, whereas RTX 50-series (Blackwell, e.g. 5060 Ti / 5070 Ti) can suffer
+    # whiteout/blur under thin lists (megafork 79f36b3b, avatarmanz #112/#62).
+    $isBlackwell = ($gpuName -match 'RTX\s*50\d\d')
+    $useThin = if ($Thin) { $true } elseif ($NoThin) { $false } else { -not $isBlackwell }
+    if ($useThin) {
         $settings.VICTORY_THIN         = '1'
         $settings.VICTORY_THIN_THREADS = '8'
     } else {
@@ -327,7 +338,8 @@ if ($Quality) {
 if (-not $NoAmbient -and -not $RayTracing) {
     $settings.VICTORY_AMBIENT       = '1.0'
     $settings.VICTORY_AMBIENT_AIR   = '1.5'
-    $settings.VICTORY_AMBIENT_MOST  = '3.0'
+    # Cap at 2.0 (matches ambient.rs / megafork) to prevent overbright glare near indoor windows.
+    $settings.VICTORY_AMBIENT_MOST  = '2.0'
     $settings.VICTORY_AMBIENT_SHADE = '0.7,0.5'
     $settings.VICTORY_AMBIENT_REFL  = '2.0'
 }
@@ -368,10 +380,12 @@ if ($Fsr4K) {
     # Series S at scale 1.0 hits a title breakpoint on start (trustno1-coder 033be27f); default to 720p internal (0.667).
     if ($Scale -le 0.0) { $Scale = 0.667 }
 } else {
-    # Force the title's own temporal upscaler (6) by default so FidelityFX does not write unpatched
-    # descriptors under VICTORY_PORT_DESCRIPTORS=1.
+    # Force the title's own temporal upscaler (6) by default (pure NVIDIA path, no AMD FSR DLL
+    # loaded unless -Fsr4K or -FidelityFx is requested).
     $settings.VICTORY_UPSCALER = $(if ($FidelityFx) { '7' } else { '6' })
-    if ($Full1440p) {
+    if ($Full720p) {
+        $settings.VICTORY_OUTPUT = '1280x720'
+    } elseif ($Full1440p) {
         $settings.VICTORY_OUTPUT = '2560x1440'
     } elseif (-not $Full4K) {
         # Upstream native output scaling: 1920x1080 output on Series X (~16 ms less GPU work vs 4K).
@@ -447,9 +461,10 @@ foreach ($k in $settings.Keys) {
 
 $Exe = (Resolve-Path -LiteralPath $Exe).Path
 $consoleArg = if ($SeriesS) { 'series-s' } else { 'series-x' }
-$mode = if ($Fsr4K) { "Series X 4K PC FSR ($Fsr4K)" } elseif ($SeriesS) { 'Series S 1080p+4K HUD' } elseif ($Full4K) { 'Series X 3840x2160' } elseif ($Full1440p) { 'Series X 2560x1440' } else { 'Series X 1920x1080' }
+$mode = if ($Fsr4K) { "Series X 4K PC FSR ($Fsr4K)" } elseif ($SeriesS) { 'Series S 1080p+4K HUD' } elseif ($Full720p) { 'Series X 1280x720' } elseif ($Full4K) { 'Series X 3840x2160' } elseif ($Full1440p) { 'Series X 2560x1440' } else { 'Series X 1920x1080' }
 if ($Scale -gt 0.0) { $mode += " @ scale $($settings.VICTORY_RENDER_SCALE)" }
 if ($Fps -gt 0.0) { $mode += ", cap ${Fps} FPS" }
+if ($settings.VICTORY_THIN -eq '1') { $mode += ", thin=1" } else { $mode += ", thin=0" }
 if ($Kbm) { $mode += ", KBM-GTA" }
 Write-Host "Starting VIctory-RTX-Mc3yohan ($Build, $mode) on $gpuName [$vramTier] with $($settings.Count) switches..."
 
