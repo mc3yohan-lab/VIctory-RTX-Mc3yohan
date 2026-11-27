@@ -3,7 +3,7 @@
 //! every changed heap page goes (`VICTORY_PORT_DESCRIPTORS=1`, off by
 //! default; read in [`on`]).
 //!
-//! What the title does (game_scarlett_master.exe; `victory-loader`'s
+//! What the title does (the title executable; `victory-loader`'s
 //! `descriptor_sites` has the code): its placed shader-visible view heap is
 //! the memory of its frame allocator (image +0x4d9f400), which hands out the
 //! draws' and dispatches' descriptor tables and much else (constants, list

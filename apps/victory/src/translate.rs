@@ -667,9 +667,7 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                     *counter(t, p.stage, 0) += 1;
                     let first = emit::emit_with_retries(container, &p, &program, &s, &i, &r);
                     let emitted = match first {
-                        Err(ShaderError::Unsupported { what, .. })
-                            if what == "a constant lane mask" =>
-                        {
+                        Err(ShaderError::Unsupported { what: "a constant lane mask", .. }) => {
                             structure::without_live_quads(|| structure::structure(&program))
                                 .and_then(|s| {
                                     emit::emit_with_retries(container, &p, &program, &s, &i, &r)

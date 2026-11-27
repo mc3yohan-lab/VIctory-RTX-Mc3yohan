@@ -72,6 +72,8 @@ param(
     [switch]$UpQueue,
     [switch]$SweepPerHeap,
     [switch]$XmaRefill,
+    [switch]$WideCopy,
+    [switch]$DspConvolution,
     [switch]$SendBar,
     [switch]$NoSendBar,
     [switch]$OrderAlone,
@@ -368,8 +370,14 @@ if ($SweepPerHeap) {
 if ($XmaRefill) {
     $settings.VICTORY_XMA_REFILL = '1'
 }
+if ($WideCopy) {
+    $settings.VICTORY_WIDE_COPY = '1'
+}
+if ($DspConvolution) {
+    $settings.VICTORY_DSP_CONVOLUTION = '1'
+}
 if ($Kbm) {
-    # Opt-in GTA V PC-style keyboard + mouse mapping (ported from Belobug #295).
+    # Opt-in PC-style keyboard + mouse mapping (ported from Belobug #295).
     # F2 or ` (~) toggles mouse-look and auto-hides the cursor; Esc/P unlocks.
     $settings.VICTORY_KBM_GTA = '1'
     if ($MouseSens -gt 0.0 -and $MouseSens -ne 1.0) {
@@ -531,13 +539,11 @@ if (-not $Exe) {
         }
     }
     if ($gameDir -and (Test-Path -LiteralPath $gameDir)) {
-        $preferred = Join-Path $gameDir 'game_scarlett_master.exe'
-        if (Test-Path -LiteralPath $preferred) {
-            $Exe = $preferred
-        } else {
-            $firstExe = Get-ChildItem -LiteralPath $gameDir -Filter '*.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($firstExe) { $Exe = $firstExe.FullName }
-        }
+        $bestExe = Get-ChildItem -LiteralPath $gameDir -Filter '*.exe' -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notmatch '^(victory|VIctory-RTX)' } |
+            Sort-Object Length -Descending |
+            Select-Object -First 1
+        if ($bestExe) { $Exe = $bestExe.FullName }
     }
 }
 if (-not $Exe -or -not (Test-Path -LiteralPath $Exe)) {
@@ -566,7 +572,7 @@ $mode = if ($Fsr4K) { "Series X 4K PC FSR ($Fsr4K)" } elseif ($SeriesS) { 'Serie
 if ($Scale -gt 0.0) { $mode += " @ scale $($settings.VICTORY_RENDER_SCALE)" }
 if ($Fps -gt 0.0) { $mode += ", cap ${Fps} FPS" }
 if ($settings.VICTORY_THIN -eq '1') { $mode += ", thin=1" } else { $mode += ", thin=0" }
-if ($Kbm) { $mode += ", KBM-GTA" }
+if ($Kbm) { $mode += ", KBM" }
 Write-Host "Starting VIctory-RTX-Mc3yohan ($Build, $mode) on $gpuName [$vramTier] with $($settings.Count) switches..."
 
 $runArgs = @('run', $Exe, '--console', $consoleArg, '--execute')

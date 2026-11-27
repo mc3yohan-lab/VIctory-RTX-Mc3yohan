@@ -325,7 +325,7 @@ impl Drop for Recording {
                 super::close(inner.back as This);
             }
             let mut backs = held(&BACKS);
-            // GTA VI translates ~200 thin lists per frame; cap at 512 (matching
+            // The title translates ~200 thin lists per frame; cap at 512 (matching
             // `list::IDLE_MOST.0`) so steady-state frames never destroy and
             // recreate `HostList` allocators/buffers every frame.
             if backs.len() < 512 {

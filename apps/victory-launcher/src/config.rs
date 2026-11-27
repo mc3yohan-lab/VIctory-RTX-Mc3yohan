@@ -178,9 +178,13 @@ impl TextureQuality {
     }
 }
 
+const CURRENT_CONFIG_VERSION: u32 = 2;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LauncherConfig {
+    #[serde(default)]
+    pub config_version: u32,
     pub wizard_completed: bool,
     pub game_dir: String,
     pub preset: Preset,
@@ -223,6 +227,7 @@ pub struct LauncherConfig {
 impl Default for LauncherConfig {
     fn default() -> Self {
         Self {
+            config_version: CURRENT_CONFIG_VERSION,
             wizard_completed: false,
             game_dir: String::new(),
             preset: Preset::Auto,
@@ -261,8 +266,25 @@ impl Default for LauncherConfig {
 }
 
 impl LauncherConfig {
+    fn migrate(&mut self) -> bool {
+        if self.config_version >= CURRENT_CONFIG_VERSION {
+            return false;
+        }
+        if (self.ambient_most - 2.0).abs() < 0.01 && (self.ambient_reflect - 0.6).abs() < 0.01 {
+            self.ambient_most = 4.0;
+            self.ambient_reflect = 1.2;
+        }
+        self.config_version = CURRENT_CONFIG_VERSION;
+        true
+    }
+
     pub fn apply_preset(&mut self, preset: Preset) {
         self.preset = preset;
+        if !matches!(preset, Preset::Safe | Preset::Custom) {
+            self.ambient_light = true;
+            self.ambient_most = 4.0;
+            self.ambient_reflect = 1.2;
+        }
         match preset {
             Preset::Auto => {
                 self.console = ConsoleModel::Auto;
@@ -278,9 +300,6 @@ impl LauncherConfig {
                 self.ram_low_profile = TriState::Auto;
                 self.live_textures = true;
                 self.video_planes = true;
-                self.ambient_light = true;
-                self.ambient_most = 4.0;
-                self.ambient_reflect = 1.2;
                 self.send_bar = true;
             }
             Preset::Fluid720p => {
@@ -428,6 +447,8 @@ impl LauncherConfig {
             Some(self.render_scale.clamp(0.45, max_scale))
         } else if is_series_s {
             Some(0.667)
+        } else if self.preset == Preset::Fluid720p && self.render_scale <= 0.05 {
+            Some(1.0)
         } else {
             None
         }
@@ -718,12 +739,16 @@ pub fn load_config(repo_root: Option<&Path>) -> LauncherConfig {
         .ok()
         .and_then(|raw| serde_json::from_str::<LauncherConfig>(&raw).ok())
         .unwrap_or_default();
+    let mut changed = cfg.migrate();
 
     // Si la carpeta guardada está vacía o ya no existe, buscar automáticamente.
     let valid_saved = !cfg.game_dir.is_empty()
         && GameFilesStatus::inspect(Path::new(&cfg.game_dir)).ready();
     if !valid_saved && let Some(found) = auto_find_game_dir(repo_root) {
         cfg.game_dir = found.to_string_lossy().into_owned();
+        changed = true;
+    }
+    if changed {
         let _ = save_config(&cfg, repo_root);
     }
     cfg
@@ -1017,11 +1042,46 @@ mod tests {
     }
 
     #[test]
-    fn scale_clamps_safely_on_series_s_and_4k() {
+    fn legacy_json_migrates_only_the_old_ambient_defaults() {
+        let mut cfg: LauncherConfig =
+            serde_json::from_str(r#"{"ambient_most":2.0,"ambient_reflect":0.6}"#).unwrap();
+        assert_eq!(cfg.config_version, 0);
+        assert!(cfg.migrate());
+        assert_eq!(cfg.config_version, 2);
+        assert_eq!((cfg.ambient_most, cfg.ambient_reflect), (4.0, 1.2));
+        assert!(!cfg.migrate());
+
+        let mut custom: LauncherConfig =
+            serde_json::from_str(r#"{"ambient_most":2.0,"ambient_reflect":0.8}"#).unwrap();
+        assert!(custom.migrate());
+        assert_eq!((custom.ambient_most, custom.ambient_reflect), (2.0, 0.8));
+    }
+
+    #[test]
+    fn fluid_720p_is_native_on_series_x_with_24gb() {
         let hw = mock_hw("NVIDIA GeForce RTX 4090", 24564, 64.0);
         let mut cfg = LauncherConfig::default();
-        cfg.output = OutputRes::P4K;
-        cfg.render_scale = 1.0;
+        cfg.apply_preset(Preset::Fluid720p);
+        assert_eq!(cfg.effective_console(&hw), "series-x");
+        assert_eq!(cfg.effective_output(&hw), OutputRes::P720);
+        assert_eq!(cfg.effective_scale(&hw), Some(1.0));
+        assert_eq!(
+            cfg.build_run_env(&hw).get("VICTORY_RENDER_SCALE").map(String::as_str),
+            Some("1.000")
+        );
+
+        let low_vram = mock_hw("NVIDIA GeForce RTX 4060", 8192, 24.0);
+        assert_eq!(cfg.effective_scale(&low_vram), Some(0.667));
+    }
+
+    #[test]
+    fn scale_clamps_safely_on_series_s_and_4k() {
+        let hw = mock_hw("NVIDIA GeForce RTX 4090", 24564, 64.0);
+        let mut cfg = LauncherConfig {
+            output: OutputRes::P4K,
+            render_scale: 1.0,
+            ..LauncherConfig::default()
+        };
         assert_eq!(cfg.effective_scale(&hw), Some(0.667));
         cfg.output = OutputRes::P1080;
         assert_eq!(cfg.effective_scale(&hw), Some(1.0));

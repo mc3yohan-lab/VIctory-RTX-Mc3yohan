@@ -1,6 +1,6 @@
 //! Two presented planes as one image: the console's display puts the second
 //! (the interface) over the first (the scene), each scaled to the screen.
-//! Grand Theft Auto VI presents so on Series S.
+//! The title presents this way on Series S.
 //!
 //! From the codec-d/cool_fox fork (641835a4, 581b0cb9). Only with
 //! `VICTORY_PLANES=1` ([`on`]); else the first plane is shown alone, as before.

@@ -314,18 +314,10 @@ impl ControllerStatus {
     }
 }
 
+#[derive(Default)]
 pub struct ControllerPoller {
     last_check: Option<Instant>,
     cached: ControllerStatus,
-}
-
-impl Default for ControllerPoller {
-    fn default() -> Self {
-        Self {
-            last_check: None,
-            cached: ControllerStatus::default(),
-        }
-    }
 }
 
 impl ControllerPoller {

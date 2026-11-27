@@ -80,7 +80,7 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (b'H', RIGHT_STICK),
 ];
 
-/// Opt-in GTA V PC-style keyboard bindings for the stand-in gamepad
+/// Opt-in PC-style keyboard and mouse bindings for the stand-in gamepad
 /// (`VICTORY_KBM_GTA=1`, ported from Belobug/VIctory-Belobug-AMD #295).
 /// Left stick stays W/A/S/D; right stick is driven by mouse look (toggled with
 /// F2 or `` ` `` / `~`) plus I/J/K/L fallback; triggers come from LMB (RT)
@@ -114,13 +114,13 @@ const GTA_BUTTONS: [(u8, u32); 26] = [
     (b'G', LEFT),           // G: Throw / Context left (D-pad Left)
 ];
 
-/// Whether GTA mouse-look lock (`~` / `F2`) is currently active; read by
+/// Whether PC mouse-look lock (`~` / `F2`) is currently active; read by
 /// `lifecycle` on `WM_SETCURSOR` to auto-hide the Windows cursor inside the
 /// game window's client area while locked.
 #[cfg(windows)]
 static CURSOR_LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Returns true while GTA mouse-look lock (`~` / `F2`) is active and the
+/// Returns true while PC mouse-look lock (`~` / `F2`) is active and the
 /// cursor should be hidden inside the client area.
 #[cfg(windows)]
 pub(crate) fn cursor_locked() -> bool {

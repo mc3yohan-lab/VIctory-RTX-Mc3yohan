@@ -2,7 +2,7 @@
 //! `port_descriptors`): the title's own code that copies descriptor records
 //! into its shader-visible heap as bytes tells the layer which slots it wrote.
 //!
-//! What the title does (game_scarlett_master.exe): each draw's and each
+//! What the title does (the title executable): each draw's and each
 //! dispatch's descriptor tables are allocated from its frame allocator
 //! (image +0x4d9f400; the allocator's memory is the placed shader-visible
 //! view heap) and filled by two functions, +0x4d9efd0 (graphics) and
@@ -353,7 +353,8 @@ mod tests {
                 let mine = [Site { window: 0x1100, ..*site }];
                 assert_eq!(apply(place, 0x10000, &raw const *marks as usize, &mine), [Hooked::Done]);
                 assert_eq!(*((place + 0x1100 + site.store) as *const u8), 0xe9);
-                let (plain, hooked): (F, F) = (std::mem::transmute(plain), std::mem::transmute(hooked));
+                let plain = std::mem::transmute::<usize, F>(plain);
+                let hooked = std::mem::transmute::<usize, F>(hooked);
                 let record: [u8; 32] = std::array::from_fn(|k| k as u8 ^ 0x5a);
                 // In the heap: slot 0x40 + 3 of its start.
                 let table = heap.add(0x2000 + 0x40 * 32);
@@ -437,7 +438,8 @@ mod tests {
                 let mine = [Site { window: 0x1100, ..*site }];
                 assert_eq!(apply(place, 0x10000, &raw const *marks as usize, &mine), [Hooked::Done]);
                 assert_eq!(*((place + 0x1100 + site.store) as *const u8), 0xe9);
-                let (plain, hooked): (F, F) = (std::mem::transmute(plain), std::mem::transmute(hooked));
+                let plain = std::mem::transmute::<usize, F>(plain);
+                let hooked = std::mem::transmute::<usize, F>(hooked);
                 let record: [u8; 32] = std::array::from_fn(|k| (k as u8).wrapping_mul(7) ^ 0xa5);
                 let slot_idx = 0x55usize;
                 let dst_plain = heap.add(0x6000 + slot_idx * 32);

@@ -299,7 +299,7 @@ extern "system" fn window_proc(
         return 0;
     }
     // Auto-hide the Windows cursor inside the game window's client area while
-    // GTA mouse-look lock (`~` / `F2`) is active, and restore it immediately
+    // PC mouse-look lock (`~` / `F2`) is active, and restore it immediately
     // when unlocked (`~` / `F2` / `Esc` / `P`) (ported from Belobug #295).
     if message == wm::WM_SETCURSOR && (lparam as u32 & 0xFFFF) == wm::HTCLIENT {
         static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
@@ -388,7 +388,7 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
 
 /// Runs the constrained-change routines (constrained), then the suspend
 /// routines (quiesced), as the console does when it suspends a title.
-/// Grand Theft Auto VI's suspend routine waits for a state that only its
+/// The title's suspend routine waits for a state that only its
 /// constrained routine brings about; called alone it never returns.
 fn constrain_then_suspend(constrain: &[Registration], suspend: &[Registration]) {
     for &(_, routine, context) in constrain.iter().chain(suspend) {

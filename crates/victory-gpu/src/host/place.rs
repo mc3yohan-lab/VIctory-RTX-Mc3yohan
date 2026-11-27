@@ -65,7 +65,7 @@ impl Placed {
     /// Whether the card copies the bytes the CPU takes out of the source at
     /// submission (out of the list's upload memory), not a host copy that
     /// shaders write.
-    pub(super) fn from_upload(&self) -> bool {
+    pub(super) fn has_upload_source(&self) -> bool {
         self.from.is_some()
     }
 

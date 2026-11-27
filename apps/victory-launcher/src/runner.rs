@@ -1275,7 +1275,7 @@ pub fn scan_data_logs() -> Vec<LogFileEntry> {
             ));
         }
     }
-    out.sort_by(|a, b| b.0.cmp(&a.0));
+    out.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     out.into_iter().take(25).map(|(_, e)| e).collect()
 }
 
@@ -1357,7 +1357,7 @@ pub fn build_diagnostic_report(
     if !tail_lines.is_empty() {
         r.push_str("\n```text\n");
         for line in &tail_lines {
-            r.push_str(&sanitize_line(line));
+            r.push_str(&sanitize_line_with_dir(line, &cfg.game_dir));
             r.push('\n');
         }
         r.push_str("```\n");
@@ -1384,17 +1384,62 @@ pub fn save_report_to_desktop(
     Ok(path)
 }
 
-pub fn sanitize_line(line: &str) -> String {
-    let mut s = line.to_owned();
+fn replace_ascii_case_insensitive(haystack: &str, needle: &str, replacement: &str) -> String {
+    if needle.is_empty() || !needle.is_ascii() {
+        return haystack.replace(needle, replacement);
+    }
+    let hay_bytes = haystack.as_bytes();
+    let needle_bytes = needle.as_bytes();
+    if needle_bytes.len() > hay_bytes.len() {
+        return haystack.to_owned();
+    }
+    let mut out = String::with_capacity(haystack.len());
+    let mut i = 0;
+    while i + needle_bytes.len() <= hay_bytes.len() {
+        if hay_bytes[i..i + needle_bytes.len()].eq_ignore_ascii_case(needle_bytes) {
+            out.push_str(replacement);
+            i += needle_bytes.len();
+        } else {
+            let ch = haystack[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out.push_str(&haystack[i..]);
+    out
+}
+
+fn redact_path_variants(mut s: String, raw_path: &str, placeholder: &str) -> String {
+    let trimmed = raw_path.trim().trim_end_matches(['\\', '/']);
+    if trimmed.is_empty() {
+        return s;
+    }
+    let backslash = trimmed.replace('/', "\\");
+    let escaped = backslash.replace('\\', "\\\\");
+    let forward = backslash.replace('\\', "/");
+    for variant in [escaped.as_str(), backslash.as_str(), forward.as_str()] {
+        s = replace_ascii_case_insensitive(&s, variant, placeholder);
+    }
+    s
+}
+
+fn sanitize_line_with_dir(line: &str, game_dir: &str) -> String {
+    let mut s = redact_path_variants(line.to_owned(), game_dir, "<GAME_DIR>");
     if let Ok(profile) = std::env::var("USERPROFILE")
         && !profile.is_empty()
     {
-        s = s.replace(&profile, "<USUARIO>");
+        s = redact_path_variants(s, &profile, "<USUARIO>");
     }
     if let Ok(user) = std::env::var("USERNAME")
         && user.len() >= 3
     {
-        s = s.replace(&format!("\\{user}\\"), "\\<USUARIO>\\");
+        for (pat, rep) in [
+            (format!("\\\\{user}\\\\"), "\\\\<USUARIO>\\\\"),
+            (format!("\\{user}\\"), "\\<USUARIO>\\"),
+            (format!("/{user}/"), "/<USUARIO>/"),
+        ] {
+            s = replace_ascii_case_insensitive(&s, &pat, rep);
+        }
     }
     s
 }
@@ -1442,6 +1487,19 @@ fn timestamp_compact() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_lines_redact_the_game_dir() {
+        let game_dir = r"D:\Private\Title\";
+        assert_eq!(
+            sanitize_line_with_dir(
+                r#"loading d:\private\title\data and "D:\\Private\\Title\\data" and D:/Private/Title/cfg"#,
+                game_dir
+            ),
+            r#"loading <GAME_DIR>\data and "<GAME_DIR>\\data" and <GAME_DIR>/cfg"#
+        );
+        assert_eq!(sanitize_line_with_dir("loading data", ""), "loading data");
+    }
 
     #[test]
     fn ansi_stripping_removes_color_sequences() {

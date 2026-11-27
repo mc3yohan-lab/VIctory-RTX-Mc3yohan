@@ -118,7 +118,7 @@ enum Command {
         list: Option<PathBuf>,
         /// Apply the VIctory-RTX-Mc3yohan NVIDIA preset defaults for unset
         /// `VICTORY_*` variables (matches `scripts/play-nvidia.ps1` and
-        /// `AmericasLauncher` `runners.json`).
+        /// the settings used by external launchers).
         #[arg(long)]
         nvidia_preset: bool,
     },
@@ -169,7 +169,7 @@ enum Command {
         console: Console,
         /// Apply the VIctory-RTX-Mc3yohan NVIDIA preset defaults (Ports 1-2-5-6-7,
         /// ReBAR, Wave32, 1080p output on Series X) for any unset `VICTORY_*`
-        /// variables so external launchers (`AmericasLauncher`) get full RTX tuning.
+        /// variables so external launchers get full RTX tuning.
         #[arg(long)]
         nvidia_preset: bool,
         /// Arguments for the title, after `--` (it reads the whole command
@@ -338,8 +338,8 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
 }
 
 /// Applies the `VIctory-RTX-Mc3yohan` NVIDIA RTX defaults for any unset
-/// `VICTORY_*` environment variables so launchers without an env block
-/// (such as `AmericasLauncher`) get identical shader-cache keys and runtime
+/// `VICTORY_*` environment variables so external launchers without an env block
+/// get identical shader-cache keys and runtime
 /// tuning as `scripts/play-nvidia.ps1`, while still honoring user overrides.
 fn apply_nvidia_preset(run_console: Option<Console>) {
     let set_default = |k: &str, v: &str| {

@@ -4,7 +4,7 @@
 //! in the title's code changed at load, each compared byte for byte first
 //! and left alone, said so, if it differs (another build of the title).
 //!
-//! What the title does (game_scarlett_master.exe 1.0.2.1, image offsets):
+//! What the title does (the title executable 1.0.2.1, image offsets):
 //!
 //! - **Output size.** Its settings (`settings.xml` in its storage,
 //!   `video/resolutionFullscreen`, 3840x2160 as a Series X wrote it; read
