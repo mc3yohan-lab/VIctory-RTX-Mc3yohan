@@ -1,8 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-//! VIctory-RTX · Launcher Nativo Quantico Systems (100% Español)
+//! VIctory-RTX-Mc3yohan · Launcher Nativo en Español (NVIDIA RTX / Wave32)
 //! Flujo guiado en 3 pasos para cualquier usuario + Menú Principal minimalista
-//! con estética oficial Quantico Systems (#007BFF / #4DA3FF / carbón profundo).
+//! con arranque instantáneo (escaneo de GPU y caché en segundo plano).
 
 mod art;
 mod config;
@@ -51,9 +51,11 @@ struct VictoryLauncherApp {
     wizard_step: u8, // 1, 2, 3
     cfg: LauncherConfig,
     hw: HardwareInfo,
+    hw_async: Arc<Mutex<Option<HardwareInfo>>>,
     engine: EnginePaths,
     game: GameFilesStatus,
     cache: CacheStatus,
+    cache_async: Arc<Mutex<Option<CacheStatus>>>,
     git: Arc<Mutex<GitInfo>>,
     git_checking: Arc<Mutex<bool>>,
     controllers: ControllerPoller,
@@ -70,13 +72,15 @@ struct VictoryLauncherApp {
 
 impl VictoryLauncherApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        theme::apply_quantico_theme(&cc.egui_ctx);
+        theme::apply_theme(&cc.egui_ctx);
         let engine = EnginePaths::discover();
-        let hw = HardwareInfo::probe();
+        // Arranque instantáneo (< 5 ms): RAM/CPU nativo + comprobación acotada de caché.
+        // `nvidia-smi`, conteo exacto de ~230k shaders y `git rev-parse` corren en segundo plano.
+        let hw = HardwareInfo::probe_fast();
         let cfg = config::load_config(engine.repo_root.as_deref());
         let game = GameFilesStatus::inspect(Path::new(&cfg.game_dir));
-        let cache = CacheStatus::scan();
-        let git_local = GitInfo::probe_local(engine.repo_root.as_deref());
+        let cache = CacheStatus::scan_fast();
+        let git_local = GitInfo::placeholder(engine.repo_root.as_deref());
         let log_files = runner::scan_data_logs();
         let banner_tex = if !cfg.game_dir.is_empty() {
             art::load_game_banner_texture(&cc.egui_ctx, Path::new(&cfg.game_dir))
@@ -84,6 +88,36 @@ impl VictoryLauncherApp {
             None
         };
         let banner_loaded_for = cfg.game_dir.clone();
+
+        let hw_async = Arc::new(Mutex::new(None));
+        let cache_async = Arc::new(Mutex::new(None));
+        let git = Arc::new(Mutex::new(git_local));
+
+        // 1. Sondeo real de GPU (nvidia-smi + elevación) + Git local en segundo plano.
+        {
+            let hw_slot = hw_async.clone();
+            let git_slot = git.clone();
+            let repo_root = engine.repo_root.clone();
+            let ctx_bg = cc.egui_ctx.clone();
+            std::thread::spawn(move || {
+                let probed = HardwareInfo::probe();
+                *hw_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(probed);
+                let git_info = GitInfo::probe_local(repo_root.as_deref());
+                *git_slot.lock().unwrap_or_else(|e| e.into_inner()) = git_info;
+                ctx_bg.request_repaint();
+            });
+        }
+
+        // 2. Conteo exacto de caché (~230k shaders) en segundo plano sin trabar jamás el arranque.
+        {
+            let cache_slot = cache_async.clone();
+            let ctx_bg = cc.egui_ctx.clone();
+            std::thread::spawn(move || {
+                let exact = CacheStatus::scan_exact();
+                *cache_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(exact);
+                ctx_bg.request_repaint();
+            });
+        }
 
         // Mostrar el asistente guiado la primera vez o si falta la carpeta del juego.
         let in_wizard = !cfg.wizard_completed || !game.ready();
@@ -101,10 +135,12 @@ impl VictoryLauncherApp {
             wizard_step,
             cfg,
             hw,
+            hw_async,
             engine,
             game,
             cache,
-            git: Arc::new(Mutex::new(git_local)),
+            cache_async,
+            git,
             git_checking: Arc::new(Mutex::new(false)),
             controllers: ControllerPoller::default(),
             runner: ProcessRunner::default(),
@@ -126,7 +162,14 @@ impl VictoryLauncherApp {
     fn refresh_status(&mut self, ctx: &egui::Context) {
         self.engine = EnginePaths::discover();
         self.game = GameFilesStatus::inspect(Path::new(&self.cfg.game_dir));
-        self.cache = CacheStatus::scan();
+        self.cache = CacheStatus::scan_fast();
+        let cache_slot = self.cache_async.clone();
+        let ctx_bg = ctx.clone();
+        std::thread::spawn(move || {
+            let exact = CacheStatus::scan_exact();
+            *cache_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(exact);
+            ctx_bg.request_repaint();
+        });
         self.log_files = runner::scan_data_logs();
         if self.cfg.game_dir != self.banner_loaded_for {
             self.banner_tex = if !self.cfg.game_dir.is_empty() {
@@ -224,16 +267,16 @@ impl VictoryLauncherApp {
         // Cabecera minimalista del asistente.
         ui.horizontal(|ui| {
             let (mark_rect, _) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::hover());
-            theme::paint_quantico_mark(ui.painter(), mark_rect);
+            theme::paint_brand_mark(ui.painter(), mark_rect);
             ui.add_space(4.0);
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
-                ui.label(RichText::new("VIctory-RTX").strong().size(15.5));
+                ui.label(RichText::new("VIctory-RTX-Mc3yohan").strong().size(15.5));
                 ui.label(
-                    RichText::new("CONFIGURACIÓN INICIAL · QUANTICO SYSTEMS")
+                    RichText::new("CONFIGURACIÓN INICIAL · EDICIÓN NVIDIA RTX")
                         .size(9.5)
                         .strong()
-                        .color(theme::QUANTICO_BLUE_LIGHT),
+                        .color(theme::ACCENT_BLUE_LIGHT),
                 );
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -312,7 +355,7 @@ impl VictoryLauncherApp {
                 let active = self.wizard_step == *num;
                 let done = self.wizard_step > *num;
                 let (bg, border, txt) = if active {
-                    (theme::QUANTICO_BLUE, theme::QUANTICO_BLUE_LIGHT, Color32::WHITE)
+                    (theme::ACCENT_BLUE, theme::ACCENT_BLUE_LIGHT, Color32::WHITE)
                 } else if done {
                     (
                         Color32::from_rgba_unmultiplied(16, 185, 129, 32),
@@ -360,7 +403,7 @@ impl VictoryLauncherApp {
                 if self.game.ready() {
                     theme::STATUS_OK
                 } else {
-                    theme::QUANTICO_BLUE_LIGHT
+                    theme::ACCENT_BLUE_LIGHT
                 },
             );
             ui.add_space(4.0);
@@ -423,7 +466,7 @@ impl VictoryLauncherApp {
                                 .strong()
                                 .color(Color32::WHITE),
                         )
-                        .fill(theme::QUANTICO_BLUE)
+                        .fill(theme::ACCENT_BLUE)
                         .min_size(vec2(190.0, 38.0));
                         if ui.add(search).clicked() {
                             self.auto_search_game(ctx);
@@ -451,7 +494,7 @@ impl VictoryLauncherApp {
                         }),
                 )
                 .fill(if self.game.ready() {
-                    theme::QUANTICO_BLUE
+                    theme::ACCENT_BLUE
                 } else {
                     theme::BG_CARD_ALT
                 })
@@ -477,7 +520,7 @@ impl VictoryLauncherApp {
                 if self.cache.shaders_ready() {
                     theme::STATUS_OK
                 } else {
-                    theme::QUANTICO_BLUE_LIGHT
+                    theme::ACCENT_BLUE_LIGHT
                 },
             );
             ui.add_space(4.0);
@@ -502,7 +545,7 @@ impl VictoryLauncherApp {
         if is_running {
             Frame::new()
                 .fill(theme::BG_CARD_ALT)
-                .stroke(Stroke::new(1.0_f32, theme::QUANTICO_BLUE))
+                .stroke(Stroke::new(1.0_f32, theme::ACCENT_BLUE))
                 .corner_radius(CornerRadius::same(12))
                 .inner_margin(Margin::same(18))
                 .show(ui, |ui| {
@@ -510,7 +553,7 @@ impl VictoryLauncherApp {
                         ui.label(
                             RichText::new(&snap.progress.step_label)
                                 .strong()
-                                .color(theme::QUANTICO_BLUE_LIGHT)
+                                .color(theme::ACCENT_BLUE_LIGHT)
                                 .size(14.0),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -527,7 +570,7 @@ impl VictoryLauncherApp {
                     ui.add_space(8.0);
                     ui.add(
                         egui::ProgressBar::new(snap.progress.fraction())
-                            .fill(theme::QUANTICO_BLUE)
+                            .fill(theme::ACCENT_BLUE)
                             .desired_height(16.0)
                             .show_percentage(),
                     );
@@ -546,11 +589,14 @@ impl VictoryLauncherApp {
                         .color(theme::STATUS_OK)
                         .size(14.5),
                 );
+                let shader_txt = if self.cache.shader_count_exact {
+                    format!("{} shaders listos ({} MB)", self.cache.shader_files, self.cache.shader_mb)
+                } else {
+                    "Shaders listos (calculando tamaño total...)".to_owned()
+                };
                 ui.label(
                     RichText::new(format!(
-                        "{} shaders listos ({} MB){}",
-                        self.cache.shader_files,
-                        self.cache.shader_mb,
+                        "{shader_txt}{}",
                         if self.cache.pipeline_lib_exists {
                             format!(" · {} MB de escenas aceleradas", self.cache.pipeline_lib_mb)
                         } else {
@@ -562,7 +608,7 @@ impl VictoryLauncherApp {
                 );
             });
         } else if let Some(legacy) = self.cache.legacy_importable.clone() {
-            theme::alert_banner(theme::QUANTICO_BLUE, Color32::from_rgb(11, 24, 44)).show(
+            theme::alert_banner(theme::ACCENT_BLUE, Color32::from_rgb(11, 24, 44)).show(
                 ui,
                 |ui| {
                     ui.label(
@@ -583,10 +629,15 @@ impl VictoryLauncherApp {
                     } else {
                         format!(" + {}", extras.join(" y "))
                     };
+                    let legacy_shaders = if legacy.shader_files >= 500 {
+                        "miles de shaders".to_owned()
+                    } else {
+                        format!("{} shaders", legacy.shader_files)
+                    };
                     ui.label(
                         RichText::new(format!(
-                            "Detectamos {} shaders y {} MB de escenas{extra_txt}. Puedes importarlos en segundos en vez de recompilar.",
-                            legacy.shader_files, legacy.pipeline_mb
+                            "Detectamos {legacy_shaders} y {} MB de escenas{extra_txt}. Puedes importarlos en segundos en vez de recompilar.",
+                            legacy.pipeline_mb
                         ))
                         .color(theme::TEXT_SECONDARY)
                         .size(12.5),
@@ -598,7 +649,7 @@ impl VictoryLauncherApp {
                                 .strong()
                                 .color(Color32::WHITE),
                         )
-                        .fill(theme::QUANTICO_BLUE)
+                        .fill(theme::ACCENT_BLUE)
                         .min_size(vec2(250.0, 38.0));
                         if ui.add(imp).clicked()
                             && let Err(e) = self.runner.start_import_legacy_cache(legacy)
@@ -640,7 +691,7 @@ impl VictoryLauncherApp {
                             .size(14.0)
                             .color(Color32::WHITE),
                     )
-                    .fill(theme::QUANTICO_BLUE)
+                    .fill(theme::ACCENT_BLUE)
                     .min_size(vec2(220.0, 40.0));
                     if ui.add(prep).clicked()
                         && let Err(e) =
@@ -677,7 +728,7 @@ impl VictoryLauncherApp {
                         }),
                 )
                 .fill(if ready {
-                    theme::QUANTICO_BLUE
+                    theme::ACCENT_BLUE
                 } else {
                     theme::BG_CARD_ALT
                 })
@@ -692,7 +743,7 @@ impl VictoryLauncherApp {
 
     fn ui_wizard_step3(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            theme::paint_badge_icon(ui, theme::BadgeKind::Sliders, theme::QUANTICO_BLUE_LIGHT);
+            theme::paint_badge_icon(ui, theme::BadgeKind::Sliders, theme::ACCENT_BLUE_LIGHT);
             ui.add_space(4.0);
             ui.vertical(|ui| {
                 ui.label(
@@ -737,14 +788,14 @@ impl VictoryLauncherApp {
                 let selected = self.cfg.preset == *preset;
                 let frame = Frame::new()
                     .fill(if selected {
-                        theme::QUANTICO_BLUE_SOFT
+                        theme::ACCENT_BLUE_SOFT
                     } else {
                         theme::BG_CARD_ALT
                     })
                     .stroke(Stroke::new(
                         if selected { 1.6_f32 } else { 1.0_f32 },
                         if selected {
-                            theme::QUANTICO_BLUE_LIGHT
+                            theme::ACCENT_BLUE_LIGHT
                         } else {
                             theme::BORDER
                         },
@@ -838,8 +889,8 @@ impl VictoryLauncherApp {
                         .size(14.5)
                         .color(Color32::WHITE),
                 )
-                .fill(theme::QUANTICO_BLUE)
-                .stroke(Stroke::new(1.0_f32, theme::QUANTICO_BLUE_LIGHT))
+                .fill(theme::ACCENT_BLUE)
+                .stroke(Stroke::new(1.0_f32, theme::ACCENT_BLUE_LIGHT))
                 .corner_radius(CornerRadius::same(10))
                 .min_size(vec2(220.0, 44.0));
                 if ui.add(finish).clicked() {
@@ -863,20 +914,20 @@ impl VictoryLauncherApp {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let (mark_rect, _) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::hover());
-                    theme::paint_quantico_mark(ui.painter(), mark_rect);
+                    theme::paint_brand_mark(ui.painter(), mark_rect);
                     ui.add_space(4.0);
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
-                        ui.label(RichText::new("VIctory-RTX").strong().size(15.0));
+                        ui.label(RichText::new("VIctory-RTX-Mc3yohan").strong().size(15.0));
                         ui.label(
-                            RichText::new("QUANTICO SYSTEMS")
+                            RichText::new("EDICIÓN NVIDIA RTX · WAVE32")
                                 .size(9.0)
                                 .strong()
-                                .color(theme::QUANTICO_BLUE_LIGHT),
+                                .color(theme::ACCENT_BLUE_LIGHT),
                         );
                     });
 
-                    ui.add_space(26.0);
+                    ui.add_space(22.0);
 
                     for tab in [Tab::Jugar, Tab::Ajustes, Tab::Logs, Tab::Actualizar] {
                         let active = self.tab == tab;
@@ -891,12 +942,12 @@ impl VictoryLauncherApp {
                                 .size(13.0),
                         )
                         .fill(if active {
-                            theme::QUANTICO_BLUE_SOFT
+                            theme::ACCENT_BLUE_SOFT
                         } else {
                             Color32::TRANSPARENT
                         })
                         .stroke(if active {
-                            Stroke::new(1.0_f32, theme::QUANTICO_BLUE)
+                            Stroke::new(1.0_f32, theme::ACCENT_BLUE)
                         } else {
                             Stroke::NONE
                         })
@@ -912,13 +963,13 @@ impl VictoryLauncherApp {
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
-                            RichText::new(format!("v0.7.1 · {}", env!("VICTORY_GIT_SHA")))
+                            RichText::new(format!("v0.7.2 · {}", env!("VICTORY_GIT_SHA")))
                                 .color(theme::TEXT_MUTED)
                                 .size(11.0),
                         );
                         ui.add_space(8.0);
                         if let Some(task) = snap.running {
-                            theme::status_pill(ui, task.label_es(), theme::QUANTICO_BLUE_LIGHT);
+                            theme::status_pill(ui, task.label_es(), theme::ACCENT_BLUE_LIGHT);
                         } else if git_snapshot.behind_count > 0 {
                             theme::status_pill(ui, "Actualización lista", theme::STATUS_OK);
                         }
@@ -964,13 +1015,14 @@ impl VictoryLauncherApp {
             ui.painter()
                 .image(tex.id(), banner_rect, uv, Color32::WHITE);
         }
-        theme::paint_quantico_banner_overlay(ui.painter(), banner_rect, self.banner_tex.is_some());
+        theme::paint_hero_overlay(ui.painter(), banner_rect, self.banner_tex.is_some());
 
         // Bloque inferior-izquierdo con Rect exacto (jamás choca con el botón derecho ni se sale).
         let left_rect = Rect::from_min_max(
             pos2(banner_rect.left() + 28.0, banner_rect.bottom() - 122.0),
             pos2((banner_rect.right() - 270.0).max(banner_rect.left() + 260.0), banner_rect.bottom() - 22.0),
         );
+        let title_size = if left_rect.width() < 520.0 { 30.0 } else { 35.0 };
         ui.allocate_new_ui(
             egui::UiBuilder::new()
                 .max_rect(left_rect)
@@ -991,14 +1043,14 @@ impl VictoryLauncherApp {
                 );
                 ui.add_space(2.0);
                 ui.label(
-                    RichText::new("VIctory-RTX")
+                    RichText::new("VIctory-RTX-Mc3yohan")
                         .color(Color32::WHITE)
                         .strong()
-                        .size(38.0),
+                        .size(title_size),
                 );
                 ui.label(
-                    RichText::new("QUANTICO SYSTEMS  ·  EDICIÓN NVIDIA RTX")
-                        .color(theme::QUANTICO_BLUE_LIGHT)
+                    RichText::new("MC3YOHAN  ·  EDICIÓN NVIDIA RTX")
+                        .color(theme::ACCENT_BLUE_LIGHT)
                         .strong()
                         .size(11.0),
                 );
@@ -1030,6 +1082,7 @@ impl VictoryLauncherApp {
                     }
                 } else {
                     let can_play = self.game.ready()
+                        && self.hw.probe_done
                         && self.engine.active_victory(self.cfg.use_diag_build).is_some();
                     let play = Button::new(
                         RichText::new("JUGAR")
@@ -1038,14 +1091,14 @@ impl VictoryLauncherApp {
                             .color(if can_play { Color32::WHITE } else { theme::TEXT_MUTED }),
                     )
                     .fill(if can_play {
-                        theme::QUANTICO_BLUE
+                        theme::ACCENT_BLUE
                     } else {
                         theme::BG_CARD_ALT
                     })
                     .stroke(Stroke::new(
                         1.2_f32,
                         if can_play {
-                            theme::QUANTICO_BLUE_LIGHT
+                            theme::ACCENT_BLUE_LIGHT
                         } else {
                             theme::BORDER
                         },
@@ -1056,7 +1109,7 @@ impl VictoryLauncherApp {
                             Ok(()) => {
                                 self.set_toast(
                                     "Iniciando juego... Puedes ver los FPS en la pestaña Logs.",
-                                    theme::QUANTICO_BLUE_LIGHT,
+                                    theme::ACCENT_BLUE_LIGHT,
                                 );
                             }
                             Err(e) => self.set_toast(e, theme::STATUS_ERR),
@@ -1083,6 +1136,7 @@ impl VictoryLauncherApp {
                             .color(theme::TEXT_SECONDARY)
                             .size(12.5),
                     );
+                    let preset_tip = self.cfg.preset.description_es(&self.hw);
                     egui::ComboBox::from_id_salt("home_preset_combo")
                         .width(155.0)
                         .selected_text(self.cfg.preset.label_es())
@@ -1104,7 +1158,9 @@ impl VictoryLauncherApp {
                                     self.persist();
                                 }
                             }
-                        });
+                        })
+                        .response
+                        .on_hover_text(preset_tip);
 
                     ui.add_space(16.0);
 
@@ -1144,7 +1200,7 @@ impl VictoryLauncherApp {
                                         .size(12.0)
                                         .color(Color32::WHITE),
                                 )
-                                .fill(theme::QUANTICO_BLUE_STRONG);
+                                .fill(theme::ACCENT_BLUE_STRONG);
                                 if ui.add(imp).clicked()
                                     && let Err(e) = self.runner.start_import_legacy_cache(legacy)
                                 {
@@ -1157,7 +1213,7 @@ impl VictoryLauncherApp {
                                         .size(12.0)
                                         .color(Color32::WHITE),
                                 )
-                                .fill(theme::QUANTICO_BLUE_STRONG);
+                                .fill(theme::ACCENT_BLUE_STRONG);
                                 if ui.add(prep).clicked()
                                     && let Err(e) = self.runner.start_prep(
                                         &self.engine,
@@ -1183,7 +1239,7 @@ impl VictoryLauncherApp {
                     ui.label(
                         RichText::new(&snap.progress.step_label)
                             .strong()
-                            .color(theme::QUANTICO_BLUE_LIGHT)
+                            .color(theme::ACCENT_BLUE_LIGHT)
                             .size(13.0),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1201,7 +1257,7 @@ impl VictoryLauncherApp {
                 ui.add_space(5.0);
                 ui.add(
                     egui::ProgressBar::new(snap.progress.fraction())
-                        .fill(theme::QUANTICO_BLUE)
+                        .fill(theme::ACCENT_BLUE)
                         .desired_height(14.0)
                         .show_percentage(),
                 );
@@ -1256,7 +1312,7 @@ impl VictoryLauncherApp {
                     ui.label(
                         RichText::new("Carpeta del juego y gráficos")
                             .strong()
-                            .color(theme::QUANTICO_BLUE_LIGHT)
+                            .color(theme::ACCENT_BLUE_LIGHT)
                             .size(14.0),
                     );
                     ui.add_space(6.0);
@@ -1279,10 +1335,15 @@ impl VictoryLauncherApp {
                     });
                     ui.add_space(8.0);
                     ui.horizontal_wrapped(|ui| {
+                        let shaders_desc = if self.cache.shader_count_exact {
+                            format!("{} ({} MB)", self.cache.shader_files, self.cache.shader_mb)
+                        } else if self.cache.shaders_ready() {
+                            "listos (calculando...)".to_owned()
+                        } else {
+                            format!("{}", self.cache.shader_files)
+                        };
                         let status_str = format!(
-                            "Shaders: {} ({} MB)  ·  Escenas: {}",
-                            self.cache.shader_files,
-                            self.cache.shader_mb,
+                            "Shaders: {shaders_desc}  ·  Escenas: {}",
                             if self.cache.pipeline_lib_exists {
                                 format!("{} MB listas", self.cache.pipeline_lib_mb)
                             } else {
@@ -1320,7 +1381,7 @@ impl VictoryLauncherApp {
                     ui.label(
                         RichText::new("Pantalla y Calidad Gráfica")
                             .strong()
-                            .color(theme::QUANTICO_BLUE_LIGHT)
+                            .color(theme::ACCENT_BLUE_LIGHT)
                             .size(14.0),
                     );
                     ui.add_space(8.0);
@@ -1630,7 +1691,7 @@ impl VictoryLauncherApp {
                         .color(Color32::WHITE)
                         .size(13.0),
                 )
-                .fill(theme::QUANTICO_BLUE)
+                .fill(theme::ACCENT_BLUE)
                 .corner_radius(CornerRadius::same(8))
                 .min_size(vec2(215.0, 36.0));
                 if ui.add(copy_btn).clicked() {
@@ -1655,7 +1716,7 @@ impl VictoryLauncherApp {
                         .size(13.0),
                 )
                 .fill(theme::BG_CARD_ALT)
-                .stroke(Stroke::new(1.0_f32, theme::QUANTICO_BLUE_LIGHT))
+                .stroke(Stroke::new(1.0_f32, theme::ACCENT_BLUE_LIGHT))
                 .corner_radius(CornerRadius::same(8))
                 .min_size(vec2(250.0, 36.0));
                 if ui.add(desk_btn).clicked() {
@@ -1699,7 +1760,7 @@ impl VictoryLauncherApp {
                     ui.label(
                         RichText::new(title)
                             .strong()
-                            .color(theme::QUANTICO_BLUE_LIGHT)
+                            .color(theme::ACCENT_BLUE_LIGHT)
                             .size(12.0),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1772,7 +1833,7 @@ impl VictoryLauncherApp {
                     ui.label(
                         RichText::new("Resumen de la última partida")
                             .strong()
-                            .color(theme::QUANTICO_BLUE_LIGHT)
+                            .color(theme::ACCENT_BLUE_LIGHT)
                             .size(13.5),
                     );
                     ui.add_space(6.0);
@@ -1901,7 +1962,7 @@ impl VictoryLauncherApp {
                             ui.label(
                                 RichText::new("Actualización por Git")
                                     .strong()
-                                    .color(theme::QUANTICO_BLUE_LIGHT)
+                                    .color(theme::ACCENT_BLUE_LIGHT)
                                     .size(15.0),
                             );
                             if git_info.available {
@@ -1923,7 +1984,7 @@ impl VictoryLauncherApp {
                         });
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if checking {
-                                theme::status_pill(ui, "Comprobando...", theme::QUANTICO_BLUE_LIGHT);
+                                theme::status_pill(ui, "Comprobando...", theme::ACCENT_BLUE_LIGHT);
                             } else if git_info.behind_count > 0 {
                                 theme::status_pill(
                                     ui,
@@ -1988,7 +2049,7 @@ impl VictoryLauncherApp {
                                     .strong()
                                     .color(Color32::WHITE),
                             )
-                            .fill(theme::QUANTICO_BLUE)
+                            .fill(theme::ACCENT_BLUE)
                             .corner_radius(CornerRadius::same(8))
                             .min_size(vec2(245.0, 36.0));
                             if ui.add_enabled(!is_running && !checking, pull_btn).clicked() {
@@ -1997,7 +2058,7 @@ impl VictoryLauncherApp {
                                 } else {
                                     self.set_toast(
                                         "Descargando y compilando actualización...",
-                                        theme::QUANTICO_BLUE_LIGHT,
+                                        theme::ACCENT_BLUE_LIGHT,
                                     );
                                 }
                             }
@@ -2015,14 +2076,14 @@ impl VictoryLauncherApp {
                     ui.label(
                         RichText::new("Créditos y Licencia Open Source (GPL-3.0)")
                             .strong()
-                            .color(theme::QUANTICO_BLUE_LIGHT)
+                            .color(theme::ACCENT_BLUE_LIGHT)
                             .size(14.0),
                     );
                     ui.add_space(6.0);
                     for (name, desc, url) in [
                         (
                             "mc3yohan-lab / VIctory-RTX-Mc3yohan",
-                            "Fork NVIDIA RTX Wave32 + Launcher Quantico Systems",
+                            "Fork NVIDIA RTX Wave32 + Launcher Nativo en Español",
                             "https://github.com/mc3yohan-lab/VIctory-RTX-Mc3yohan",
                         ),
                         (
@@ -2067,6 +2128,18 @@ impl VictoryLauncherApp {
 
 impl eframe::App for VictoryLauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Recoger resultados asíncronos de GPU y caché exacta sin bloquear jamás el hilo UI.
+        if let Ok(mut slot) = self.hw_async.try_lock()
+            && let Some(probed) = slot.take()
+        {
+            self.hw = probed;
+        }
+        if let Ok(mut slot) = self.cache_async.try_lock()
+            && let Some(exact) = slot.take()
+        {
+            self.cache = exact;
+        }
+
         let snap = self.runner.snapshot();
 
         if snap.finished_seq != self.last_finished_seq {
@@ -2083,13 +2156,19 @@ impl eframe::App for VictoryLauncherApp {
                 };
                 self.set_toast(note.clone(), col);
             }
-            if let Some(root) = self.engine.repo_root.as_deref() {
-                *self.git.lock().unwrap_or_else(|e| e.into_inner()) =
-                    GitInfo::probe_local(Some(root));
+            if let Some(root) = self.engine.repo_root.clone() {
+                let git_arc = self.git.clone();
+                std::thread::spawn(move || {
+                    *git_arc.lock().unwrap_or_else(|e| e.into_inner()) =
+                        GitInfo::probe_local(Some(&root));
+                });
             }
         }
 
-        if snap.running.is_some() || *self.git_checking.lock().unwrap_or_else(|e| e.into_inner()) {
+        if snap.running.is_some()
+            || !self.hw.probe_done
+            || *self.git_checking.lock().unwrap_or_else(|e| e.into_inner())
+        {
             ctx.request_repaint_after(Duration::from_millis(120));
         } else {
             ctx.request_repaint_after(Duration::from_millis(800));
@@ -2097,7 +2176,7 @@ impl eframe::App for VictoryLauncherApp {
 
         // Cabecera superior solo en el Menú Principal (el asistente lleva su propia barra limpia).
         if !self.in_wizard {
-            egui::TopBottomPanel::top("quantico_header")
+            egui::TopBottomPanel::top("victory_header")
                 .frame(Frame::NONE)
                 .show(ctx, |ui| {
                     self.ui_top_header(ui, &snap);
@@ -2109,7 +2188,7 @@ impl eframe::App for VictoryLauncherApp {
             if at.elapsed() > Duration::from_secs(6) {
                 self.toast = None;
             } else {
-                egui::TopBottomPanel::bottom("quantico_toast")
+                egui::TopBottomPanel::bottom("victory_toast")
                     .frame(
                         Frame::new()
                             .fill(Color32::from_rgb(13, 18, 28))
@@ -2149,7 +2228,7 @@ impl eframe::App for VictoryLauncherApp {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("VIctory-RTX · Quantico Systems")
+            .with_title("VIctory-RTX-Mc3yohan")
             .with_inner_size([1060.0, 680.0])
             .with_min_inner_size([880.0, 580.0])
             .with_icon(art::app_icon()),
@@ -2157,7 +2236,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "VIctory-RTX · Quantico Systems",
+        "VIctory-RTX-Mc3yohan",
         options,
         Box::new(|cc| Ok(Box::new(VictoryLauncherApp::new(cc)))),
     )

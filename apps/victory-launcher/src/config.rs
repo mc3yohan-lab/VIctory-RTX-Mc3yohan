@@ -956,6 +956,7 @@ mod tests {
             commit_free_gb: 60.0,
             logical_cpus: 24,
             is_elevated_admin: false,
+            probe_done: true,
         }
     }
 

@@ -189,6 +189,7 @@ pub struct LegacyCacheInfo {
 pub struct CacheStatus {
     pub shader_files: usize,
     pub shader_mb: u64,
+    pub shader_count_exact: bool,
     pub pipeline_lib_mb: u64,
     pub pipeline_lib_exists: bool,
     pub early_pipelines_count: usize,
@@ -197,10 +198,35 @@ pub struct CacheStatus {
 }
 
 impl CacheStatus {
-    pub fn scan() -> Self {
+    /// Escaneo ultrarrápido (< 5 ms) para abrir la ventana al instante sin
+    /// recorrer los ~230,000 archivos de shaders en el hilo principal.
+    pub fn scan_fast() -> Self {
+        let root = cache_dir();
+        let shader_files = count_files_capped(&root.join("shaders"), 500);
+        let mut status = Self::scan_metadata_only(&root);
+        status.shader_files = shader_files;
+        status.shader_count_exact = shader_files < 500;
+        if shader_files == 0 || !status.pipeline_lib_exists {
+            status.legacy_importable = detect_legacy_scarlett_cache_fast();
+        }
+        status
+    }
+
+    /// Escaneo completo (para ejecutar siempre en segundo plano).
+    pub fn scan_exact() -> Self {
         let root = cache_dir();
         let (shader_files, shader_bytes) = count_files_recursive(&root.join("shaders"));
+        let mut status = Self::scan_metadata_only(&root);
+        status.shader_files = shader_files;
+        status.shader_mb = shader_bytes / (1024 * 1024);
+        status.shader_count_exact = true;
+        if shader_files == 0 || !status.pipeline_lib_exists {
+            status.legacy_importable = detect_legacy_scarlett_cache_fast();
+        }
+        status
+    }
 
+    fn scan_metadata_only(root: &Path) -> Self {
         let pipes_dir = root.join("pipelines");
         let lib_path = pipes_dir.join("host-pipelines.bin");
         let next_path = pipes_dir.join("host-pipelines.next");
@@ -218,22 +244,15 @@ impl CacheStatus {
             .join("fidelityfx")
             .join("amd_fidelityfx_upscaler_dx12.dll");
 
-        // Si falta caché en `%LOCALAPPDATA%\victory`, buscar caché previa en ScarlettPort
-        // (ScarlettPort v0.4.7+ renombra `%LOCALAPPDATA%\victory` -> `ScarlettPort`).
-        let legacy_importable = if shader_files == 0 || !pipeline_lib_exists {
-            detect_legacy_scarlett_cache()
-        } else {
-            None
-        };
-
         Self {
-            shader_files,
-            shader_mb: shader_bytes / (1024 * 1024),
+            shader_files: 0,
+            shader_mb: 0,
+            shader_count_exact: false,
             pipeline_lib_mb,
             pipeline_lib_exists,
             early_pipelines_count,
             ffx_dll_exists: ffx_dll.is_file(),
-            legacy_importable,
+            legacy_importable: None,
         }
     }
 
@@ -242,12 +261,12 @@ impl CacheStatus {
     }
 }
 
-fn detect_legacy_scarlett_cache() -> Option<LegacyCacheInfo> {
+fn detect_legacy_scarlett_cache_fast() -> Option<LegacyCacheInfo> {
     let sp_root = local_app_data().join("ScarlettPort");
     if !sp_root.is_dir() {
         return None;
     }
-    let (shader_files, _) = count_files_recursive(&sp_root.join("cache").join("shaders"));
+    let shader_files = count_files_capped(&sp_root.join("cache").join("shaders"), 500);
     let pipe_file = sp_root
         .join("cache")
         .join("pipelines")
@@ -274,6 +293,34 @@ fn detect_legacy_scarlett_cache() -> Option<LegacyCacheInfo> {
     } else {
         None
     }
+}
+
+/// Cuenta hasta `limit` archivos usando `DirEntry::file_type()` sin `stat`
+/// extra por archivo: termina en < 3 ms incluso con 250,000 shaders.
+fn count_files_capped(dir: &Path, limit: usize) -> usize {
+    let mut files = 0usize;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut stack = vec![entries];
+    while let Some(mut rd) = stack.pop() {
+        for entry in rd.by_ref().flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_file() {
+                files += 1;
+                if files >= limit {
+                    return files;
+                }
+            } else if ft.is_dir()
+                && let Ok(sub) = std::fs::read_dir(entry.path())
+            {
+                stack.push(sub);
+            }
+        }
+    }
+    files
 }
 
 fn count_files_recursive(dir: &Path) -> (usize, u64) {
@@ -379,6 +426,25 @@ pub struct GitInfo {
 }
 
 impl GitInfo {
+    /// Versión instantánea sin subprocesos para arrancar la ventana en < 100 ms.
+    pub fn placeholder(repo_root: Option<&Path>) -> Self {
+        let has_git = repo_root.is_some_and(|r| r.join(".git").exists());
+        Self {
+            available: has_git,
+            branch: "nvidia-rtx4090".to_owned(),
+            local_sha: env!("VICTORY_GIT_SHA").to_owned(),
+            behind_count: 0,
+            pending_commits: Vec::new(),
+            checked_once: false,
+            last_status_es: if has_git {
+                "Pulsa 'Buscar actualizaciones' para comprobar mejoras nuevas en GitHub."
+                    .to_owned()
+            } else {
+                "Instalación portable (sin repositorio Git local).".to_owned()
+            },
+        }
+    }
+
     pub fn probe_local(repo_root: Option<&Path>) -> Self {
         let Some(root) = repo_root else {
             return Self {
@@ -597,7 +663,7 @@ impl ProcessRunner {
 
         // Encabezado limpio UTF-8 para que cualquier log compartido tenga toda la info del PC.
         let header = format!(
-            "=== VIctory-RTX-Mc3yohan (Quantico Launcher v0.7.0 @ {}) ===\n\
+            "=== VIctory-RTX-Mc3yohan (Launcher v0.7.2 @ {}) ===\n\
              GPU      : {} ({} MiB VRAM, Tier {})\n\
              RAM      : {:.1} GB total ({:.1} GB libre, {:.1} GB commit libre) | {} hilos\n\
              Perfil   : {} | Consola: {} | Salida: {} | Escala: {:?}\n\
@@ -1229,7 +1295,7 @@ pub fn build_diagnostic_report(
 ) -> String {
     let mut r = String::new();
     r.push_str(&format!(
-        "### Reporte de Diagnóstico · VIctory-RTX-Mc3yohan (v0.7.0 @ {})\n",
+        "### Reporte de Diagnóstico · VIctory-RTX-Mc3yohan (v0.7.2 @ {})\n",
         env!("VICTORY_GIT_SHA")
     ));
     r.push_str(&format!(
@@ -1241,8 +1307,12 @@ pub fn build_diagnostic_report(
         hw.vram_tier.label(),
     ));
     r.push_str(&format!(
-        "- **Memoria del PC**: {:.1} GB RAM ({:.1} GB libre · {:.1} GB virtual libre) · {} hilos CPU\n",
-        hw.ram_total_gb, hw.ram_free_gb, hw.commit_free_gb, hw.logical_cpus,
+        "- **Memoria del PC**: {:.1} GB RAM ({:.1} GB libre · {:.1} GB virtual libre · ahorro RAM auto: {}) · {} hilos CPU\n",
+        hw.ram_total_gb,
+        hw.ram_free_gb,
+        hw.commit_free_gb,
+        if hw.low_ram_auto() { "sí" } else { "no" },
+        hw.logical_cpus,
     ));
     r.push_str(&format!(
         "- **Perfil**: `{}` · Consola `{}` · Salida `{}` · ReBAR `{} MiB` · MipDrop `{}` · PortRT `{}`\n",
@@ -1325,14 +1395,16 @@ pub fn sanitize_line(line: &str) -> String {
 }
 
 fn is_victory_already_running() -> bool {
-    let out = Command::new("tasklist")
-        .args(["/FI", "IMAGENAME eq victory.exe", "/NH"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    out.is_ok_and(|o| {
-        let s = String::from_utf8_lossy(&o.stdout);
-        s.to_ascii_lowercase().contains("victory.exe")
-    })
+    for img in ["victory.exe", "victory_sm.exe"] {
+        let out = Command::new("tasklist")
+            .args(["/FI", &format!("IMAGENAME eq {img}"), "/NH"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        if out.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).to_ascii_lowercase().contains(img)) {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn open_folder(path: &Path) {

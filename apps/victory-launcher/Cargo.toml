@@ -1,11 +1,11 @@
 [package]
 name = "victory-launcher"
-version = "0.7.1"
+version = "0.7.2"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Launcher nativo Quantico Systems en español para VIctory-RTX-Mc3yohan (NVIDIA RTX / Wave32)"
+description = "Launcher nativo en español para VIctory-RTX-Mc3yohan (NVIDIA RTX / Wave32)"
 
 [[bin]]
 name = "VIctory-RTX"

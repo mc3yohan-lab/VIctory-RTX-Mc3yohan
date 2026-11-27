@@ -94,9 +94,33 @@ pub struct HardwareInfo {
     pub commit_free_gb: f64,
     pub logical_cpus: usize,
     pub is_elevated_admin: bool,
+    pub probe_done: bool,
 }
 
 impl HardwareInfo {
+    /// Lectura instantánea (< 0.5 ms) para abrir la ventana sin bloqueos:
+    /// RAM y núcleos por Win32 nativo; GPU (`nvidia-smi`) llega en segundo plano.
+    pub fn probe_fast() -> Self {
+        let (ram_total_gb, ram_free_gb, commit_free_gb) = probe_memory_gb();
+        let logical_cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8);
+        Self {
+            gpu_name: "Detectando tarjeta NVIDIA...".to_owned(),
+            vram_total_mb: 0,
+            vram_used_mb: 0,
+            gpu_util_pct: 0,
+            vram_tier: VramTier::Gb24Plus,
+            is_blackwell: false,
+            ram_total_gb,
+            ram_free_gb,
+            commit_free_gb,
+            logical_cpus,
+            is_elevated_admin: false,
+            probe_done: false,
+        }
+    }
+
     pub fn probe() -> Self {
         let (gpu_name, gpu_util_pct, vram_used_mb, vram_total_mb) = probe_nvidia_smi();
         let vram_tier = VramTier::from_mb(vram_total_mb);
@@ -119,6 +143,7 @@ impl HardwareInfo {
             commit_free_gb,
             logical_cpus,
             is_elevated_admin,
+            probe_done: true,
         }
     }
 
