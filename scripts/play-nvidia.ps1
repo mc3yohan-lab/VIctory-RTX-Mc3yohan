@@ -50,6 +50,7 @@ param(
     [switch]$SkipRtHashes,
     [switch]$SkipRtAggressive,
     [switch]$LaneCore,
+    [switch]$Thin,
     [switch]$NoAmbient,
     [switch]$NoPortConstants,
     [switch]$PortDescriptors,
@@ -299,10 +300,18 @@ if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'
     $settings.VICTORY_LAND_ECHO  = '0'
     $settings.VICTORY_CARD_STEPS = '0'
+    $settings.VICTORY_THIN       = '0'
     $settings.Remove('VICTORY_UPLOAD_AHEAD')
 } else {
-    $settings.VICTORY_THIN         = '1'
-    $settings.VICTORY_THIN_THREADS = '8'
+    # Direct list recording by default on NVIDIA: deferred thin lists (`VICTORY_THIN=1`)
+    # can wash out / blur the 3D scene on RTX 5060 Ti / 5070 Ti (megafork 79f36b3b,
+    # avatarmanz #112/#62). Pass -Thin to opt in for benchmarking.
+    if ($Thin) {
+        $settings.VICTORY_THIN         = '1'
+        $settings.VICTORY_THIN_THREADS = '8'
+    } else {
+        $settings.VICTORY_THIN         = '0'
+    }
     $settings.VICTORY_JOIN_PARTS   = '8'
     if ($LaneCore) {
         $settings.VICTORY_LANE_CORE = '1'
