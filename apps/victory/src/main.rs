@@ -355,6 +355,7 @@ fn apply_nvidia_preset(run_console: Option<Console>) {
     set_default("VICTORY_WAVE_WIDE", "last");
     set_default("VICTORY_NAN_SCRUB", "1");
     set_default("VICTORY_PORT_CBV", "1");
+    set_default("VICTORY_CONSTANT_MARKS", "1");
     if !rt_on {
         set_default("VICTORY_BVH_NO_HIT", "1");
     }
@@ -400,7 +401,9 @@ fn apply_nvidia_preset(run_console: Option<Console>) {
         ("VICTORY_NO_WATCHDOG", "1"),
         ("VICTORY_XMA_REFILL", "1"),
         ("VICTORY_PORT_CONSTANTS", "1"),
-        ("VICTORY_PORT_DESCRIPTORS", "1"),
+        // Renderer Port 2 (`VICTORY_PORT_DESCRIPTORS`) stays opt-in: 6 unpatched
+        // writers (including external CRT/DLL memcpy) miss thousands of live view
+        // records and corrupt one-shot NPC face bakes.
         ("VICTORY_PORT_GUARD", "1"),
         ("VICTORY_PORT_JOURNAL", "1"),
         ("VICTORY_CARD_BUFFERS_MIN_KB", "64"),

@@ -490,8 +490,13 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
 }
 
 /// Whether textures of 64 KiB and less are placed at multiples of 4 KiB in
-/// their block, where the host allows it (`VICTORY_POOL_SMALL=1`; otherwise
-/// at multiples of 64 KiB, as every other texture).
+/// their block, where the host allows it, rather than at multiples of 64 KiB
+/// as every other texture: on any card but an AMD one by default;
+/// `VICTORY_POOL_SMALL=1` or `=0` picks either.
+///
+/// Ported from TaynanGT/Vice-Tay (#45): on an RTX 4090 (Series S, 30 min),
+/// 4 KiB placement held 3.2 GB less PC RAM and 3.4 GB less VRAM than 64 KiB
+/// with no device loss; the two losses below were on an RX 7900 XTX.
 ///
 /// The two device losses of the night of 2026-11-25 with the pool in the
 /// report (runs steps-ab2 and start-3) faulted in the same kind of texture:
@@ -508,7 +513,10 @@ fn small_placement() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_SMALL").is_some_and(|v| v != "0"))
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_POOL_SMALL") {
+        Some(v) => v != "0",
+        None => !crate::host::host().is_some_and(|h| crate::indirect::amd(&h.device)),
+    })
 }
 
 /// Diagnostics: whether the card reads a pooled texture inside the piece it

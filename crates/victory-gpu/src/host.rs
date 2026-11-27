@@ -6737,10 +6737,21 @@ impl HostList {
             }
         }
         // SAFETY: our list.
-        if let Err(e) = unsafe { self.list.Close() } {
-            fail(format_args!(
+        match unsafe { self.list.Close() } {
+            Ok(()) => {}
+            Err(e) if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY => {
+                // Ported from WASDeKeys/victory-gtx1660 (988c9de): free idle
+                // preludes and host lists under RAM pressure and retry once.
+                sweep();
+                if let Err(e) = unsafe { self.list.Close() } {
+                    fail(format_args!(
+                        "a host command list did not close ({e}): a command recorded into it was invalid"
+                    ));
+                }
+            }
+            Err(e) => fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
-            ));
+            )),
         }
     }
 
@@ -10301,18 +10312,16 @@ impl Host {
     /// PC's memory shared with the card (where the system moves what does
     /// not fit on the card).
     pub(crate) fn video_memory(&self) -> Option<[u64; 4]> {
-        let adapter = self.adapter.as_ref()?;
-        let mut own = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
-        let mut shared = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
-        // SAFETY: plain queries that fill our structures.
-        unsafe {
-            adapter
-                .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut own)
-                .ok()?;
-            adapter
-                .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut shared)
-                .ok()?;
-        }
+        let [own, shared] = self.sample_video_memory();
+        let (own, shared) = (own?, shared?);
+        Some([own.Budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
+    }
+
+    /// Sample the local and non-local segments independently for the panel
+    /// (ported from Belobug/VIctory-Belobug-AMD #348).
+    pub(super) fn sample_video_memory(&self) -> [Option<DXGI_QUERY_VIDEO_MEMORY_INFO>; 2] {
+        let groups = self.query_video_memory_groups();
+        let [Some(own), Some(shared)] = groups else { return groups };
         // The card's budget moved by 256 MB or more since the last look:
         // said at once, with what was in use at the last look, so the log
         // has the moment. (It fell from 11,242 MB to some 10,300 MB with
@@ -10333,7 +10342,16 @@ impl Host {
             );
             self.log_video_memory("right after that change");
         }
-        Some([own.Budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
+        groups
+    }
+
+    fn query_video_memory_groups(&self) -> [Option<DXGI_QUERY_VIDEO_MEMORY_INFO>; 2] {
+        [DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL].map(|segment| {
+            let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+            // SAFETY: DXGI writes the result to the live structure.
+            unsafe { self.adapter.as_ref()?.QueryVideoMemoryInfo(0, segment, &mut info) }.ok()?;
+            Some(info)
+        })
     }
 
     /// Both of the system's memory groups for this process, in bytes: for
@@ -10341,18 +10359,8 @@ impl Host {
     /// card, the budget, the use, what could still be reserved and what
     /// is reserved (the layer reserves none).
     pub(crate) fn video_memory_groups(&self) -> Option<[[u64; 4]; 2]> {
-        let adapter = self.adapter.as_ref()?;
-        let mut own = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
-        let mut shared = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
-        // SAFETY: plain queries that fill our structures.
-        unsafe {
-            adapter
-                .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut own)
-                .ok()?;
-            adapter
-                .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut shared)
-                .ok()?;
-        }
+        let [own, shared] = self.query_video_memory_groups();
+        let (own, shared) = (own?, shared?);
         let all = |m: &DXGI_QUERY_VIDEO_MEMORY_INFO| {
             [m.Budget, m.CurrentUsage, m.AvailableForReservation, m.CurrentReservation]
         };

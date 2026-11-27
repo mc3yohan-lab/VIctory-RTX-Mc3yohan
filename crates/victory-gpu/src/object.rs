@@ -71,6 +71,21 @@ pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// Increments the reference count of `this` only while it is still > 0,
+/// returning `false` if the object is already being released (ported from
+/// fxceless/victory-fork #1336).
+pub(crate) fn add_ref_alive(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    // SAFETY: caller pins lookup under the registry lock before release frees it.
+    let refs = &unsafe { &*this }.refs;
+    refs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        (n > 0).then(|| n.saturating_add(1))
+    })
+    .is_ok()
+}
+
 pub(crate) extern "system" fn release(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     let refs = &unsafe { &*this }.refs;

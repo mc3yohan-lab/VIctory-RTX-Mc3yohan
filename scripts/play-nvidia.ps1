@@ -71,10 +71,14 @@ param(
     [int]$WindowsBarMb = -1,
     [int]$MipDrop = -1,
     [int]$WindowKb = 4096,
-    [int]$CardBuffersMinKb = 64,
+    [int]$CardBuffersMinKb = -1,
     [int]$DynamicSlots = 393216,
     [switch]$RecordPipelines,
     [switch]$Panel,
+    [switch]$Kbm,
+    [double]$MouseSens = 1.0,
+    [switch]$MouseInvertY,
+    [string]$AmbientRt = '',
     [ValidateSet('', 'quality', 'balanced', 'performance')][string]$Fsr4K = '',
     [string]$WindowMax = '',
     [switch]$NoLog,
@@ -113,24 +117,28 @@ $autoCardBuffersMb = 0
 $vramTier = '24GB+'
 if ($gpuTotalMb -gt 0 -and $gpuTotalMb -lt 10000) {
     $vramTier = '8GB'
-    if ($WindowsBarMb -lt 0) { $WindowsBarMb = 1536 }
-    if ($MipDrop -lt 0)      { $MipDrop = 2 }
+    if ($WindowsBarMb -lt 0)     { $WindowsBarMb = 1536 }
+    if ($MipDrop -lt 0)          { $MipDrop = 2 }
+    if ($CardBuffersMinKb -lt 0) { $CardBuffersMinKb = 1024 }
     if (-not $SeriesX -and -not $Full1440p -and -not $Full4K -and -not $Fsr4K) {
         $SeriesS = $true
     }
 } elseif ($gpuTotalMb -ge 10000 -and $gpuTotalMb -lt 14000) {
     $vramTier = '12GB'
-    if ($WindowsBarMb -lt 0) { $WindowsBarMb = 2048 }
-    if ($MipDrop -lt 0)      { $MipDrop = 1 }
+    if ($WindowsBarMb -lt 0)     { $WindowsBarMb = 2048 }
+    if ($MipDrop -lt 0)          { $MipDrop = 1 }
+    if ($CardBuffersMinKb -lt 0) { $CardBuffersMinKb = 64 }
     $autoCardBuffersMb = 2560
 } elseif ($gpuTotalMb -ge 14000 -and $gpuTotalMb -lt 20000) {
     $vramTier = '16GB'
-    if ($WindowsBarMb -lt 0) { $WindowsBarMb = 3584 }
-    if ($MipDrop -lt 0)      { $MipDrop = 1 }
+    if ($WindowsBarMb -lt 0)     { $WindowsBarMb = 3584 }
+    if ($MipDrop -lt 0)          { $MipDrop = 1 }
+    if ($CardBuffersMinKb -lt 0) { $CardBuffersMinKb = 64 }
     $autoCardBuffersMb = 4096
 } else {
-    if ($WindowsBarMb -lt 0) { $WindowsBarMb = 4096 }
-    if ($MipDrop -lt 0)      { $MipDrop = 0 }
+    if ($WindowsBarMb -lt 0)     { $WindowsBarMb = 4096 }
+    if ($MipDrop -lt 0)          { $MipDrop = 0 }
+    if ($CardBuffersMinKb -lt 0) { $CardBuffersMinKb = 64 }
 }
 if ($gpuTotalMb -gt 0) {
     Write-Host ("GPU auto-tier: {0} ({1} MiB VRAM) -> {2} (WindowsBarMb={3}, MipDrop={4})" -f $gpuName, $gpuTotalMb, $vramTier, $WindowsBarMb, $MipDrop)
@@ -205,14 +213,18 @@ if (-not $NoPortConstants -and -not $Safe) {
     # Renderer Port 1: in-place 185 MB constants heap (verified 0 forgotten regions, saves ~10,800 fills/frame).
     $settings.VICTORY_PORT_CONSTANTS = '1'
 }
-if ((-not $NoPortDescriptors -or $PortDescriptors) -and -not $Safe) {
-    # Renderer Port 2: 12-byte descriptor header diff + copy_simple mark ordering (99.9993% accuracy, 0.08 misses/frame).
+if ($PortDescriptors -and -not $NoPortDescriptors -and -not $Safe) {
+    # Renderer Port 2: opt-in only (-PortDescriptors). Left off by default because
+    # 6 unpatched writers (including external CRT/DLL memcpy) miss thousands of
+    # live view records and corrupt one-shot NPC face bakes.
     $settings.VICTORY_PORT_DESCRIPTORS = '1'
 }
 if (-not $NoPortCbv -and -not $Safe) {
     # Renderer Port 5: read constant buffers in place as raw bytes (~22,000 fills/frame -> 0, -4.7 ms).
-    # Note: shader cache keys on VICTORY_PORT_CBV=1 (must match `victory shaders` / `victory warm`).
+    # VICTORY_CONSTANT_MARKS=1 keeps texture/UAV/null slots guarded against rawBufferLoad.
+    # Note: shader cache keys on VICTORY_PORT_CBV=1 + VICTORY_CONSTANT_MARKS=1 (must match `victory shaders` / `victory warm`).
     $settings.VICTORY_PORT_CBV = '1'
+    $settings.VICTORY_CONSTANT_MARKS = '1'
 }
 if (-not $NoPortGuard -and -not $Safe) {
     # Renderer Port 6: shared write-guard lock with per-64 KiB claims + parallel refresh planning (-2 ms).
@@ -263,6 +275,20 @@ if ($SweepPerHeap) {
 }
 if ($XmaRefill) {
     $settings.VICTORY_XMA_REFILL = '1'
+}
+if ($Kbm) {
+    # Opt-in GTA V PC-style keyboard + mouse mapping (ported from Belobug #295).
+    # F2 or ` (~) toggles mouse-look and auto-hides the cursor; Esc/P unlocks.
+    $settings.VICTORY_KBM_GTA = '1'
+    if ($MouseSens -gt 0.0 -and $MouseSens -ne 1.0) {
+        $settings.VICTORY_MOUSE_SENS = ('{0:0.###}' -f $MouseSens).Replace(',', '.')
+    }
+    if ($MouseInvertY) {
+        $settings.VICTORY_MOUSE_INVERT_Y = '1'
+    }
+}
+if ($AmbientRt) {
+    $settings.VICTORY_AMBIENT_RT = $AmbientRt
 }
 if ($Fps -gt 0.0) {
     $intervalMs = [math]::Max(1.0, [math]::Min(1000.0, 1000.0 / $Fps))
@@ -415,6 +441,7 @@ $consoleArg = if ($SeriesS) { 'series-s' } else { 'series-x' }
 $mode = if ($Fsr4K) { "Series X 4K PC FSR ($Fsr4K)" } elseif ($SeriesS) { 'Series S 1080p+4K HUD' } elseif ($Full4K) { 'Series X 3840x2160' } elseif ($Full1440p) { 'Series X 2560x1440' } else { 'Series X 1920x1080' }
 if ($Scale -gt 0.0) { $mode += " @ scale $($settings.VICTORY_RENDER_SCALE)" }
 if ($Fps -gt 0.0) { $mode += ", cap ${Fps} FPS" }
+if ($Kbm) { $mode += ", KBM-GTA" }
 Write-Host "Starting VIctory-RTX-Mc3yohan ($Build, $mode) on $gpuName [$vramTier] with $($settings.Count) switches..."
 
 $runArgs = @('run', $Exe, '--console', $consoleArg, '--execute')

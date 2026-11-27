@@ -151,7 +151,11 @@ fn build() -> [u8; 32] {
         hash.update(&value.to_le_bytes());
     }
     if victory_shader::emit::constants_raw() && victory_shader::emit::raw_views() == 0 {
-        hash.update(b"cbv-inplace");
+        hash.update(if victory_shader::emit::constant_marks() {
+            b"cbv-inplace-marked".as_slice()
+        } else {
+            b"cbv-inplace-guarded".as_slice()
+        });
     }
     *hash.finalize().as_bytes()
 }

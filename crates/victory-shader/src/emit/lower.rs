@@ -6992,25 +6992,22 @@ impl<'a> Lower<'a> {
         // buffer; only the load that fits the slot runs.
         // Under Port 5 on NVIDIA 1M heaps (`constants_raw() && raw_views() == 0`),
         // both buffer SRVs and constant buffers are raw SRVs in place at the exact
-        // same slot `(11, 0)`: collapse the two-branch `SLOT_STRIDES` dispatch.
+        // same slot `(11, 0)`: collapse the two-branch `SLOT_STRIDES` dispatch
+        // ONLY when `constant_marks()` is on so non-buffer slots (textures, UAVs,
+        // nulls) stay guarded and never execute `rawBufferLoad` on NVIDIA.
         if kind.is_none() && super::shader::constants_raw() && super::shader::raw_views() == 0 {
-            if let Some(stride) = self.slot_stride(src)? {
+            if let Some(stride) = self.slot_stride(src)?
+                && let Some(is_constant) = self.slot_is_constant(src)?
+            {
                 let zero = self.s.m.i32(0);
-                if let Some(is_constant) = self.slot_is_constant(src)? {
-                    let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
-                    let valid = self.s.m.bin(self.cur, Bin::Or, is_buffer, is_constant);
-                    let at = self.begin_guarded(Some(valid));
-                    let h = self.handle(site, src, false, (11, 0))?;
-                    let raw: Vec<(V, V)> = self.raw_dwords(h, addr, count).into_iter().map(|x| (x, zero)).collect();
-                    let raw = self.end_guarded(at, &raw);
-                    for (k, x) in raw.into_iter().enumerate() {
-                        self.write(inst, Reg::S(code + k as u8), x, None);
-                    }
-                } else {
-                    let h = self.handle(site, src, false, (11, 0))?;
-                    for (k, x) in self.raw_dwords(h, addr, count).into_iter().enumerate() {
-                        self.write(inst, Reg::S(code + k as u8), x, None);
-                    }
+                let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
+                let valid = self.s.m.bin(self.cur, Bin::Or, is_buffer, is_constant);
+                let at = self.begin_guarded(Some(valid));
+                let h = self.handle(site, src, false, (11, 0))?;
+                let raw: Vec<(V, V)> = self.raw_dwords(h, addr, count).into_iter().map(|x| (x, zero)).collect();
+                let raw = self.end_guarded(at, &raw);
+                for (k, x) in raw.into_iter().enumerate() {
+                    self.write(inst, Reg::S(code + k as u8), x, None);
                 }
                 return Ok(());
             }

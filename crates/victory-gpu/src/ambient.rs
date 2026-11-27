@@ -101,12 +101,62 @@ fn parse(set: &str) -> Set {
 
 fn set() -> Set {
     static SET: OnceLock<Set> = OnceLock::new();
-    *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
+    *SET.get_or_init(|| match parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()) {
+        // With the RT band asked for and no share, the band's level.
+        Set::Off => rt_band().map_or(Set::Off, |b| Set::Estimate(b.level)),
+        set => set,
+    })
 }
 
-/// Whether the stand-in is on: set, and the title's rays find nothing.
+/// With ray tracing (`VICTORY_AMBIENT_RT=<least>,<most>[,<level>]`; unset:
+/// off, the title's own light whenever the builder runs): the diffuse light
+/// the title's resolve leaves is kept between `least` and `most` times the
+/// estimate (ported from avatarmanz/VIctory-7900XTX `77137b9`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct Band {
+    least: f32,
+    most: f32,
+    level: f32,
+}
+
+pub(crate) fn rt_band() -> Option<Band> {
+    static SET: OnceLock<Option<Band>> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let band = parse_band(&std::env::var("VICTORY_AMBIENT_RT").ok()?)?;
+        tracing::info!(
+            least = band.least,
+            most = band.most,
+            level = band.level,
+            "the stand-in keeps the traced indirect light in a band (VICTORY_AMBIENT_RT)"
+        );
+        Some(band)
+    })
+}
+
+fn parse_band(set: &str) -> Option<Band> {
+    let mut parts = set
+        .split(',')
+        .map(|p| p.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0));
+    let least = parts.next().flatten()?;
+    let most = parts.next().flatten().unwrap_or(4.0).max(least).max(1e-3);
+    let level = parts.next().flatten().filter(|v| *v > 0.0).unwrap_or(0.8);
+    Some(Band { least, most, level })
+}
+
+/// Whether the stand-in is on: set, and the title's rays find nothing (or
+/// the band is asked for with them).
 pub(crate) fn on() -> bool {
-    set() != Set::Off && !crate::pipeline::builder_runs()
+    set() != Set::Off && (rt_band().is_some() || !crate::pipeline::builder_runs())
+}
+
+/// The title's leftover light is kept between these multiples of the
+/// estimate: with rays, the band's; without, at least the estimate and at
+/// most `most()`.
+fn bounds() -> (f32, f32) {
+    match rt_band() {
+        Some(b) if crate::pipeline::builder_runs() => (b.least, b.most),
+        _ => (1.0, most()),
+    }
 }
 
 /// The most the air scatters, as a multiple of the light around
@@ -220,24 +270,20 @@ fn refl() -> f32 {
     })
 }
 
-/// Minimum warm indoor indirect light floor (`VICTORY_AMBIENT_FLOOR`, default
-/// `0.06`; `0` or `off` disables). Prevents dim interiors and downward camera
-/// angles (where no sky or bright lamps fill the viewport) from collapsing into
-/// a zero-radiance feedback loop while leaving sunlit and well-lit scenes
-/// untouched.
+/// Optional minimum pre-exposure HDR indoor indirect light floor
+/// (`VICTORY_AMBIENT_FLOOR`, default `0` / off).
 fn floor() -> f32 {
     static SET: OnceLock<f32> = OnceLock::new();
     *SET.get_or_init(|| {
         match std::env::var("VICTORY_AMBIENT_FLOOR").ok().as_deref().map(str::trim) {
-            Some("0" | "off") => 0.0,
-            Some(s) => s.parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(0.06),
-            None => 0.06,
+            Some("0" | "off") | None => 0.0,
+            Some(s) => s.parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(0.0),
         }
     })
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=17, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
+#define RS "RootConstants(num32BitConstants=18, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -248,7 +294,7 @@ cbuffer Set : register(b0) {
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; uint probe;
     float jump; float fresh; float dt; float refl;
-    float floor_level;
+    float floor_level; float least;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -488,7 +534,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
         float has = dot(was, LUMA);
         was *= min(1.0, top / max(has, 1e-9));
     }
-    float3 written = max(was, found);
+    float3 written = max(was, found * least);
     light[p] = pack(written);
     if (probe != 0 && (at.x & 15) == 0 && (at.y & 15) == 0) {
         uint ignored;
@@ -667,15 +713,16 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.points);
     list.keep(&pass.stats);
     let [strength, radius] = shade();
+    let (least, upper) = bounds();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 17];
+    let mut words = [0u32; 18];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
     words[6] = views.size[0];
     words[7] = views.size[1];
     words[8] = follow(role).to_bits();
-    words[9] = most().to_bits();
+    words[9] = upper.to_bits();
     words[10] = air().to_bits();
     words[11] = u32::from(crate::lightprobe::on());
     words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
@@ -683,6 +730,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[14] = (frame_ms(role) / 1000.0).to_bits();
     words[15] = refl().to_bits();
     words[16] = floor().to_bits();
+    words[17] = least.to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -690,7 +738,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l, None);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 17, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 18, words.as_ptr().cast(), 0);
         if let Some(depth) = views.depth {
             l.SetComputeRootDescriptorTable(1, depth);
         }

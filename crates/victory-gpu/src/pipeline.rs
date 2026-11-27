@@ -528,46 +528,26 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
 }
 
 /// Name prefixes for `VICTORY_SKIP_PREFIXES` (comma-separated ASCII substrings
-/// matched once at shader creation). When `VICTORY_BVH_NO_HIT=1` (and
-/// `VICTORY_SKIP_PREFIXES` is not set to `none`), Tier-A pure-BVH shadow and
-/// raytraced-collision passes that always miss under no-hit are auto-skipped.
+/// matched once at shader creation). Strictly opt-in: auto-skipping shadow
+/// prefixes under `VICTORY_BVH_NO_HIT=1` dropped active mixed / screen-space
+/// shadow shaders (`CS_RaytraceShadows_Mixed_*`, `CS_TraceShadowRays_*`) and
+/// left shadow mask UAVs stuck at zero (pitch-black interiors).
 /// Shaders with an `ambient::Role` are always immune.
 #[cfg(windows)]
 fn skip_prefixes() -> &'static [Vec<u8>] {
     static PREFIXES: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
     PREFIXES.get_or_init(|| {
-        const TIER_A_NO_HIT: &[&str] = &[
-            "CS_RTDistantShadow",
-            "CS_RTShadowTrace32",
-            "CS_SetRTShadowsIndirectArgs",
-            "CS_GenerateShadowMasks_Raytraced",
-            "CS_RaytraceShadows_",
-            "CS_TraceShadowRays_",
-            "CS_LaserLightShadowRaytracing",
-            "CS_CollisionRaytraced",
-            "CS_ShadowTileBalanceRTCost",
-        ];
         let env = std::env::var("VICTORY_SKIP_PREFIXES").unwrap_or_default();
         let trimmed = env.trim();
-        if trimmed.eq_ignore_ascii_case("none") || trimmed == "0" {
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") || trimmed == "0" {
             return Vec::new();
         }
-        let mut out: Vec<Vec<u8>> = trimmed
+        let out: Vec<Vec<u8>> = trimmed
             .split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none"))
             .map(|s| s.as_bytes().to_vec())
             .collect();
-        let no_hit = std::env::var_os("VICTORY_BVH_NO_HIT").is_some_and(|v| v == "1")
-            && !std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if no_hit {
-            for p in TIER_A_NO_HIT {
-                let b = p.as_bytes();
-                if !out.iter().any(|e| e.as_slice() == b) {
-                    out.push(b.to_vec());
-                }
-            }
-        }
         if !out.is_empty() {
             tracing::info!(count = out.len(), "shader name prefixes skipped (VICTORY_SKIP_PREFIXES)");
         }

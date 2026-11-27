@@ -141,6 +141,9 @@ pub(crate) struct HostHeap {
     /// (`victory_shader::emit::raw_views`; 0: there are none), and which of
     /// them are not null.
     raw: u32,
+    /// Unique heap identity (`NEXT_ID`): dynamic slots are returned only to
+    /// the heap that allocated them (ported from fxceless/victory-fork #1324).
+    id: u64,
     twins: Vec<std::sync::atomic::AtomicBool>,
     /// When each slot was written last (with `crate::book`; else empty).
     #[cfg(feature = "diagnostics")]
@@ -1805,13 +1808,11 @@ impl HostHeap {
             .then(|| {
                 // The strides, then the views' title addresses
                 // (`victory_shader::emit::VIEW_ADDRESSES`).
+                // Use cached-coherent upload memory (24 MiB) instead of
+                // un-fenced write-combined GPU_UPLOAD VRAM so volatile CPU
+                // updates are immediately visible to bindless shaders.
                 let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_BYTES);
-                // Prefer ReBAR VRAM (`D3D12_HEAP_TYPE_GPU_UPLOAD`) over PCIe L0 System RAM:
-                // the CPU only writes this table on descriptor updates, while every bindless
-                // shader reads it on the GPU.
-                let (buffer, data) = host
-                    .mapped_card_buffer(bytes, false)
-                    .or_else(|| host.upload_buffer(bytes))?;
+                let (buffer, data) = host.upload_buffer(bytes)?;
                 // SAFETY: the buffer's whole mapping; a live buffer.
                 let gpu = unsafe {
                     std::ptr::write_bytes(data, 0, bytes as usize);
@@ -1822,7 +1823,9 @@ impl HostHeap {
             })
             .flatten();
         let queued = std::sync::Arc::new(Queued::new(if sampler { 0 } else { count }));
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let h = HostHeap {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             buffer_sweep: Mutex::default(),
             buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             heap,
@@ -2987,7 +2990,9 @@ impl HostHeap {
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(entry) };
             write_view_address(*data, index, view);
         }
-        let was = if stride.is_some() {
+        let track_buf = stride.is_some()
+            || (crate::port_cbv::on() && matches!(view, Some(View::Constant(..))));
+        let was = if track_buf {
             self.buffers.put(index);
             true
         } else {
@@ -2999,17 +3004,23 @@ impl HostHeap {
         stale
     }
 
+    /// This heap's unique identity: dynamic slots are returned only to it,
+    /// never to a later heap allocated at the same address (fxceless #1324).
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     #[cfg(test)]
     pub(crate) fn release(&self, first: u32, n: u32) {
-        self.release_many(&[(first, n)]);
+        self.release_many(self.id, &[(first, n)]);
     }
 
     /// Gives back multiple `(first, n)` dynamic slot ranges (from [`dynamic`])
-    /// under one lock.
+    /// under one lock, only if `id` matches this heap's identity.
     ///
     /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release_many(&self, ranges: &[(u32, u32)]) {
-        if ranges.is_empty() || self.dynamic == 0 {
+    pub(crate) fn release_many(&self, id: u64, ranges: &[(u32, u32)]) {
+        if id != self.id || ranges.is_empty() || self.dynamic == 0 {
             return;
         }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
@@ -3983,6 +3994,9 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
 /// address and length.
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     let (base, words): (u64, &[u32; 10]) = match view {
+        View::Constant(address, size) if crate::port_cbv::on() => {
+            return Some((*address, u64::from(*size)));
+        }
         View::Shader(r, Some(desc)) => (
             crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64,
             desc,

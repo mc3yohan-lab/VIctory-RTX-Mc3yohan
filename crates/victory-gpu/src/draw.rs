@@ -439,6 +439,69 @@ const WINDOW_MOST: u64 = 64;
 /// (`crate::indirect::bound_ahead`); a tail record that looks real is
 /// charged what it asks, a few thousand of 2^27. And arguments the title's CPU side changes are seen as
 /// before, at the next submission.
+/// Whether indirect executions whose arguments or count lie in title memory
+/// the card reads in place (renderer port 1, `VICTORY_PORT_CONSTANTS=1`) are
+/// clamped alone, right before they run (`VICTORY_PORT_CONSTANTS_ORDER`; `=0`:
+/// in batches and windows as any other). Ported from avatarmanz/VIctory-7900XTX
+/// (`7ab13ed`): eliminates tree/palm/wall dropout and lamp-lit room flicker.
+fn in_place_order() -> bool {
+    crate::toggled!("VICTORY_PORT_CONSTANTS_ORDER")
+}
+
+/// With [`in_place_order`]: such executions never in a batch (unset or
+/// `VICTORY_PORT_CONSTANTS_ORDER_ALONE=1`; `=0`: in a batch opened after the
+/// last shader that may write buffers).
+fn in_place_alone() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PORT_CONSTANTS_ORDER_ALONE").is_none_or(|v| v != "0"))
+}
+
+static IN_PLACE_INDIRECT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static IN_PLACE_RANGES: std::sync::Mutex<std::collections::BTreeMap<u64, [u64; 3]>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn in_place_indirect(arguments: u64, kind: u32) {
+    IN_PLACE_INDIRECT[0].fetch_add(1, Ordering::Relaxed);
+    IN_PLACE_INDIRECT[1].fetch_add(u64::from(in_place_order()), Ordering::Relaxed);
+    let slot = match kind {
+        2 => 1,
+        10 => 2,
+        _ => 0,
+    };
+    let mut ranges = IN_PLACE_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+    ranges.entry(arguments >> 20).or_default()[slot] += 1;
+}
+
+pub(crate) fn in_place_indirect_line(frames: f64) {
+    let [all, alone] = [0, 1].map(|i| IN_PLACE_INDIRECT[i].swap(0, Ordering::Relaxed));
+    if all == 0 {
+        return;
+    }
+    let ranges = std::mem::take(&mut *IN_PLACE_RANGES.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut by: Vec<(u64, [u64; 3])> = ranges.into_iter().collect();
+    by.sort_by_key(|(_, n)| std::cmp::Reverse(n.iter().sum::<u64>()));
+    let top: Vec<String> = by
+        .iter()
+        .take(6)
+        .map(|(mb, n)| {
+            format!(
+                "{:#x}+1MiB: {:.0} draws {:.0} dispatches {:.0} mesh",
+                mb << 20,
+                n[0] as f64 / frames,
+                n[1] as f64 / frames,
+                n[2] as f64 / frames
+            )
+        })
+        .collect();
+    tracing::info!(
+        "renderer port 1: indirect executions with arguments or count in place per frame: {:.0}, of them {:.0} clamped after every shader write before them (VICTORY_PORT_CONSTANTS_ORDER); from {} ranges of 1 MiB, the busiest: {}",
+        all as f64 / frames,
+        alone as f64 / frames,
+        by.len(),
+        top.join("; ")
+    );
+}
+
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
@@ -575,12 +638,13 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list has run, is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
-    /// Current per-list 64-slot slab `(title heap, next_slot, remaining)`
+    /// The dynamic slots the list holds: title heap, that heap's identity
+    /// (`HostHeap::id`), first, count; given back when the list has run, is
+    /// reset or released (ported from fxceless/victory-fork #1324).
+    dynamic: Vec<(usize, u64, u32, u32)>,
+    /// Current per-list 64-slot slab `(title heap, heap id, next_slot, remaining)`
     /// for small dynamic table sub-allocations (`n <= 32`).
-    dynamic_slab: Option<(usize, u32, u32)>,
+    dynamic_slab: Option<(usize, u64, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -608,17 +672,17 @@ impl State {
             return;
         }
         let mut ranges: Vec<(u32, u32)> = Vec::with_capacity(self.dynamic.len());
-        let mut current_heap = self.dynamic[0].0;
-        for (heap, first, n) in self.dynamic.drain(..) {
-            if heap != current_heap {
-                crate::descriptor::release_dynamic_many(current_heap, &ranges);
+        let mut current = (self.dynamic[0].0, self.dynamic[0].1);
+        for (heap, id, first, n) in self.dynamic.drain(..) {
+            if (heap, id) != current {
+                crate::descriptor::release_dynamic_many(current.0, current.1, &ranges);
                 ranges.clear();
-                current_heap = heap;
+                current = (heap, id);
             }
             ranges.push((first, n));
         }
         if !ranges.is_empty() {
-            crate::descriptor::release_dynamic_many(current_heap, &ranges);
+            crate::descriptor::release_dynamic_many(current.0, current.1, &ranges);
         }
     }
 
@@ -635,22 +699,24 @@ impl State {
         if n == 0 {
             return None;
         }
+        let heap_id = host.id();
         if n <= 32 && !self.dynamic.is_empty() {
-            if let Some((slab_heap, cur, rem)) = self.dynamic_slab
+            if let Some((slab_heap, slab_id, cur, rem)) = self.dynamic_slab
                 && slab_heap == heap_key
+                && slab_id == heap_id
                 && rem >= n
             {
-                self.dynamic_slab = (rem > n).then_some((slab_heap, cur + n, rem - n));
+                self.dynamic_slab = (rem > n).then_some((slab_heap, slab_id, cur + n, rem - n));
                 return Some(cur);
             }
             if let Some(base) = host.dynamic_try(SLAB) {
-                self.dynamic.push((heap_key, base, SLAB));
-                self.dynamic_slab = Some((heap_key, base + n, SLAB - n));
+                self.dynamic.push((heap_key, heap_id, base, SLAB));
+                self.dynamic_slab = Some((heap_key, heap_id, base + n, SLAB - n));
                 return Some(base);
             }
         }
         let first = host.dynamic(n)?;
-        self.dynamic.push((heap_key, first, n));
+        self.dynamic.push((heap_key, heap_id, first, n));
         Some(first)
     }
 
@@ -4711,8 +4777,23 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        // Renderer port 1: arguments (or their count) in the title's memory
+        // read in place ([`in_place_order`]): clamped alone, right before
+        // their execution, after every earlier shader write.
+        let in_place = args.in_place() || counter.as_ref().is_some_and(|(s, _)| s.in_place());
+        if in_place {
+            in_place_indirect(arguments, kind);
+        }
+        let ordered = in_place && in_place_order();
+        let alone = ordered && in_place_alone();
+        if ordered {
+            if alone || self.batch.as_ref().is_some_and(|b| b.wrote) {
+                self.batch = None;
+            }
+            self.window = None;
+        }
         // One record without a count: clamped in a batch (`batches`).
-        let batch = if batches() > 0 && max == 1 && count.is_none() {
+        let batch = if !alone && batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
             self.batched(list, &args, arguments, kind)
         } else {
@@ -4728,6 +4809,7 @@ impl State {
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
         let windowed = windows()
+            && !ordered
             && kind != DISPATCH
             && max == 1
             && count.is_none()
@@ -5097,7 +5179,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+                .is_some_and(|source| crate::texture::alias(list, *resource as This, source.get()));
             if !aliased
                 && let Some(t) = crate::resource::host_copy(*resource as This)
                 && t.flags() & 0x7 == 0

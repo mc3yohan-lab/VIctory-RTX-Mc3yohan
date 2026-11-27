@@ -49,10 +49,15 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 pub const SLOT_STRIDE_CONSTANT: u32 = VIEW_STRIDE_BITS;
 
 /// Whether [`SLOT_STRIDE_CONSTANT`] is in use: read once, by the host and
-/// the translator alike.
+/// the translator alike. Defaults to on when renderer port 5 (`constants_raw`)
+/// is active so bindless `rawBufferLoad` never executes on texture/UAV/null
+/// slots when reading constant buffers as raw SRVs.
 pub fn constant_marks() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CONSTANT_MARKS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_CONSTANT_MARKS") {
+        Some(v) => v == "1",
+        None => constants_raw(),
+    })
 }
 
 /// Where the [`SLOT_STRIDES`] buffer's second table begins (bytes): two
