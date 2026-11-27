@@ -98,6 +98,7 @@ mod rect;
 mod sampler;
 mod shader;
 mod threading;
+mod water_tile_append;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
@@ -501,7 +502,7 @@ fn prepare(container: &[u8]) -> Result<Prepared<'_>, ShaderError> {
         .part(FourCC::DXIL)
         .or(c.part(FourCC::ACCC))
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    let mut native = crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {
             matches!(
@@ -513,6 +514,9 @@ fn prepare(container: &[u8]) -> Result<Prepared<'_>, ShaderError> {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
+    if lower::host_max_wave() == 32 && c.digest == water_tile_append::CONTAINER_ID {
+        water_tile_append::rewrite(&mut native)?;
+    }
     let p = crate::spill::build(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').

@@ -2021,7 +2021,16 @@ pub fn host_native16() -> bool {
 /// Whether programs with console lanes in groups of several host waves take their console
 /// threads from a group counter (`ticket`). `VICTORY_THREAD_TICKET=0`: as before.
 fn ticket_on() -> bool {
+    #[cfg(all(test, windows))]
+    if let Some(on) = TEST_THREAD_TICKET.get() {
+        return on;
+    }
     std::env::var_os("VICTORY_THREAD_TICKET").is_none_or(|v| v != "0")
+}
+
+#[cfg(all(test, windows))]
+thread_local! {
+    pub(super) static TEST_THREAD_TICKET: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 static HOST_RDNA: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -2147,6 +2156,16 @@ pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
         Operand::Scalar { code, .. } if code != NULL => i.read(Reg::S(code)).is_some_and(is_mask),
         _ => false,
     })
+}
+
+/// A select whose scalar operand is a numeric mask.
+fn selects_on_mask_data(st: &Structured, i: &Inst) -> bool {
+    let Fields::Valu(v) = &i.fields else {
+        return false;
+    };
+    i.name() == "v_cndmask_b32"
+        && matches!(v.src.get(2), Some(&Operand::Scalar { code, .. })
+            if i.read(Reg::S(code)).is_some_and(|mask| !st.masks.contains_key(&mask)))
 }
 
 /// The parameters packing 16-bit rows two per dword and where each lays
@@ -2439,6 +2458,8 @@ impl<'a> Lower<'a> {
                         !(quad_layout_matches && wave_invariant_dpp(d))
                     }))
                     || reads_mask_as_data(x.st, i)
+                    // Wave64's constant-mask path uses the flat guest lane index.
+                    || !x.native.wave64 && selects_on_mask_data(x.st, i)
             }) || lane_constant_masks(p, x.st)
                 // (a branch the wave takes together asks the wave)
                 || !x.st.wide.is_empty();
@@ -7338,22 +7359,23 @@ impl<'a> Lower<'a> {
         // same slot `(11, 0)`: collapse the two-branch `SLOT_STRIDES` dispatch
         // ONLY when `constant_marks()` is on so non-buffer slots (textures, UAVs,
         // nulls) stay guarded and never execute `rawBufferLoad` on NVIDIA.
-        if kind.is_none() && super::shader::constants_raw() && super::shader::raw_views() == 0 {
-            if let Some(stride) = self.slot_stride(src)?
-                && let Some(is_constant) = self.slot_is_constant(src)?
-            {
-                let zero = self.s.m.i32(0);
-                let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
-                let valid = self.s.m.bin(self.cur, Bin::Or, is_buffer, is_constant);
-                let at = self.begin_guarded(Some(valid));
-                let h = self.handle(site, src, false, (11, 0))?;
-                let raw: Vec<(V, V)> = self.raw_dwords(h, addr, count).into_iter().map(|x| (x, zero)).collect();
-                let raw = self.end_guarded(at, &raw);
-                for (k, x) in raw.into_iter().enumerate() {
-                    self.write(inst, Reg::S(code + k as u8), x, None);
-                }
-                return Ok(());
+        if kind.is_none()
+            && super::shader::constants_raw()
+            && super::shader::raw_views() == 0
+            && let Some(stride) = self.slot_stride(src)?
+            && let Some(is_constant) = self.slot_is_constant(src)?
+        {
+            let zero = self.s.m.i32(0);
+            let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
+            let valid = self.s.m.bin(self.cur, Bin::Or, is_buffer, is_constant);
+            let at = self.begin_guarded(Some(valid));
+            let h = self.handle(site, src, false, (11, 0))?;
+            let raw: Vec<(V, V)> = self.raw_dwords(h, addr, count).into_iter().map(|x| (x, zero)).collect();
+            let raw = self.end_guarded(at, &raw);
+            for (k, x) in raw.into_iter().enumerate() {
+                self.write(inst, Reg::S(code + k as u8), x, None);
             }
+            return Ok(());
         }
         let picked = match kind {
             None => self.slot_stride(src)?,
