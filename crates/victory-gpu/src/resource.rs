@@ -125,6 +125,17 @@ pub(crate) struct AllocationInfo {
     alignment: u64,
 }
 
+#[cfg(test)]
+pub(crate) fn readback_test_descriptions() -> (HeapProperties, ResourceDesc) {
+    (
+        HeapProperties { kind: 1, cpu_pages: 0, pool: 0, creation_nodes: 0, visible_nodes: 0 },
+        ResourceDesc {
+            dimension: 3, alignment: 0, width: 256, height: 256, depth_or_array_size: 1,
+            mip_levels: 1, format: 41, sample_count: 1, sample_quality: 0, layout: 0, flags: 4,
+        },
+    )
+}
+
 const _: () = assert!(size_of::<HeapProperties>() == 20);
 const _: () = assert!(size_of::<HeapDesc>() == 48);
 const _: () = assert!(size_of::<ResourceDesc>() == 56);
@@ -3104,20 +3115,21 @@ static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// The placed textures asked for with filler words set, as asked
-/// (address and description): for [`PLACED_TWINS`].
-#[cfg(windows)]
+/// (address and description): for [`PLACED_TWINS`]. Diagnostics builds only
+/// (ported from trustno1-coder/VIctory-NVIDIA PR #13): avoids a second mutex,
+/// BTreeSet, and per-call scan in release builds.
+#[cfg(all(windows, feature = "diagnostics"))]
 static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, [u32; 14])>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 /// Placed textures asked for a second time with other filler words in
 /// their description: each was a second resource and host copy before the
-/// filler was left out of the key ([`texture_at`]).
-#[cfg(windows)]
+/// filler was left out of the key ([`texture_at`]). Diagnostics builds only.
+#[cfg(all(windows, feature = "diagnostics"))]
 static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// See [`PLACED_TWINS`].
-#[cfg(windows)]
-#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+#[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn placed_filler_twins() -> u64 {
     PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -3198,6 +3210,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     // that fills at world entry. They are not part of what a texture is.
     // `VICTORY_PLACED_FILLER=1`: kept in the key, as before.
     static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(feature = "diagnostics")]
     let raw = *desc;
     let mut key = *desc;
     if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
@@ -3207,7 +3220,8 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     let desc = &key;
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // How many resources the filler alone would have added (a count for
-    // the log: `placed_filler_twins`).
+    // the log: `placed_filler_twins`). Diagnostics builds only.
+    #[cfg(feature = "diagnostics")]
     if raw != key {
         let mut seen = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert((address, raw)) {

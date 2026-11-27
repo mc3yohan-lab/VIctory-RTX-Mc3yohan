@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -53,6 +53,9 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// Whether `pending` holds any ranges, read lock-free; set and cleared
+    /// under `pending`'s lock (XaviFortes/VIctory-RDNA fdfb306d).
+    has_pending: AtomicBool,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -828,8 +831,11 @@ pub(crate) fn send_copied(dst: usize, len: usize) {
         if from >= to {
             continue;
         }
-        let busy: Vec<(usize, usize)> =
-            shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().filter(|&(a, b)| a < to && b > from).collect();
+        let busy: Vec<(usize, usize)> = if !shadow.has_pending.load(Ordering::Acquire) {
+            Vec::new()
+        } else {
+            shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().filter(|&(a, b)| a < to && b > from).collect()
+        };
         for (a, b) in outside(from, to, busy) {
             shadow.copy(a, b);
         }
@@ -1355,6 +1361,7 @@ mod relay_tests {
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
+/// Kept sorted by capacity, largest first ([`pool_take`], [`pool_put`]).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
 /// An empty buffer with room for `n` bytes, from the pool if it has one
@@ -1363,19 +1370,24 @@ static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 /// reserved (1.4 GB in run 24).
 fn pooled(n: usize) -> Vec<u8> {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let most = n.saturating_mul(4).max(1 << 20);
-    let fit = pool
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.capacity() >= n && v.capacity() <= most)
-        .min_by_key(|(_, v)| v.capacity())
-        .map(|(i, _)| i);
-    let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
-    };
+    let mut v = pool_take(&mut pool, n).unwrap_or_else(|| Vec::with_capacity(n));
     v.clear();
     v
+}
+
+/// Of `pool` (sorted, largest first): the smallest buffer with room for `n`
+/// bytes and no more than four times that (or 1 MiB), taken out; the pool
+/// stays sorted. Binary search instead of linear scan (Marvisak #3384).
+fn pool_take(pool: &mut Vec<Vec<u8>>, n: usize) -> Option<Vec<u8>> {
+    let most = n.saturating_mul(4).max(1 << 20);
+    let i = pool.partition_point(|v| v.capacity() >= n).checked_sub(1)?;
+    (pool[i].capacity() <= most).then(|| pool.remove(i))
+}
+
+/// Inserts `v` into `pool` keeping it sorted largest-first.
+fn pool_put(pool: &mut Vec<Vec<u8>>, v: Vec<u8>) {
+    let at = pool.partition_point(|b| b.capacity() >= v.capacity());
+    pool.insert(at, v);
 }
 
 /// How many snapshot buffers are kept (`VICTORY_SNAPSHOT_POOL`; `8`: as
@@ -1398,8 +1410,7 @@ fn snapshots_kept() -> usize {
 fn give_back(v: Vec<u8>) {
     const KEPT: usize = 512 << 20;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+    pool_put(&mut pool, v);
     let (mut kept, mut total) = (0, 0usize);
     for v in pool.iter().take(snapshots_kept()) {
         total = total.saturating_add(v.capacity());
@@ -1412,6 +1423,53 @@ fn give_back(v: Vec<u8>) {
     let gone = pool.split_off(kept);
     drop(pool);
     drop(gone);
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::{pool_put, pool_take};
+
+    fn take_scanning(pool: &mut Vec<Vec<u8>>, n: usize) -> Option<Vec<u8>> {
+        let most = n.saturating_mul(4).max(1 << 20);
+        let fit = pool
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.capacity() >= n && v.capacity() <= most)
+            .min_by_key(|(_, v)| v.capacity())
+            .map(|(i, _)| i)?;
+        Some(pool.swap_remove(fit))
+    }
+
+    #[test]
+    fn the_pool_stays_sorted_and_gives_what_the_scan_gave() {
+        let (mut sorted, mut scanned): (Vec<Vec<u8>>, Vec<Vec<u8>>) = (Vec::new(), Vec::new());
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % n) as usize
+        };
+        let size = |k: usize| 4096usize << (k % 10);
+        for _ in 0..4000 {
+            if next(3) == 0 {
+                let n = size(next(10)) + next(4096);
+                let (a, b) = (pool_take(&mut sorted, n), take_scanning(&mut scanned, n));
+                assert_eq!(a.as_ref().map(Vec::capacity), b.as_ref().map(Vec::capacity), "asked for {n}");
+            } else {
+                let n = size(next(10));
+                pool_put(&mut sorted, Vec::with_capacity(n));
+                scanned.push(Vec::with_capacity(n));
+                scanned.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+                sorted.truncate(64);
+                scanned.truncate(64);
+            }
+            assert!(sorted.windows(2).all(|w| w[0].capacity() >= w[1].capacity()), "sorted");
+            let mut caps: Vec<usize> = scanned.iter().map(Vec::capacity).collect();
+            caps.sort_unstable_by(|a, b| b.cmp(a));
+            assert_eq!(sorted.iter().map(Vec::capacity).collect::<Vec<_>>(), caps, "the same buffers kept");
+        }
+    }
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -3285,6 +3343,7 @@ impl Shadow {
             ranged: Mutex::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            has_pending: AtomicBool::new(false),
             flights: Mutex::default(),
             before: Mutex::default(),
             merging: RwLock::default(),
@@ -3363,6 +3422,7 @@ impl Shadow {
         // lists).
         if self.card.is_some() {
             pending.push(range);
+            self.has_pending.store(true, Ordering::Release);
             return;
         }
         // The parts no declared range holds yet: their bytes are taken now,
@@ -3387,6 +3447,7 @@ impl Shadow {
             parts = rest;
         }
         pending.push(range);
+        self.has_pending.store(true, Ordering::Release);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
@@ -3637,7 +3698,9 @@ impl Shadow {
                 return to;
             }
             let at = from + (to - from) / threads * i;
-            (at - (start + at) % PIECE).max(from)
+            // (saturating: near the copy's start, the piece `at` lies in may
+            // begin before the copy does)
+            at.saturating_sub((start + at) % PIECE).max(from)
         };
         let scan = &scan;
         std::thread::scope(|s| {
@@ -3675,6 +3738,9 @@ impl Shadow {
             pending.retain(|r| free.binary_search(r).is_err());
         } else {
             pending.retain(|r| !ranges.contains(r));
+        }
+        if pending.is_empty() {
+            self.has_pending.store(false, Ordering::Release);
         }
         if !pending.is_empty() || self.card.is_some() {
             return;
@@ -3733,13 +3799,29 @@ impl Shadow {
     /// Whether shaders of a submission not yet copied back may be writing
     /// the copy.
     pub(crate) fn writes_pending(&self) -> bool {
-        !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        self.has_pending.load(Ordering::Acquire)
     }
 
     /// Whether one of those submissions may be writing in title memory
     /// `[from, to)`.
     pub(crate) fn writes_pending_in(&self, from: usize, to: usize) -> bool {
-        self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+        self.has_pending.load(Ordering::Acquire)
+            && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+    }
+
+    /// The ranges of `pending` that meet `[from, to)`, cut to it; lock-free
+    /// when nothing is pending.
+    fn pending_in(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        if !self.has_pending.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|&&(a, e)| a < to && e > from)
+            .map(|&(a, e)| (a.max(from), e.min(to)))
+            .collect()
     }
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would leave
@@ -3759,14 +3841,7 @@ impl Shadow {
         if from >= to {
             return false;
         }
-        let busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|&&(a, e)| a < to && e > from)
-            .map(|&(a, e)| (a.max(from), e.min(to)))
-            .collect();
+        let busy: Vec<(usize, usize)> = self.pending_in(from, to);
         if busy.is_empty() {
             return false;
         }
@@ -3803,14 +3878,7 @@ impl Shadow {
         if from >= to {
             return false;
         }
-        let busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|&&(a, e)| a < to && e > from)
-            .map(|&(a, e)| (a.max(from), e.min(to)))
-            .collect();
+        let busy: Vec<(usize, usize)> = self.pending_in(from, to);
         if busy.is_empty() {
             return false;
         }
@@ -4049,14 +4117,17 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
-            .collect();
+        let mut busy: Vec<(usize, usize)> = if !self.has_pending.load(Ordering::Acquire) {
+            Vec::new()
+        } else {
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied()
+                .filter(|&(a, e)| a < to && e > from)
+                .collect()
+        };
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
@@ -4093,8 +4164,7 @@ impl Shadow {
             return false;
         }
         // Around ranges shaders are writing the refresh asks gap by gap.
-        // Read-only buffers (`!self.written`) never have in-flight shader writes.
-        if self.written.load(Ordering::Acquire)
+        if self.has_pending.load(Ordering::Acquire)
             && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
         {
             return false;
@@ -5069,6 +5139,7 @@ mod land_tests {
             return; // no host GPU
         };
         shadow.pending.lock().unwrap().push((title, title + LEN));
+        shadow.has_pending.store(true, Ordering::Release);
         // SAFETY: committed, aligned; touched as atomics or by the landing's
         // stores of whole dwords.
         let dword = |i: usize| unsafe { &*((title + i * 4) as *const AtomicU32) };
@@ -5121,6 +5192,38 @@ mod land_tests {
             let last = writer.join().expect("nothing undone");
             assert!((1..LEN / 4).step_by(4 * 331).all(|i| dword(i).load(Ordering::Relaxed) == last));
         });
+    }
+
+    /// The compare after a submission (`Shadow::differing`) cuts a range of
+    /// 32 MiB or more into slices on several threads, each cut on a piece of
+    /// title memory. A copy that starts 32 KiB into a piece, compared from
+    /// its first byte: the first cut lay below the copy's start, so the
+    /// subtraction wrapped (and panicked with overflow checks), and in a
+    /// release build the first slice was never compared. Every changed byte
+    /// is found now, in the first slice too, and no unchanged piece.
+    #[test]
+    fn a_big_compare_finds_changes_in_its_first_slice() {
+        let Some((buffer, _)) = crate::host::host().and_then(|h| h.shared_buffer(64)) else {
+            return;
+        };
+        const LEN: usize = 48 << 20;
+        let before = vec![0u8; LEN];
+        let mut copy = before.clone();
+        let changed = [0usize, 100, (64 << 10) - 1, (64 << 10) + 5, 3 << 20, 20 << 20, 40 << 20, LEN - 1];
+        for &at in &changed {
+            copy[at] = 1;
+        }
+        let start = 0x0012_3456_8000u64;
+        let shadow = Shadow::new(buffer, copy.as_mut_ptr(), 0, start, LEN as u64);
+        let found = shadow.differing(0, LEN, &before);
+        drop(shadow);
+        for &at in &changed {
+            assert!(found.iter().any(|&(a, n)| (a..a + n).contains(&at)), "the change at {at:#x} was not found: {found:x?}");
+        }
+        for &(a, n) in &found {
+            assert!(changed.iter().any(|&at| (a..a + n).contains(&at)), "an unchanged piece at {a:#x}+{n:#x}");
+            assert!((start as usize + a + n).is_multiple_of(PIECE) || a + n == LEN, "{a:#x}+{n:#x}");
+        }
     }
 }
 

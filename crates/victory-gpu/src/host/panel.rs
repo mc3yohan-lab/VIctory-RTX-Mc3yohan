@@ -402,8 +402,12 @@ impl CpuMeter {
             self.cores_pct.clear();
             let mut sum = 0.0f32;
             for (&(pi, pt), &(ni, nt)) in self.prev.iter().zip(&now) {
-                let dt = (nt - pt).max(1) as f32;
-                let di = (ni - pi).clamp(0, nt - pt) as f32;
+                // Windows NtQuerySystemInformation counters can jitter slightly
+                // backwards on a core sample (observed nt - pt = -1406250);
+                // clamp against dt_raw >= 1 so i64::clamp never panics.
+                let dt_raw = nt.saturating_sub(pt).max(1);
+                let dt = dt_raw as f32;
+                let di = ni.saturating_sub(pi).clamp(0, dt_raw) as f32;
                 let busy = ((1.0 - di / dt) * 100.0).clamp(0.0, 100.0);
                 self.cores_pct.push(busy);
                 sum += busy;

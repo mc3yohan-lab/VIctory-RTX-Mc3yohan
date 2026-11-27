@@ -293,6 +293,13 @@ pub(crate) fn to_check(frame: u64) -> Vec<usize> {
     out
 }
 
+/// Whether the fallback warning for the `n`-th (0-based) missed view record
+/// since the start should be logged (Belobug #354).
+#[inline]
+fn should_warn_missed(n: u64) -> bool {
+    n < 20 || n.is_power_of_two()
+}
+
 /// The fallback found slot `index` (at `handle`) with a new record: a view
 /// record that no mark told of is counted and said.
 pub(crate) fn missed(index: u32, handle: u64, view: bool, tabled: bool) {
@@ -307,12 +314,12 @@ pub(crate) fn missed(index: u32, handle: u64, view: bool, tabled: bool) {
         CHECKED[3].fetch_add(1, Relaxed);
         return;
     }
+    CHECKED[1].fetch_add(1, Relaxed);
     if tabled {
         // A draw read it through a table lately: the draw makes it anyway.
         CHECKED[5].fetch_add(1, Relaxed);
     }
-    let n = CHECKED[1].fetch_add(1, Relaxed);
-    MISSED_ALL.fetch_add(1, Relaxed);
+    let n = MISSED_ALL.fetch_add(1, Relaxed);
     let rip = a.writers.get(((handle - a.start) >> 16) as usize).map_or(0, |w| w.load(Relaxed));
     let (base, size) = (IMAGE[0].load(Relaxed), IMAGE[1].load(Relaxed));
     let writer = if rip >= base && rip < base + size { format!("title+{:#x}", rip - base) } else if rip != 0 { format!("{rip:#x} (not the title's)") } else { "not known (no fault on its block)".into() };
@@ -320,7 +327,7 @@ pub(crate) fn missed(index: u32, handle: u64, view: bool, tabled: bool) {
         let mut by = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
         *by.entry(writer.clone()).or_default() += 1;
     }
-    if n < 20 || n.is_power_of_two() {
+    if should_warn_missed(n) {
         tracing::warn!(
             slot = index,
             handle = format_args!("{handle:#x}"),

@@ -406,6 +406,8 @@ fn apply_nvidia_preset(run_console: Option<Console>) {
         // records and corrupt one-shot NPC face bakes.
         ("VICTORY_PORT_GUARD", "1"),
         ("VICTORY_PORT_JOURNAL", "1"),
+        ("VICTORY_PORT_RT", "1"),
+        ("VICTORY_FEED_ONE_CALL", "1"),
         ("VICTORY_CARD_BUFFERS_MIN_KB", "64"),
         ("VICTORY_WINDOWS_BAR_MB", "4096"),
         ("VICTORY_WINDOW_KB", "4096"),

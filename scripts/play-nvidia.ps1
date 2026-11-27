@@ -62,6 +62,7 @@ param(
     [switch]$NoPortCbv,
     [switch]$NoPortGuard,
     [switch]$NoPortJournal,
+    [switch]$NoPortRt,
     [switch]$UpQueue,
     [switch]$SweepPerHeap,
     [switch]$XmaRefill,
@@ -238,6 +239,15 @@ if (-not $NoPortGuard -and -not $Safe) {
 if (-not $NoPortJournal -and -not $Safe) {
     # Renderer Port 7: early heap sync at title submit + 64-sharded journal locks (-1 to -3 ms).
     $settings.VICTORY_PORT_JOURNAL = '1'
+}
+if (-not $NoPortRt -and -not $Safe) {
+    # Renderer Port RT part 1 (avatarmanz 84917c34): placed-copy ordering + fill forwarding
+    # eliminates BEHIND_PLACED card_steps refusals (cuts up to 26 ms GPU settle stalls/frame).
+    $settings.VICTORY_PORT_RT = '1'
+}
+if (-not $Safe) {
+    # Merge card_before send-up list into the submission's ExecuteCommandLists call (fxceless #1137).
+    $settings.VICTORY_FEED_ONE_CALL = '1'
 }
 if ($TexStore) {
     $texStoreDir = Join-Path $env:LOCALAPPDATA 'victory\cache\textures'
