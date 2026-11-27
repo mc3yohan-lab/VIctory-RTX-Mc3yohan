@@ -628,16 +628,32 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        // Let frame-critical threads run ahead of decompression when the CPU is busy.
+        let number = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<i32>().ok());
+        let workers = match number("VICTORY_DSTORAGE_WORKERS") {
+            Some(n) if n > 0 => n as usize,
+            _ => std::thread::available_parallelism().map_or(4, |n| n.get()),
+        };
+        let priority = number("VICTORY_DSTORAGE_PRIORITY").map_or(-1, |p| p.clamp(-2, 2));
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
+                    .spawn(move || {
+                        #[cfg(windows)]
+                        if priority != 0 {
+                            use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
+                            // SAFETY: GetCurrentThread returns this worker's pseudo-handle.
+                            if unsafe { SetThreadPriority(GetCurrentThread(), priority) } == 0 {
+                                tracing::warn!(priority, error = %std::io::Error::last_os_error(), "DirectStorage worker priority was not set");
+                            }
+                        }
+                        work(scheduler)
+                    })
                     .is_ok()
             })
             .count();
-        tracing::info!(workers = started, "dstorage: workers");
+        tracing::info!(workers = started, priority, "dstorage: workers (VICTORY_DSTORAGE_WORKERS, VICTORY_DSTORAGE_PRIORITY)");
     });
     Some(scheduler)
 }

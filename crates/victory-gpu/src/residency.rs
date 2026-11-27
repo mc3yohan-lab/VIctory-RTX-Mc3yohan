@@ -156,6 +156,7 @@ pub(crate) fn refresh() {
                 buffer_mirror_span_mib = crate::shadow::live_span_bytes() >> 20,
                 texture_staging_mib = crate::texture::live_staging_bytes() >> 20,
                 spare_scratch_mib = crate::host::ALIVE[4].load(Ordering::Relaxed) >> 20,
+                spare_upload_mib = crate::host::UPLOAD_SPARE_BYTES.load(Ordering::Relaxed) >> 20,
                 game_filled_gpu_texture_mib = crate::resource::KINDS[1].load(Ordering::Relaxed) >> 20,
                 "host memory pressure: limiting texture prefetch and idle upload storage"
             );

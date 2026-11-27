@@ -1222,6 +1222,9 @@ pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
 
 /// Ranges in order, those that overlap or touch as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    if ranges.windows(2).all(|w| w[0].0 <= w[0].1 && w[0].1 < w[1].0) {
+        return ranges;
+    }
     // (The sort that finds what is in order already: they come as a few
     // stretches of tens of thousands in order, put behind one another.)
     ranges.sort();
@@ -1377,6 +1380,10 @@ mod card_tests {
     fn ranges_join_where_they_touch() {
         assert_eq!(joined(vec![(8, 12), (0, 4), (4, 6), (10, 20), (30, 31)]), [(0, 6), (8, 20), (30, 31)]);
         assert!(joined(Vec::new()).is_empty());
+        assert_eq!(joined(vec![(0, 10), (20, 30), (40, 50)]), [(0, 10), (20, 30), (40, 50)]);
+        assert_eq!(joined(vec![(0, 10), (10, 20), (30, 40)]), [(0, 20), (30, 40)]);
+        assert_eq!(joined(vec![(0, 10), (5, 8), (30, 40)]), [(0, 10), (30, 40)]);
+        assert_eq!(joined(vec![(20, 30), (0, 10), (5, 25)]), [(0, 30)]);
     }
 }
 
@@ -2221,6 +2228,7 @@ fn workers() -> &'static Workers {
                         }
                     };
                     let _working = crate::timeline::span("a job for another thread");
+                    let _in_wide = WideScope::enter();
                     job();
                 }
             });
@@ -2229,30 +2237,66 @@ fn workers() -> &'static Workers {
     workers
 }
 
+thread_local! {
+    static IN_WIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct WideScope(bool);
+
+impl WideScope {
+    fn enter() -> Self {
+        let prev = IN_WIDE.replace(true);
+        Self(prev)
+    }
+}
+
+impl Drop for WideScope {
+    fn drop(&mut self) {
+        IN_WIDE.set(self.0);
+    }
+}
+
+/// Whether this thread is currently executing inside [`wide`] or one of its
+/// worker jobs. Nested callers must stay serial to avoid stealing outer jobs
+/// while holding thread-local borrows or locks.
+pub(crate) fn in_wide() -> bool {
+    IN_WIDE.get()
+}
+
+struct WideDone(Arc<(Mutex<usize>, std::sync::Condvar)>);
+
+impl Drop for WideDone {
+    fn drop(&mut self) {
+        let mut n = self.0.0.lock().unwrap_or_else(|e| e.into_inner());
+        *n = n.saturating_sub(1);
+        if *n == 0 {
+            self.0.1.notify_all();
+        }
+    }
+}
+
 /// Runs `jobs` on the kept threads and on this one, and returns when all
-/// of them are done. The jobs copy and compare memory; they do not panic.
+/// of them are done. Nested calls run serially on the calling thread.
 fn wide(jobs: Vec<Job>) {
-    if jobs.len() < 2 {
+    if jobs.len() < 2 || in_wide() {
+        let _in_wide = WideScope::enter();
         for job in jobs {
             job();
         }
         return;
     }
+    let _in_wide = WideScope::enter();
     let workers = workers();
     let _wide = crate::timeline::span("work spread over threads");
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for job in jobs {
-            let left = left.clone();
+            let done = WideDone(left.clone());
             workers.there.fetch_add(1, Ordering::AcqRel);
             queue.push_back(Box::new(move || {
+                let _done = done;
                 job();
-                let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-                *n -= 1;
-                if *n == 0 {
-                    left.1.notify_all();
-                }
             }));
         }
     }

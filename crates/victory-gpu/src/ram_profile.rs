@@ -50,6 +50,10 @@ pub(crate) fn snapshot_budget() -> usize {
     }
 }
 
+pub(crate) const fn spare_list_scratch_bytes() -> u64 {
+    64 << 20
+}
+
 pub(crate) fn read_cache_budget() -> Option<usize> {
     enabled().then(|| {
         if crate::residency::pressured() {

@@ -247,7 +247,7 @@ struct Aside {
     list: ID3D12CommandList,
     fence: ID3D12Fence,
     event: windows::Win32::Foundation::HANDLE,
-    value: u64,
+    progress: mapping_fence::Progress,
     _keep: (ID3D12CommandAllocator, [ID3D12Resource; 2]),
 }
 // SAFETY: D3D12 objects are free-threaded, the event is waited on by one
@@ -308,18 +308,19 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
                 list: list.cast()?,
                 fence: device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?,
                 event: CreateEventW(None, false, false, None)?,
-                value: 0,
+                progress: mapping_fence::Progress::default(),
                 _keep: (allocator, [from, to]),
             });
         }
         let Some(a) = aside.as_mut() else { return Ok(()) };
-        a.queue.ExecuteCommandLists(&[Some(a.list.clone())]);
-        a.value += 1;
-        a.queue.Signal(&a.fence, a.value)?;
-        if a.fence.GetCompletedValue() < a.value {
-            a.fence.SetEventOnCompletion(a.value, a.event)?;
-            WaitForSingleObject(a.event, INFINITE);
-        }
+        a.progress.run(
+            || a.queue.ExecuteCommandLists(&[Some(a.list.clone())]),
+            |value, attempt| {
+                mapping_fence::confirm(
+                    device, &a.queue, &a.fence, a.event, value, attempt, mapping_fence::wait_ms(),
+                )
+            },
+        )?;
     }
     let us = started.elapsed().as_micros() as u64;
     MAPPED[0].fetch_add(1, Ordering::Relaxed);
@@ -543,8 +544,9 @@ type SweepPass = (&'static str, fn(bool));
 const SWEEP_PASSES: &[SweepPass] = &[
     ("snapshot_and_scratch", |pressured| {
         crate::shadow::trim_snapshot_pool();
-        if pressured {
-            trim_spare_chunks();
+        if pressured || crate::residency::critical_commit() {
+            trim_spare_uploads(0);
+            trim_spare_chunks(0);
         }
     }),
     ("pools", |_| {
@@ -2254,17 +2256,110 @@ impl<T> Spare<T> {
     /// Keeps `thing` (`size` bytes) unless that takes the kept bytes past
     /// `most`: then it comes back.
     fn give(&mut self, thing: T, size: u64, most: u64) -> Option<T> {
-        if self.bytes + size > most {
+        if size > most.saturating_sub(self.bytes) {
             return Some(thing);
         }
         self.bytes += size;
         self.kept.push((thing, size));
         None
     }
+
+    /// Evicts the oldest entries first, keeping the latest reusable buffers.
+    fn trim(&mut self, most: u64) -> Vec<(T, u64)> {
+        let mut count = 0;
+        while self.bytes > most {
+            self.bytes -= self.kept[count].1;
+            count += 1;
+        }
+        self.kept.drain(..count).collect()
+    }
 }
 
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
+
+/// Idle copy sources, in separate pools for upload and CPU-visible shared buffers.
+static UPLOAD_SPARE: [Mutex<Spare<Chunk>>; 2] = [const { Mutex::new(Spare::new()) }; 2];
+
+/// Total idle bytes currently retained across [`UPLOAD_SPARE`].
+pub(crate) static UPLOAD_SPARE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn limited_list_memory() -> bool {
+    crate::residency::limited_host_ram() || crate::ram_profile::enabled()
+}
+
+fn default_upload_pool_mb() -> u64 {
+    if limited_list_memory() {
+        return 128;
+    }
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: sized Win32 struct initialized before query.
+    let mut mem: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    mem.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: valid pointer to initialized MEMORYSTATUSEX.
+    if unsafe { GlobalMemoryStatusEx(&mut mem) } != 0 && mem.ullTotalPhys > 0 && mem.ullTotalPhys <= 32 << 30 {
+        return 256;
+    }
+    1024
+}
+
+/// Bytes kept per upload pool. Set VICTORY_UPLOAD_POOL_MB=0 to disable reuse.
+fn upload_pool_most() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        let default_mb = default_upload_pool_mb();
+        std::env::var("VICTORY_UPLOAD_POOL_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&mb| mb <= u64::MAX >> 20)
+            .unwrap_or(default_mb)
+            << 20
+    })
+}
+
+fn spare_retention_limit(most: u64) -> u64 {
+    if crate::residency::critical_commit() || crate::residency::pressured() {
+        0
+    } else {
+        most
+    }
+}
+
+fn take_upload(shared: bool, class: u64) -> Option<Chunk> {
+    let chunk = UPLOAD_SPARE[usize::from(shared)]
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take(class)?;
+    UPLOAD_SPARE_BYTES.fetch_sub(class, Ordering::Relaxed);
+    Some(chunk)
+}
+
+/// Returns copy sources after the list's GPU work has finished.
+fn give_uploads(pooled: Vec<(Chunk, u64, bool)>) {
+    if pooled.is_empty() {
+        return;
+    }
+    let most = spare_retention_limit(upload_pool_most());
+    for (chunk, class, shared) in pooled {
+        let freed = UPLOAD_SPARE[usize::from(shared)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .give(chunk, class, most);
+        if freed.is_none() {
+            UPLOAD_SPARE_BYTES.fetch_add(class, Ordering::Relaxed);
+        }
+        drop(freed);
+    }
+}
+
+fn trim_spare_uploads(target: u64) {
+    for pool in &UPLOAD_SPARE {
+        let freed = pool.lock().unwrap_or_else(|e| e.into_inner()).trim(target);
+        let bytes: u64 = freed.iter().map(|(_, s)| *s).sum();
+        UPLOAD_SPARE_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+        drop(freed);
+    }
+}
 
 /// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
 fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
@@ -2293,23 +2388,23 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     if chunks.is_empty() {
         return;
     }
+    let limit = if !scratch_pool() {
+        0
+    } else {
+        let most = if crate::ram_profile::enabled() {
+            crate::ram_profile::spare_list_scratch_bytes()
+        } else if keep_freed() && !crate::residency::limited_host_ram() {
+            SPARE_KEPT
+        } else {
+            SPARE_MOST
+        };
+        spare_retention_limit(most)
+    };
     let mut freed = Vec::new();
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
-            let back = if scratch_pool() {
-                let limit = if crate::ram_profile::enabled() {
-                    64 << 20
-                } else if keep_freed() && !crate::residency::limited_host_ram() {
-                    SPARE_KEPT
-                } else {
-                    SPARE_MOST
-                };
-                spare.give(chunk, size, limit)
-            } else {
-                Some(chunk)
-            };
-            match back {
+            match spare.give(chunk, size, limit) {
                 None => {
                     ALIVE[3].fetch_add(1, Ordering::Relaxed);
                     ALIVE[4].fetch_add(size, Ordering::Relaxed);
@@ -2326,23 +2421,17 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     drop(freed);
 }
 
-/// Lets go of the scratch chunks kept idle, when the system is short of
-/// memory (`VICTORY_RESIDENCY=1`, [`crate::residency::pressured`]).
-fn trim_spare_chunks() {
-    let freed: Vec<(Chunk, u64)> = {
-        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-        if spare.kept.is_empty() {
-            return;
-        }
-        spare.bytes = 0;
-        std::mem::take(&mut spare.kept)
-    };
+/// Releases idle scratch chunks past the memory-pressure budget.
+fn trim_spare_chunks(target: u64) {
+    let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    let freed = spare.trim(target);
     let count = freed.len() as u64;
     let bytes: u64 = freed.iter().map(|(_, s)| *s).sum();
     ALIVE[1].fetch_sub(count, Ordering::Relaxed);
     ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
     ALIVE[3].fetch_sub(count, Ordering::Relaxed);
     ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
+    drop(spare);
     drop(freed);
 }
 
@@ -2652,9 +2741,11 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
+    /// Copy sources held until reset (buffer, size class, shared heap).
+    pooled_uploads: Vec<(Chunk, u64, bool)>,
     /// Standalone upload chunks kept through this list's fence (movie planes).
     plane_uploads: Vec<(Chunk, u64)>,
-    /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
+    /// The bytes of both kinds of upload (counted while the list holds them).
     upload_bytes: u64,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
@@ -2725,8 +2816,9 @@ impl Deferred {
 impl Drop for Deferred {
     fn drop(&mut self) {
         give_chunks(std::mem::take(&mut self.plane_uploads));
-        ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
+        ALIVE[6].fetch_sub((self.uploads.len() + self.pooled_uploads.len()) as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        give_uploads(std::mem::take(&mut self.pooled_uploads));
     }
 }
 
@@ -4211,6 +4303,7 @@ pub(crate) mod awake;
 mod card_steps;
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod indirects;
+mod mapping_fence;
 mod panel;
 mod place;
 pub(crate) mod rec;
@@ -7717,6 +7810,8 @@ impl HostList {
             let deferred = self.deferred();
             if !(deferred.copies.is_empty()
                 && deferred.uploads.is_empty()
+                && deferred.pooled_uploads.is_empty()
+                && deferred.plane_uploads.is_empty()
                 && deferred.kept.is_empty()
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
@@ -7807,7 +7902,7 @@ impl HostList {
         }
         let deferred = self.deferred();
         let seen = deferred.copies.iter().rev().map(|step| match step {
-            Step::Placed(p) => crate::port_rt::Seen::Placed { dst: p.dst, src: p.src, len: p.len, from_upload: p.from_upload() },
+            Step::Placed(p) => crate::port_rt::Seen::Placed { dst: p.dst, src: p.src, len: p.len, from_upload: p.has_upload_source() },
             &Step::Copy(d, _, n) => crate::port_rt::Seen::Writes(d, d + n),
             &Step::GpuWrite(_, a, n) => crate::port_rt::Seen::Writes(a, a + n),
             Step::RawCopy { .. } => crate::port_rt::Seen::Anything,
@@ -7903,14 +7998,37 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
-    /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    /// A mapped upload buffer of at least `size` bytes, alive until reset.
+    /// Reused buffers may contain old data. Callers initialize the bytes they copy.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         // With [`card_steps`] the card may be the one that fills it; never
         // exposed in a live bindless descriptor heap read by earlier flights.
-        let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer_internal(size)? } else { host.upload_buffer(size)? };
+        let shared = card_steps::stage() > 1;
+        let allocate = |bytes| {
+            if shared { host.shared_buffer_internal(bytes) } else { host.upload_buffer(bytes) }
+        };
+        if let Some(class) = size.max(64 << 10).checked_next_power_of_two()
+            && class <= upload_pool_most()
+        {
+            let chunk = take_upload(shared, class).or_else(|| {
+                let (buffer, data) = allocate(class)?;
+                name(&buffer, || format!("list upload, pooled {class:#x}"));
+                Some(Chunk { buffer, data: data as usize })
+            });
+            if let Some(chunk) = chunk {
+                let out = (chunk.buffer.clone(), chunk.data as *mut u8);
+                let mut deferred = self.deferred();
+                deferred.pooled_uploads.push((chunk, class, shared));
+                deferred.upload_bytes += class;
+                ALIVE[6].fetch_add(1, Ordering::Relaxed);
+                ALIVE[7].fetch_add(class, Ordering::Relaxed);
+                return Some(out);
+            }
+            if class == size {
+                return None;
+            }
+        }
+        let (buffer, data) = allocate(size)?;
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);
         Some((buffer, data))
@@ -9865,6 +9983,83 @@ fn copy_raw_title(dst: usize, src: usize, len: usize) {
     crate::watch::ask_once_end();
 }
 
+/// Large copies into host memory are split on the kept workers when
+/// VICTORY_WIDE_COPY=1.
+const WIDE_COPY_MIN: usize = 8 << 20;
+const WIDE_COPY_PIECE: usize = 2 << 20;
+
+fn wide_copy_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_COPY").is_some_and(|v| v == "1"))
+}
+
+fn piece_bounds(len: usize, piece: usize) -> Vec<(usize, usize)> {
+    (0..len)
+        .step_by(piece)
+        .map(|from| (from, from + piece.min(len - from)))
+        .collect()
+}
+
+/// The caller keeps the source and disjoint host destination alive until
+/// the workers finish. Each worker writes only its own range.
+fn copy_pieces(dst: *mut u8, src: *const u8, len: usize) {
+    let (dst, src) = (dst as usize, src as usize);
+    let jobs = piece_bounds(len, WIDE_COPY_PIECE)
+        .into_iter()
+        .map(|(from, to)| {
+            Box::new(move || {
+                copy_mapped((dst + from) as *mut u8, (src + from) as *const u8, to - from, false);
+            }) as Box<dyn FnOnce() + Send>
+        })
+        .collect();
+    crate::shadow::wide_run(jobs);
+}
+
+#[cfg(test)]
+mod piece_copy_tests {
+    use super::{WIDE_COPY_PIECE, copy_pieces, piece_bounds};
+
+    #[test]
+    fn pieces_cover_the_copy_once() {
+        assert!(piece_bounds(0, 4).is_empty());
+        assert_eq!(piece_bounds(4, 4), [(0, 4)]);
+        assert_eq!(piece_bounds(10, 4), [(0, 4), (4, 8), (8, 10)]);
+        let len = 9 << 20;
+        let pieces = piece_bounds(len, WIDE_COPY_PIECE);
+        assert_eq!(pieces.len(), 5);
+        assert_eq!(pieces.iter().map(|(from, to)| to - from).sum::<usize>(), len);
+        assert!(pieces.windows(2).all(|pair| pair[0].1 == pair[1].0));
+    }
+
+    #[test]
+    fn large_copy_includes_the_partial_tail() {
+        let len = (9 << 20) + 4097;
+        let src: Vec<u8> = (0..len).map(|i| (i * 131 + i / 4099) as u8).collect();
+        let mut dst = vec![0; len];
+        copy_pieces(dst.as_mut_ptr(), src.as_ptr(), len);
+        assert!(dst == src);
+    }
+
+    #[test]
+    fn nested_wide_copy_stays_serial_without_reentering() {
+        let len = 9 << 20;
+        let src: Vec<u8> = (0..len).map(|i: usize| (i.wrapping_mul(29) ^ (i >> 7)) as u8).collect();
+        let mut dst = vec![0u8; len];
+        let src_ptr = src.as_ptr() as usize;
+        let dst_ptr = dst.as_mut_ptr() as usize;
+        crate::shadow::wide_run(vec![
+            Box::new(move || {
+                assert!(crate::shadow::in_wide());
+                super::copy_mapped(dst_ptr as *mut u8, src_ptr as *const u8, len, false);
+            }),
+            Box::new(|| {
+                assert!(crate::shadow::in_wide());
+            }),
+        ]);
+        assert!(dst == src);
+    }
+}
+
 /// Copies title memory at submission. The ranges were checked against their
 /// resources when recorded, but the title may since have unmapped pages of
 /// them (tiled memory, page mappings), which read as zeros here; a title
@@ -9886,6 +10081,18 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         _ => {}
     }
     if len == 0 {
+        return;
+    }
+    // Title destinations can have aliased pages and require a whole-range
+    // mapping check on failure. Keep those, overlapping copies, and calls
+    // already executing inside `shadow::wide` serial.
+    if !title_dst
+        && !crate::shadow::in_wide()
+        && len >= WIDE_COPY_MIN
+        && wide_copy_on()
+        && (dst as usize).abs_diff(src as usize) >= len
+    {
+        copy_pieces(dst, src, len);
         return;
     }
     // A title destination that is not all mapped is left alone. Asking
