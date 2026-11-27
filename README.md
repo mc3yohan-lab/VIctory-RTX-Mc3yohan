@@ -89,7 +89,7 @@ Series X profile (ray tracing off).
 ## Known Bottlenecks & Where Collaborators Can Help Most
 
 1. **CPU `victory-submit` Thread (Primary Ceiling on RTX 4090):**
-   - With RTX 4090 GPU wait at `0.0–0.6 ms/frame`, `victory-submit` (`prep ~26–33 ms` + `copyback ~21 ms`) is the #1 ceiling above 30 FPS. Key remaining hotspots: descriptor sync, relay fetch, and `LAND` merge (`VICTORY_TABLE_CACHE` / off-submit landing).
+   - With RTX 4090 GPU wait at `0.0–0.6 ms/frame`, `victory-submit` (`prep ~26–33 ms` + `copyback ~21 ms`) is the #1 ceiling above 30 FPS. Key remaining hotspots: descriptor sync, relay fetch, and `LAND` merge (per-draw mirrored table caching and off-submit landing).
 2. **8 GB & 12–16 GB VRAM Tuning (RTX 3070 / 4060 / 5060 / 5070 Ti):**
    - Avoiding WDDM Shared GPU Memory spill is critical on 8–16 GB cards; `play-nvidia.ps1` and `VIctory-RTX.exe` auto-scale BAR/buffer/mip tiers, and `ram_profile.rs` guards `<= 24 GiB` RAM (incl. 16 GiB) or `< 8 GiB` free-commit systems.
 3. **Native NVIDIA DLSS Super Resolution Backend:**
