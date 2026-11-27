@@ -181,6 +181,7 @@ impl TextureQuality {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LauncherConfig {
+    pub wizard_completed: bool,
     pub game_dir: String,
     pub preset: Preset,
     pub console: ConsoleModel,
@@ -222,6 +223,7 @@ pub struct LauncherConfig {
 impl Default for LauncherConfig {
     fn default() -> Self {
         Self {
+            wizard_completed: false,
             game_dir: String::new(),
             preset: Preset::Auto,
             console: ConsoleModel::Auto,

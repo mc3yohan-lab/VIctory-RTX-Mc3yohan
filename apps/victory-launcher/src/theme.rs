@@ -138,34 +138,33 @@ pub fn paint_quantico_banner_overlay(painter: &egui::Painter, rect: Rect, has_co
         }
     }
 
-    // Velo de legibilidad izquierdo (carbón profundo -> transparente).
-    let strips = 24usize;
-    let w = rect.width() / strips as f32;
-    for i in 0..strips {
-        let t = i as f32 / (strips - 1) as f32;
+    // Velo vertical suave en la base (donde reposan título y botón JUGAR) +
+    // ligera viñeta izquierda para legibilidad perfecta sin tapar el arte central.
+    let v_strips = 20usize;
+    let sh = rect.height() / v_strips as f32;
+    for i in 0..v_strips {
+        let t = i as f32 / (v_strips - 1) as f32; // 0 = arriba, 1 = abajo
         let alpha = if has_cover_art {
-            // Oscuro a la izquierda y derecha (donde van texto y botón Jugar),
-            // despejado en el centro para lucir el arte local.
-            let left = (1.0 - (t / 0.52).min(1.0)).powf(1.3) * 238.0;
-            let right = ((t - 0.58).max(0.0) / 0.42).powf(1.5) * 205.0;
-            left.max(right).clamp(48.0, 240.0) as u8
+            let bottom = ((t - 0.30).max(0.0) / 0.70).powf(1.45) * 238.0;
+            let top = ((0.18 - t).max(0.0) / 0.18) * 55.0;
+            bottom.max(top).clamp(18.0, 242.0) as u8
         } else {
-            let left = (1.0 - t) * 120.0;
-            left as u8
+            (t * 95.0) as u8
         };
-        let x0 = rect.left() + i as f32 * w;
+        let y0 = rect.top() + i as f32 * sh;
         clipped.rect_filled(
-            Rect::from_min_max(pos2(x0, rect.top()), pos2(x0 + w + 1.0, rect.bottom())),
+            Rect::from_min_max(pos2(rect.left(), y0), pos2(rect.right(), y0 + sh + 1.0)),
             CornerRadius::ZERO,
             Color32::from_rgba_unmultiplied(7, 10, 16, alpha),
         );
     }
 
-    // Barra diagonal Quantico a 53.8° (pendiente 328/240 -> dx = h * 240/328).
+    // Barra diagonal Quantico a 53.8° (pendiente 328/240 -> dx = h * 240/328)
+    // en el extremo derecho como firma sobria de marca.
     let h = rect.height();
     let dx = h * (240.0_f32 / 328.0_f32);
-    let x_top = rect.right() - 235.0;
-    let bar_w = 18.0_f32;
+    let x_top = rect.right() - 68.0;
+    let bar_w = 14.0_f32;
     let poly = vec![
         pos2(x_top, rect.top()),
         pos2(x_top + bar_w, rect.top()),
@@ -174,21 +173,21 @@ pub fn paint_quantico_banner_overlay(painter: &egui::Painter, rect: Rect, has_co
     ];
     clipped.add(Shape::convex_polygon(
         poly,
-        Color32::from_rgba_unmultiplied(0, 123, 255, if has_cover_art { 58 } else { 82 }),
+        Color32::from_rgba_unmultiplied(0, 123, 255, if has_cover_art { 52 } else { 78 }),
         Stroke::NONE,
     ));
 
     // Segunda línea fina paralela (acento técnico).
-    let x2 = x_top + 28.0;
+    let x2 = x_top + 22.0;
     let poly2 = vec![
         pos2(x2, rect.top()),
-        pos2(x2 + 4.0, rect.top()),
-        pos2(x2 + 4.0 - dx, rect.bottom()),
+        pos2(x2 + 3.0, rect.top()),
+        pos2(x2 + 3.0 - dx, rect.bottom()),
         pos2(x2 - dx, rect.bottom()),
     ];
     clipped.add(Shape::convex_polygon(
         poly2,
-        Color32::from_rgba_unmultiplied(77, 163, 255, 70),
+        Color32::from_rgba_unmultiplied(77, 163, 255, 65),
         Stroke::NONE,
     ));
 

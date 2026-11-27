@@ -879,15 +879,31 @@ impl ProcessRunner {
                 {
                     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
                     st.progress.done = idx as u64;
-                    st.progress.step_label = format!("Copiando {label}...");
+                    st.progress.step_label = format!("Importando {label}...");
                 }
                 if src.is_dir() {
-                    let count = copy_dir_non_destructive(&src, &dst, label == "Partidas guardadas");
+                    let count = if label == "Shaders traducidos" {
+                        // Copia multihilo rápida con robocopy (/MT:16 /XC /XN /XO: no sobreescribe).
+                        let _ = std::fs::create_dir_all(&dst);
+                        let rc = Command::new("robocopy")
+                            .arg(&src)
+                            .arg(&dst)
+                            .args(["/E", "/MT:16", "/XC", "/XN", "/XO", "/NFL", "/NDL", "/NJH", "/NJS", "/NP", "/R:0", "/W:0"])
+                            .creation_flags(CREATE_NO_WINDOW)
+                            .status();
+                        if rc.is_ok_and(|s| s.code().unwrap_or(99) < 8) {
+                            info.shader_files
+                        } else {
+                            copy_dir_non_destructive(&src, &dst, false)
+                        }
+                    } else {
+                        copy_dir_non_destructive(&src, &dst, label == "Partidas guardadas")
+                    };
                     copied_items += count;
                     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
                     push_log_locked(
                         &mut st,
-                        format!("[launcher] {label}: {count} archivo(s) importado(s)."),
+                        format!("[launcher] {label}: {count} archivo(s) listos."),
                     );
                 }
             }

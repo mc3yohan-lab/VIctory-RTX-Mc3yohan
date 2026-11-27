@@ -3,7 +3,30 @@
 
 use std::path::{Path, PathBuf};
 
-use eframe::egui::{self, ColorImage, IconData, TextureHandle, TextureOptions};
+use eframe::egui::{self, ColorImage, IconData, Rect, TextureHandle, TextureOptions, pos2};
+
+/// Calcula UVs en modo `object-fit: cover` (recorte centrado sin deformar ni
+/// estirar jamás la portada dentro del banner hero).
+pub fn cover_uv(tex_size: [usize; 2], target_rect: Rect) -> Rect {
+    let tw = (tex_size[0].max(1)) as f32;
+    let th = (tex_size[1].max(1)) as f32;
+    let rw = target_rect.width().max(1.0);
+    let rh = target_rect.height().max(1.0);
+    let tex_aspect = tw / th;
+    let rect_aspect = rw / rh;
+    if tex_aspect > rect_aspect {
+        // Imagen más ancha: recortar ligeramente a los lados.
+        let keep = (rect_aspect / tex_aspect).clamp(0.1, 1.0);
+        let pad = (1.0 - keep) * 0.5;
+        Rect::from_min_max(pos2(pad, 0.0), pos2(1.0 - pad, 1.0))
+    } else {
+        // Imagen más alta (ej. 16:9 en banner panorámico): recortar arriba/abajo
+        // centrando ligeramente hacia arriba para lucir el logotipo y rostros.
+        let keep = (tex_aspect / rect_aspect).clamp(0.1, 1.0);
+        let top = ((1.0 - keep) * 0.35).clamp(0.0, 1.0 - keep);
+        Rect::from_min_max(pos2(0.0, top), pos2(1.0, top + keep))
+    }
+}
 
 /// Carga `xbs_splash.png` o el mayor `xbs_logo_*.png` desde la carpeta local del
 /// juego (sin incluir jamás arte propietario en el repositorio).
