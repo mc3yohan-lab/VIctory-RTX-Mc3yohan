@@ -263,6 +263,126 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     })
 }
 
+#[cfg(windows)]
+struct LinkedPair {
+    mesh: Arc<Shader>,
+    pixel: Option<Arc<Shader>>,
+}
+
+#[cfg(windows)]
+type LinkedKey = ([u8; 32], Option<[u8; 32]>);
+
+#[cfg(windows)]
+impl Shader {
+    fn from_linked(orig: &Shader, host: victory_shader::emit::HostShader) -> Option<Arc<Shader>> {
+        let base = orig.translated()?;
+        let used = base.used.clone();
+        let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views);
+        let translated = Translated {
+            host,
+            threads: base.threads,
+            used,
+            tables,
+            stores: base.stores,
+            stores_by_address: base.stores_by_address,
+            picks: Default::default(),
+        };
+        let cell = OnceLock::new();
+        let _ = cell.set(Some(translated));
+        Some(Arc::new(Shader {
+            stage: orig.stage,
+            hash: orig.hash.clone(),
+            container: Vec::new(),
+            ambient: orig.ambient,
+            probe: orig.probe,
+            skip_name: orig.skip_name,
+            translated: cell,
+        }))
+    }
+}
+
+/// Re-translates a mesh shader together with its paired pixel shader (if any)
+/// so arbitrary mesh outputs unread by the pixel shader are pruned under
+/// D3D12's 32 KiB mesh output limit (`victory_shader::emit::MESH_OUTPUT_LIMIT`).
+#[cfg(windows)]
+pub(crate) fn translate_linked(
+    ms: &Shader,
+    ps: Option<&Shader>,
+) -> Option<(Arc<Shader>, Option<Arc<Shader>>)> {
+    static LINKED: Mutex<Option<HashMap<LinkedKey, Option<LinkedPair>>>> = Mutex::new(None);
+    let key: LinkedKey = (
+        *blake3::hash(&ms.container).as_bytes(),
+        ps.map(|p| *blake3::hash(&p.container).as_bytes()),
+    );
+    if let Some(hit) = LINKED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&key))
+    {
+        return hit
+            .as_ref()
+            .map(|pair| (pair.mesh.clone(), pair.pixel.clone()));
+    }
+    crate::descriptor::host::probe_view_limit();
+    let result = match victory_shader::emit::translate_linked(
+        &ms.container,
+        ps.map(|p| p.container.as_slice()),
+    ) {
+        Ok((ms_host, ps_host)) => {
+            let ms_bytes = victory_shader::emit::mesh_output_bytes(&ms_host.dxil);
+            let mesh = Shader::from_linked(ms, ms_host);
+            let pixel = match (ps, ps_host) {
+                (Some(p), Some(host)) => Some(Shader::from_linked(p, host)),
+                (None, None) => None,
+                _ => None,
+            };
+            match (mesh, pixel) {
+                (Some(mesh), Some(Some(pixel))) => {
+                    tracing::info!(
+                        mesh = %ms.hash,
+                        pixel = ps.map_or("none", |p| p.hash.as_str()),
+                        bytes = ms_bytes,
+                        "mesh and pixel linked under 32 KiB output budget"
+                    );
+                    Some(LinkedPair {
+                        mesh,
+                        pixel: Some(pixel),
+                    })
+                }
+                (Some(mesh), None) if ps.is_none() => {
+                    tracing::info!(
+                        mesh = %ms.hash,
+                        pixel = "none",
+                        bytes = ms_bytes,
+                        "mesh linked depth-only under 32 KiB output budget"
+                    );
+                    Some(LinkedPair { mesh, pixel: None })
+                }
+                _ => None,
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                mesh = %ms.hash,
+                pixel = ps.map_or("none", |p| p.hash.as_str()),
+                error = %e,
+                "linked mesh/pixel translation failed"
+            );
+            None
+        }
+    };
+    let out = result
+        .as_ref()
+        .map(|pair| (pair.mesh.clone(), pair.pixel.clone()));
+    LINKED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(key, result);
+    out
+}
+
 /// The compute pipelines of the console's ray-tracing structure builder
 /// (`XboxBvhBuilder.dll`; its programs are the ones with a spilled
 /// user-data table) run **all or none**. Its stages feed each other

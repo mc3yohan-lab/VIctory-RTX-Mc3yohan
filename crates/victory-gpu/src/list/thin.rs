@@ -39,6 +39,10 @@ use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
 
 /// Words after which a stream is handed to the translating threads.
 const CHUNK: usize = 1024;
+/// Keep room for the old pool's usual 1,024 chunks, with a byte ceiling
+/// for buffers that grew while they were recording.
+const MAX_SPARE_CHUNKS: usize = 1024;
+const MAX_SPARE_WORDS: usize = (16 * 1024 * 1024) / size_of::<u64>();
 
 /// Whether list calls are only written down (`VICTORY_THIN=1`; needs the line
 /// of submissions, which it turns on).
@@ -135,7 +139,7 @@ impl Front {
         if self.words.is_empty() {
             return;
         }
-        let fresh = held(&WORDS).pop().unwrap_or_else(|| Vec::with_capacity(CHUNK + 256));
+        let fresh = held(&WORDS).take().unwrap_or_else(|| Vec::with_capacity(CHUNK + 256));
         let words = std::mem::replace(&mut self.words, fresh);
         CHUNKS.fetch_add(1, Relaxed);
         let schedule = {
@@ -160,7 +164,37 @@ impl Front {
 }
 
 /// Streams' memory to use again.
-static WORDS: Mutex<Vec<Vec<u64>>> = Mutex::new(Vec::new());
+static WORDS: Mutex<SpareWords> = Mutex::new(SpareWords::new());
+
+struct SpareWords {
+    chunks: Vec<Vec<u64>>,
+    capacity: usize,
+}
+
+impl SpareWords {
+    const fn new() -> Self {
+        Self { chunks: Vec::new(), capacity: 0 }
+    }
+
+    fn take(&mut self) -> Option<Vec<u64>> {
+        let words = self.chunks.pop()?;
+        self.capacity -= words.capacity();
+        Some(words)
+    }
+
+    fn give(&mut self, mut words: Vec<u64>) {
+        let capacity = words.capacity();
+        if self.chunks.len() < MAX_SPARE_CHUNKS
+            && capacity <= 16 * CHUNK
+            && capacity <= MAX_SPARE_WORDS - self.capacity
+        {
+            words.clear();
+            self.capacity += capacity;
+            self.chunks.push(words);
+        }
+    }
+}
+
 /// Recordings with words to translate.
 static READY: Mutex<VecDeque<Arc<Recording>>> = Mutex::new(VecDeque::new());
 static WORK: Condvar = Condvar::new();
@@ -283,7 +317,7 @@ impl Recording {
 impl Drop for Recording {
     fn drop(&mut self) {
         let inner = self.inner.get_mut().unwrap_or_else(|e| e.into_inner());
-        give_back(inner.chunks.drain(..).chain(std::mem::take(&mut inner.kept)).collect());
+        give_back(inner.chunks.drain(..).chain(std::mem::take(&mut inner.kept)));
         if inner.back != 0 {
             if !inner.closed {
                 // Left in the middle.
@@ -309,13 +343,10 @@ impl Drop for Recording {
     }
 }
 
-fn give_back(streams: Vec<Vec<u64>>) {
+fn give_back(streams: impl IntoIterator<Item = Vec<u64>>) {
     let mut words = held(&WORDS);
-    for mut s in streams {
-        if words.len() < 1024 && s.capacity() <= 16 * CHUNK {
-            s.clear();
-            words.push(s);
-        }
+    for stream in streams {
+        words.give(stream);
     }
 }
 
@@ -918,6 +949,33 @@ const MINE: [(usize, *const ()); 50] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spare_streams_have_a_capacity_ceiling_and_can_be_reused() {
+        let mut pool = SpareWords::new();
+        let large = 16 * CHUNK;
+        for _ in 0..=MAX_SPARE_WORDS / large {
+            pool.give(Vec::with_capacity(large));
+        }
+        assert_eq!(pool.capacity, MAX_SPARE_WORDS);
+        assert_eq!(pool.chunks.len(), MAX_SPARE_WORDS / large);
+        let mut reused = pool.take().unwrap();
+        assert_eq!(pool.capacity, MAX_SPARE_WORDS - large);
+        reused.push(42);
+        pool.give(reused);
+        assert_eq!(pool.capacity, MAX_SPARE_WORDS);
+        assert!(pool.take().unwrap().is_empty());
+    }
+
+    #[test]
+    fn spare_streams_keep_room_for_the_usual_chunks() {
+        let mut pool = SpareWords::new();
+        for _ in 0..=MAX_SPARE_CHUNKS {
+            pool.give(Vec::with_capacity(CHUNK + 256));
+        }
+        assert_eq!(pool.chunks.len(), MAX_SPARE_CHUNKS);
+        assert_eq!(pool.capacity, MAX_SPARE_CHUNKS * (CHUNK + 256));
+    }
 
     /// Every method of the tables that records is written down too: what is
     /// left in both tables alike records nothing.

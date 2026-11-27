@@ -440,11 +440,12 @@ fn apply_nvidia_preset(run_console: Option<Console>) {
         set_default("VICTORY_SKIP_PREFIXES", "CS_RaytracingResolve");
         set_default("VICTORY_AMBIENT", "1.0");
         set_default("VICTORY_AMBIENT_AIR", "1.5");
-        set_default("VICTORY_AMBIENT_MOST", "2.0");
+        set_default("VICTORY_AMBIENT_MOST", "4.0");
         set_default("VICTORY_AMBIENT_CLEAN", "1");
+        set_default("VICTORY_AMBIENT_EXPOSURE_FLOOR", "0.0045");
         set_default("VICTORY_AMBIENT_SHADE", "0.7,0.5");
         set_default("VICTORY_AMBIENT_REFL", "2.0");
-        set_default("VICTORY_AMBIENT_REFLECT", "0.6");
+        set_default("VICTORY_AMBIENT_REFLECT", "1.2");
         set_default("VICTORY_AMBIENT_REFLECT_LEAST", "0.20");
     }
     let fsr_on = std::env::var("VICTORY_FSR_4K").is_ok_and(|v| !v.is_empty() && v != "0");

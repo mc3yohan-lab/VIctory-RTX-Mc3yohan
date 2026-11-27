@@ -599,6 +599,34 @@ impl HostPipeline {
                 })?;
             }
         }
+        // Mesh shaders whose standalone output footprint exceeds D3D12's 32 KiB
+        // limit are re-translated together with their paired pixel shader,
+        // pruning arbitrary outputs the pixel shader never reads.
+        let linked = if let Some(ms) = mesh
+            && ms.translated().is_some_and(|t| {
+                victory_shader::emit::mesh_output_bytes(&t.host.dxil)
+                    .is_some_and(|n| n > victory_shader::emit::MESH_OUTPUT_LIMIT)
+            })
+        {
+            let Some(pair) = super::translate_linked(ms, find("pixel").map(Arc::as_ref)) else {
+                return Err(quiet(
+                    "the mesh shader exceeds the 32 KiB output budget and could not be linked",
+                ));
+            };
+            Some(pair)
+        } else {
+            None
+        };
+        let stages: Vec<(&Arc<Shader>, D3D12_SHADER_VISIBILITY)> = match &linked {
+            Some((ms, ps)) => {
+                let mut v = vec![(ms, D3D12_SHADER_VISIBILITY_MESH)];
+                if let Some(ps) = ps {
+                    v.push((ps, D3D12_SHADER_VISIBILITY_PIXEL));
+                }
+                v
+            }
+            None => stages,
+        };
         let host = host().ok_or_else(|| quiet("no host D3D12 device"))?;
 
         static ANISO_POINT_MIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

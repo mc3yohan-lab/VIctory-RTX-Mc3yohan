@@ -58,6 +58,7 @@ pub struct Part<'a> {
 
 #[derive(Debug, Clone)]
 pub struct Container<'a> {
+    pub input: &'a [u8],
     pub digest: [u8; 16],
     pub version: (u16, u16),
     pub parts: Vec<Part<'a>>,
@@ -108,6 +109,7 @@ impl<'a> Container<'a> {
             });
         }
         Ok(Container {
+            input: data,
             digest,
             version,
             parts,

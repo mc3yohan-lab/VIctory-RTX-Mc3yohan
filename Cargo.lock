@@ -2969,7 +2969,7 @@ dependencies = [
 
 [[package]]
 name = "victory-launcher"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "eframe",
  "image",
@@ -3017,6 +3017,7 @@ dependencies = [
 name = "victory-shader"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "thiserror 2.0.21",
  "windows",
  "windows-sys 0.61.2",

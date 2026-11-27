@@ -53,7 +53,7 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
     let has = |name: &[u8]| container.windows(name.len()).any(|w| w == name);
     if has(b"PS_CalculateExposure") {
         Some(Role::Exposure)
-    } else if lux_on() && has(b"ComputeLuxCompressionInfo") {
+    } else if file_on() && lux_on() && has(b"ComputeLuxCompressionInfo") {
         Some(Role::Lux)
     } else {
         None
@@ -83,9 +83,15 @@ fn file() -> Option<&'static Mutex<std::io::BufWriter<std::fs::File>>> {
     .as_ref()
 }
 
-/// Whether the probe is on.
-pub(crate) fn on() -> bool {
+/// Whether CSV light-probe logging (`VICTORY_LIGHT_PROBE`) is active.
+pub(crate) fn file_on() -> bool {
     file().is_some()
+}
+
+/// Whether the probe hook is active (either CSV logging or lightweight
+/// exposure tracking for `ambient::exposure_floor`).
+pub(crate) fn on() -> bool {
+    file_on() || crate::ambient::needs_exposure()
 }
 
 const RS_EXPOSURE: &str = "RootConstants(num32BitConstants=4, b0), DescriptorTable(SRV(t0)), DescriptorTable(SRV(t1)), UAV(u0), UAV(u1), UAV(u2)";
@@ -99,7 +105,7 @@ const LAG: u64 = 16;
 
 const SOURCE: &str = r#"
 cbuffer Set : register(b0) { uint record; uint cells; uint has_stats; uint unused; };
-RWByteAddressBuffer ring : register(u0);
+globallycoherent RWByteAddressBuffer ring : register(u0);
 #ifdef EXPOSURE
 Texture2D<float4> average : register(t0);
 Texture2D<float4> before : register(t1);
@@ -119,6 +125,7 @@ void exposure() {
         ring.Store4(at + 64, uint4(0, 0, 0, 0));
         ring.Store4(at + 80, uint4(0, 0, 0, 0));
     }
+    DeviceMemoryBarrier();
     ring.Store(at + 252, record + 1);
 }
 #endif
@@ -194,8 +201,31 @@ fn uav_barrier(list: &ID3D12GraphicsCommandList) {
     unsafe { list.ResourceBarrier(&[barrier]) };
 }
 
-/// Writes the record asked for `LAG` records ago (the card has run it).
+/// Writes the record asked for `LAG` records ago (the card has run it), and
+/// feeds the latest completed exposure multiplier back to `crate::ambient`.
 fn write_old(pass: &Pass, now: u64) {
+    static DRAIN: Mutex<()> = Mutex::new(());
+    let _guard = DRAIN.lock().unwrap_or_else(|e| e.into_inner());
+    if !file_on() {
+        for back in 1..=LAG {
+            let Some(old) = now.checked_sub(back) else {
+                break;
+            };
+            let slot = old % RING;
+            // SAFETY: the ring's mapping; sentinel at dword 63 is written last by GPU.
+            let done = unsafe { ((pass.data + (slot * RECORD * 4 + 252) as usize) as *const u32).read_volatile() };
+            if u64::from(done) == slot + 1 {
+                // SAFETY: slot completed on GPU; word 4 holds `before.Load(0).x` (exposure).
+                let exp = f32::from_bits(unsafe {
+                    ((pass.data + (slot * RECORD * 4 + 16) as usize) as *const u32).read_volatile()
+                });
+                crate::ambient::note_exposure(exp);
+                unsafe { ((pass.data + (slot * RECORD * 4 + 252) as usize) as *mut u32).write_volatile(0) };
+                break;
+            }
+        }
+        return;
+    }
     let Some(old) = now.checked_sub(LAG) else {
         return;
     };
@@ -206,6 +236,7 @@ fn write_old(pass: &Pass, now: u64) {
         return;
     }
     let f = |i: usize| f32::from_bits(words[i]);
+    crate::ambient::note_exposure(f(4));
     let ms = WHEN[slot as usize].load(Relaxed);
     let samples = words[16];
     let mean = |i: usize| if samples == 0 { 0.0 } else { f64::from(words[i]) / 256.0 / f64::from(samples) };
@@ -233,15 +264,20 @@ pub(crate) fn after_exposure(list: &HostList, average: D3D12_GPU_DESCRIPTOR_HAND
         return false;
     };
     let n = ASKED.fetch_add(1, Relaxed);
-    WHEN[(n % RING) as usize].store(crate::host::now_ms(), Relaxed);
+    let csv = file_on();
+    if csv {
+        WHEN[(n % RING) as usize].store(crate::host::now_ms(), Relaxed);
+    }
     write_old(pass, n);
-    let stats = crate::ambient::probe_buffers();
+    let stats = csv.then(crate::ambient::probe_buffers).flatten();
     let words = [(n % RING) as u32, crate::ambient::CELLS_AT, u32::from(stats.is_some()), 0];
     list.keep(&pass.ring);
     let l = &list.list;
     // SAFETY: an open list with the views' heap set; buffers kept.
     unsafe {
-        uav_barrier(l);
+        if stats.is_some() {
+            uav_barrier(l);
+        }
         l.SetComputeRootSignature(&pass.exposure.0);
         l.SetPipelineState(&pass.exposure.1);
         l.SetComputeRoot32BitConstants(0, 4, words.as_ptr().cast(), 0);
@@ -259,7 +295,9 @@ pub(crate) fn after_exposure(list: &HostList, average: D3D12_GPU_DESCRIPTOR_HAND
         l.SetComputeRootUnorderedAccessView(4, a);
         l.SetComputeRootUnorderedAccessView(5, b);
         l.Dispatch(1, 1, 1);
-        uav_barrier(l);
+        if stats.is_some() {
+            uav_barrier(l);
+        }
     }
     true
 }

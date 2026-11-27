@@ -251,14 +251,14 @@ pub fn run(
         victory_core::ensure_outside_repo(Path::new(&dir))?;
     }
     let paths = crate::default_paths(paths)?;
-    let host_caps = if pipelines {
+    let (host_caps, native16) = if pipelines {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         if let Some(name) = host.adapter_name() {
             println!("pipeline adapter: {name}");
         }
-        host.translation_caps()
+        (host.translation_caps(), host.native16())
     } else {
-        None
+        (None, false)
     };
     // Without VICTORY_HOST_WAVE / VICTORY_HOST_MAX_WAVE (`wave`, set per
     // worker), translate as for the adapter the pipelines are made on.
@@ -267,11 +267,25 @@ pub fn run(
     {
         victory_shader::emit::set_host_max_wave(lanes);
     }
+    // `VICTORY_HOST_LDS_KIB=48`: as for a card that runs more shared memory than D3D12's 32 KiB
+    // (NVIDIA's, which the runtime says so for).
+    if let Some(n) = std::env::var("VICTORY_HOST_LDS_KIB")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        victory_shader::emit::set_host_lds_bytes(n * 1024);
+    }
     // `VICTORY_HOST_RDNA=1`: as for an AMD RDNA card (`VICTORY_RDNA_FLOAT`).
     victory_shader::emit::set_host_rdna(std::env::var_os("VICTORY_HOST_RDNA").map_or_else(
         || host_caps.is_some_and(|(_, rdna)| rdna),
         |v| v == "1",
     ));
+    // f16 arithmetic in native `half` as for the adapter the pipelines are made
+    // on, where it has it (`VICTORY_F16_IN_F32=1`: in f32, as without
+    // pipelines).
+    victory_shader::emit::set_host_native16(
+        native16 && std::env::var_os("VICTORY_F16_IN_F32").is_none_or(|v| v == "0"),
+    );
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;

@@ -48,8 +48,18 @@ pub(crate) fn on() -> bool {
 /// be asked for (it is `asked + 1` then). A round asked for and not begun
 /// yet (`asked >= done + 2`: the one before it is not done) begins after
 /// now; with `asked == done + 1` round `asked` may be running already.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn round_after(asked: u64, done: u64) -> (u64, bool) {
     if asked >= done + 2 { (asked, false) } else { (asked + 1, true) }
+}
+
+/// With rounds `asked` asked for and `started` already begun by the heap-sync
+/// thread: returns a round number guaranteed to begin after now, and whether
+/// `asked` must be incremented to queue one. When `asked > started`, the
+/// queued round `asked` has not begun yet and coalesces all callers arriving
+/// before it starts.
+pub(crate) fn round_after_started(asked: u64, started: u64) -> (u64, bool) {
+    if asked > started { (asked, false) } else { (asked + 1, true) }
 }
 
 thread_local! {

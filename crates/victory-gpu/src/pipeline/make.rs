@@ -37,6 +37,9 @@ pub(crate) struct Pending {
     /// Taken by a worker from [`Queue::slow`].
     was_slow: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
+    /// Per-pipeline completion signal so unrelated pipelines never contend on a
+    /// global wait lock (`avatarmanz#448`).
+    done: (Mutex<()>, Condvar),
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
     key: String,
@@ -97,6 +100,7 @@ impl Pending {
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
             made: OnceLock::new(),
+            done: (Mutex::new(()), Condvar::new()),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
             waited_us: AtomicU64::new(0),
@@ -130,7 +134,14 @@ impl Pending {
                 }
             }
         });
-        let (lock, done) = &DONE;
+        self.notify_waiters();
+    }
+
+    /// Wakes this pipeline's waiters after publishing its result. Taking the
+    /// lock prevents a waiter from missing the notification between checking
+    /// the result and going to sleep.
+    fn notify_waiters(&self) {
+        let (lock, done) = &self.done;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
@@ -167,9 +178,6 @@ pub(crate) fn hashes(p: &Pending) -> String {
     let hashes: Vec<&str> = p.shaders.iter().map(|s| s.hash.as_str()).collect();
     hashes.join("+")
 }
-
-/// Signalled whenever a worker has made a pipeline.
-static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
 /// Waiting allowed per title frame, over all threads.
 fn wait_budget() -> Duration {
@@ -422,7 +430,7 @@ fn wait(p: &Pending, frame: u64) {
         return;
     }
     let waiting = crate::timeline::span("pipeline: first use waits for a host pipeline");
-    let (lock, done) = &DONE;
+    let (lock, done) = &p.done;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
         let rest = left.saturating_sub(started.elapsed());
@@ -696,6 +704,23 @@ mod tests {
         assert_eq!(worker_count(None, 64), 16);
         assert_eq!(worker_count(Some(0), 24), 1);
         assert_eq!(worker_count(Some(20), 24), 20);
+    }
+
+    #[test]
+    fn completing_one_pipeline_does_not_take_another_pipelines_wait_lock() {
+        let pending = Pending::new(Vec::new(), None);
+        let held = pending.done.0.lock().unwrap();
+        let (send, finished) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let unrelated = Pending::new(Vec::new(), None);
+            unrelated.make();
+            send.send(unrelated.made.get().is_some()).unwrap();
+        });
+        let result = finished.recv_timeout(Duration::from_secs(5));
+        drop(held);
+        worker.join().unwrap();
+        assert_eq!(result, Ok(true));
+        assert!(pending.made.get().is_none());
     }
 
     /// A first use queues the pipeline and, within the budget, gets the

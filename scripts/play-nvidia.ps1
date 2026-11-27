@@ -425,15 +425,17 @@ if ($Quality) {
 }
 
 if (-not $NoAmbient -and -not $RayTracing) {
-    $settings.VICTORY_AMBIENT               = '1.0'
-    $settings.VICTORY_AMBIENT_AIR           = '1.5'
-    # 2.0 + CLEAN=1 keeps interiors natural without whiteout veil or camera-cut ghosts.
-    $settings.VICTORY_AMBIENT_MOST          = '2.0'
-    $settings.VICTORY_AMBIENT_CLEAN         = '1'
-    $settings.VICTORY_AMBIENT_SHADE         = '0.7,0.5'
-    $settings.VICTORY_AMBIENT_REFL          = '2.0'
-    $settings.VICTORY_AMBIENT_REFLECT       = '0.6'
-    $settings.VICTORY_AMBIENT_REFLECT_LEAST = '0.20'
+    $settings.VICTORY_AMBIENT                = '1.0'
+    $settings.VICTORY_AMBIENT_AIR            = '1.5'
+    # 4.0 + CLEAN=1 + EXPOSURE_FLOOR=0.0045 lifts dark fixed-EV interiors (diner at EV -9.75)
+    # without over-brightening outdoor scenes or introducing whiteout haze.
+    $settings.VICTORY_AMBIENT_MOST           = '4.0'
+    $settings.VICTORY_AMBIENT_CLEAN          = '1'
+    $settings.VICTORY_AMBIENT_EXPOSURE_FLOOR = '0.0045'
+    $settings.VICTORY_AMBIENT_SHADE          = '0.7,0.5'
+    $settings.VICTORY_AMBIENT_REFL           = '2.0'
+    $settings.VICTORY_AMBIENT_REFLECT        = '1.2'
+    $settings.VICTORY_AMBIENT_REFLECT_LEAST  = '0.20'
 }
 
 if ($RayTracing) {

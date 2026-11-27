@@ -351,11 +351,16 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
             _ => {}
         }
     }
+    Ok(dependency_levels(does, &order))
+}
+
+/// The original pairwise planner, also used for small or degenerate inputs.
+fn pairwise_levels(does: &[Does], order: &[usize]) -> Vec<(usize, u32)> {
     let mut out: Vec<(usize, u32)> = Vec::with_capacity(order.len());
     // The copies among them, which alone put others behind them or have to
     // stand behind others.
     let mut copies: Vec<usize> = Vec::new();
-    for &i in &order {
+    for &i in order {
         let Some((r, w)) = reads_writes(&does[i]) else {
             continue;
         };
@@ -379,7 +384,100 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
         }
         out.push((i, level));
     }
-    Ok(out)
+    out
+}
+
+/// Range-maximum segment tree over compressed address intervals (`Belobug#437`).
+struct LevelIndex {
+    size: usize,
+    max: Vec<u32>,
+    tag: Vec<u32>,
+}
+
+impl LevelIndex {
+    fn new(cells: usize) -> Self {
+        let size = cells.max(1).next_power_of_two();
+        Self { size, max: vec![0; 2 * size], tag: vec![0; 2 * size] }
+    }
+
+    fn raise(&mut self, from: usize, to: usize, value: u32) {
+        self.raise_at(1, 0, self.size, from, to, value);
+    }
+
+    fn raise_at(&mut self, node: usize, lo: usize, hi: usize, from: usize, to: usize, value: u32) {
+        if to <= lo || hi <= from {
+            return;
+        }
+        self.max[node] = self.max[node].max(value);
+        if from <= lo && hi <= to {
+            self.tag[node] = self.tag[node].max(value);
+            return;
+        }
+        let mid = (lo + hi) / 2;
+        self.raise_at(node * 2, lo, mid, from, to, value);
+        self.raise_at(node * 2 + 1, mid, hi, from, to, value);
+    }
+
+    fn query(&self, from: usize, to: usize) -> u32 {
+        self.query_at(1, 0, self.size, from, to)
+    }
+
+    fn query_at(&self, node: usize, lo: usize, hi: usize, from: usize, to: usize) -> u32 {
+        if to <= lo || hi <= from {
+            return 0;
+        }
+        if from <= lo && hi <= to {
+            return self.max[node];
+        }
+        let mid = (lo + hi) / 2;
+        self.tag[node]
+            .max(self.query_at(node * 2, lo, mid, from, to))
+            .max(self.query_at(node * 2 + 1, mid, hi, from, to))
+    }
+}
+
+/// O(N log N) dependency level assignment for large step batches.
+fn indexed_levels(does: &[Does], order: &[usize]) -> Option<Vec<(usize, u32)>> {
+    let mut ends = Vec::with_capacity(order.len() * 4);
+    for &i in order {
+        let (r, w) = reads_writes(&does[i])?;
+        if r.0 >= r.1 || (w != (0, 0) && w.0 >= w.1) {
+            return None;
+        }
+        ends.extend([r.0, r.1]);
+        if w.0 < w.1 {
+            ends.extend([w.0, w.1]);
+        }
+    }
+    ends.sort_unstable();
+    ends.dedup();
+    let index = |a: usize| ends.binary_search(&a).expect("collected endpoint");
+    let mut reads = LevelIndex::new(ends.len().saturating_sub(1));
+    let mut writes = LevelIndex::new(ends.len().saturating_sub(1));
+    let mut out = Vec::with_capacity(order.len());
+    for &i in order {
+        let (r, w) = reads_writes(&does[i])?;
+        let (a, b) = (index(r.0), index(r.1));
+        let mut level = writes.query(a, b);
+        if w.0 < w.1 {
+            let (c, d) = (index(w.0), index(w.1));
+            level = level.max(writes.query(c, d)).max(reads.query(c, d));
+            writes.raise(c, d, level + 1);
+        }
+        reads.raise(a, b, level + 1);
+        out.push((i, level));
+    }
+    Some(out)
+}
+
+fn dependency_levels(does: &[Does], order: &[usize]) -> Vec<(usize, u32)> {
+    let copies = order.iter().filter(|&&i| matches!(does[i], Does::Copy { len, .. } if len > 0)).count();
+    if order.len().saturating_mul(copies) >= 262_144
+        && let Some(levels) = indexed_levels(does, order)
+    {
+        return levels;
+    }
+    pairwise_levels(does, order)
 }
 
 /// Whether a refresh of `does` brings a host copy other than `shadow` up to
@@ -612,6 +710,8 @@ fn record(
 struct Own {
     list: HostList,
     between: ID3D12Resource,
+    /// What the buffer between held, read back (`avatarmanz#434` [`late`]).
+    back: Option<ID3D12Resource>,
 }
 
 // SAFETY: D3D12 objects are free-threaded, and the list is touched by one
@@ -633,7 +733,108 @@ pub(super) struct Taken {
     own: Own,
     steps: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
     copied: Vec<(Arc<Shadow>, usize, usize)>,
+    /// The fills' places, lengths and places in the buffer between ([`late`]).
+    sent: Vec<(usize, usize, u64)>,
+    /// The fills of the submission done on the CPU: upload memory, place, length ([`late`]).
+    cpu: Vec<(usize, usize, usize)>,
 }
+
+/// Learns pages the title overwrites between submission and landing so
+/// skinned character constant buffers never stretch (`avatarmanz#434`).
+/// Opt-in (`VICTORY_CARD_STEPS_LEARN=1`): learning a page inside the title's
+/// shared constant-buffer ring permanently forces synchronous GPU settles
+/// (~39 ms/frame on RTX 4090), so it stays off by default for fast GPUs.
+mod late {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    const PAGE: usize = 4096;
+
+    static PAGES: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+    pub(super) static COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+    pub(super) fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_STEPS_LEARN").is_some_and(|v| v == "1"))
+    }
+
+    pub(super) fn written(from: usize, to: usize) -> bool {
+        let pages = PAGES.lock().unwrap_or_else(|e| e.into_inner());
+        pages.as_ref().is_some_and(|p| (from / PAGE..to.div_ceil(PAGE)).any(|page| p.contains(&page)))
+    }
+
+    pub(super) fn landed(sent: &[(usize, usize, u64)], back: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RANGE;
+        let Some(end) = sent.iter().map(|&(_, len, at)| at as usize + len).max() else {
+            return;
+        };
+        let mut mapped: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: a read-back buffer the landed list wrote, `end` bytes of it.
+        if unsafe { back.Map(0, Some(&D3D12_RANGE { Begin: 0, End: end }), Some(&mut mapped)) }.is_err() || mapped.is_null() {
+            return;
+        }
+        // SAFETY: mapped, `end` bytes.
+        compare(sent, unsafe { std::slice::from_raw_parts(mapped as *const u8, end) });
+        // SAFETY: mapped above; nothing written.
+        unsafe { back.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 })) };
+    }
+
+    pub(super) fn compare(sent: &[(usize, usize, u64)], card: &[u8]) {
+        let mut now = Vec::new();
+        for &(src, len, at) in sent {
+            let Some(read) = card.get(at as usize..at as usize + len) else { continue };
+            now.clear();
+            now.resize(len, 0);
+            if !crate::host::read_into(src as *const u8, &mut now) {
+                continue;
+            }
+            COUNTS[0].fetch_add(1, Ordering::Relaxed);
+            if now == read {
+                continue;
+            }
+            COUNTS[1].fetch_add(1, Ordering::Relaxed);
+            learn(src, src + len, "on the card");
+        }
+    }
+
+    pub(super) fn landed_cpu(cpu: &[(usize, usize, usize)]) {
+        let mut now = Vec::new();
+        for &(dst, src, len) in cpu {
+            now.clear();
+            now.resize(len, 0);
+            if !crate::host::read_into(src as *const u8, &mut now) {
+                continue;
+            }
+            // SAFETY: the submission's upload memory, alive until its lists are reset, after this.
+            let read = unsafe { std::slice::from_raw_parts(dst as *const u8, len) };
+            COUNTS[4].fetch_add(1, Ordering::Relaxed);
+            if now == read {
+                continue;
+            }
+            COUNTS[5].fetch_add(1, Ordering::Relaxed);
+            learn(src, src + len, "on the CPU");
+        }
+    }
+
+    fn learn(from: usize, to: usize, by: &str) {
+        let mut pages = PAGES.lock().unwrap_or_else(|e| e.into_inner());
+        let pages = pages.get_or_insert_with(Default::default);
+        for page in from / PAGE..to.div_ceil(PAGE) {
+            if pages.insert(page) {
+                COUNTS[3].fetch_add(1, Ordering::Relaxed);
+                tracing::info!(
+                    page = format_args!("{:#x}", page * PAGE),
+                    fill = format_args!("{from:#x}+{:#x}", to - from),
+                    by,
+                    "card steps: the title wrote a constant buffer after the submission that reads it was sent; fills \
+                     there wait from now on"
+                );
+            }
+        }
+    }
+}
+
+const WRITTEN_LATE: &str = "a fill reads a place the title was found writing after sending";
 
 impl Taken {
     pub(super) fn list(&self) -> &HostList {
@@ -656,6 +857,10 @@ impl Taken {
 
     /// The submission has run and landed: the list and its buffer are free.
     pub(super) fn landed(self) {
+        if let Some(back) = &self.own.back {
+            late::landed(&self.sent, back);
+        }
+        late::landed_cpu(&self.cpu);
         // The host copies its steps held go; its commands stay until the
         // next use resets it.
         drop(std::mem::take(&mut *self.own.list.deferred()));
@@ -715,6 +920,14 @@ impl Host {
             }
         }
         let chosen = chosen?;
+        // Every fill of the submission, taken or not: one done on the CPU is
+        // done now too, not after the wait ([`late`]).
+        if late::on()
+            && does.iter().any(|d| matches!(*d, Does::Fill { src, len, .. } if late::written(src, src + len)))
+        {
+            late::COUNTS[2].fetch_add(1, Ordering::Relaxed);
+            return Err(WRITTEN_LATE);
+        }
         if chosen.is_empty() {
             return Ok(None);
         }
@@ -856,6 +1069,18 @@ impl Host {
             }
             record(level == 0, &own.list.list, &own.between, &reads, &writes);
         }
+        // What the fills read, read back ([`late`]): each place once.
+        let mut sent: Vec<(usize, usize, u64)> = Vec::new();
+        if let Some(back) = own.back.as_ref().filter(|_| late::on() && end > 0) {
+            // SAFETY: an open list; both buffers live and `BETWEEN` long.
+            unsafe { own.list.list.CopyBufferRegion(back, 0, &own.between, 0, end) };
+            let mut seen: HashMap<(usize, usize), ()> = HashMap::default();
+            for op in ops.iter().filter(|op| !matches!(op.to, To::Copy(..))) {
+                if seen.insert((op.from.1, op.len), ()).is_none() {
+                    sent.push((op.from.1, op.len, op.at));
+                }
+            }
+        }
         own.list.close();
         // SAFETY: a live buffer.
         let gpu = unsafe { own.between.GetGPUVirtualAddress() };
@@ -881,10 +1106,27 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         noted(&ops);
         spent.end();
+        let steps: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>> =
+            chosen.iter().map(|&(i, _)| steps[i]).collect();
+        let mut cpu = Vec::new();
+        if late::on() {
+            for list in runs {
+                let at = std::ptr::from_ref::<HostList>(list) as usize;
+                for (i, step) in list.deferred().copies.iter().enumerate() {
+                    if let &Step::Fill(dst, src, len, _) = step
+                        && !steps.contains(&(at, i))
+                    {
+                        cpu.push((dst, src, len));
+                    }
+                }
+            }
+        }
         Ok(Some(Taken {
             own,
-            steps: chosen.iter().map(|&(i, _)| steps[i]).collect(),
+            steps,
             copied,
+            sent,
+            cpu,
         }))
     }
 
@@ -898,7 +1140,8 @@ impl Host {
         let between = self.uav_buffer(BETWEEN)?;
         name(&between, || "copies of title memory on the card".into());
         let list = self.new_list().ok()?;
-        Some(Own { list, between })
+        let back = if late::on() { self.read_back_buffer(BETWEEN) } else { None };
+        Some(Own { list, between, back })
     }
 }
 
@@ -939,6 +1182,24 @@ pub(super) fn log(frames: f64) {
         d[2] / 1024.0,
         d[3],
     );
+    if late::on() {
+        let c: Vec<f64> = late::COUNTS
+            .iter()
+            .enumerate()
+            .map(|(i, c)| if i == 3 { 0.0 } else { c.swap(0, Ordering::Relaxed) as f64 / frames })
+            .collect();
+        tracing::info!(
+            "card steps, places the title writes after sending (VICTORY_CARD_STEPS_LEARN), per frame: {:.1} fills on the card \
+             and {:.1} on the CPU compared at landing, {:.2} and {:.2} found written again, {:.2} submissions waited for a \
+             learned page; {} pages learned",
+            c[0],
+            c[4],
+            c[1],
+            c[5],
+            c[2],
+            late::COUNTS[3].load(Ordering::Relaxed)
+        );
+    }
     #[cfg(feature = "diagnostics")]
     {
         let r: Vec<f64> = place::READERS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -1077,6 +1338,57 @@ mod tests {
         assert_eq!(behind(&[placed, copy(3000, 5000, 8, true)]), Some((0, 1)));
         assert_eq!(behind(&[copy(2060, 5000, 8, true), placed]), None);
         assert_eq!(behind(&[placed, copy(2060, 5000, 8, true)]), Some((0, 1)));
+    }
+
+    #[test]
+    fn indexed_dependencies_match_pairwise() {
+        let mut seed = 0x12345678u32;
+        let mut random = |n: usize| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as usize % n
+        };
+        for count in [1, 2, 17, 129, 1024, 2800] {
+            for _ in 0..8 {
+                let does: Vec<_> = (0..count)
+                    .map(|_| {
+                        let src = random(8192);
+                        let dst = random(8192);
+                        let len = 1 + random(256);
+                        if random(3) == 0 {
+                            fill(src, len, true)
+                        } else {
+                            copy(dst, src, len, true)
+                        }
+                    })
+                    .collect();
+                let order: Vec<_> = (0..count).filter(|_| random(5) != 0).collect();
+                let expected = pairwise_levels(&does, &order);
+                assert_eq!(indexed_levels(&does, &order), Some(expected.clone()));
+                assert_eq!(dependency_levels(&does, &order), expected);
+            }
+        }
+        let adjacent = [copy(32, 0, 16, true), fill(48, 8, true), fill(47, 2, true)];
+        assert_eq!(indexed_levels(&adjacent, &[0, 1, 2]), Some(vec![(0, 0), (1, 0), (2, 1)]));
+        let empty = [copy(32, 0, 16, true), fill(33, 0, true)];
+        assert!(indexed_levels(&empty, &[0, 1]).is_none());
+        assert_eq!(dependency_levels(&empty, &[0, 1]), pairwise_levels(&empty, &[0, 1]));
+    }
+
+    #[test]
+    fn places_written_after_sending_are_learned() {
+        let memory = vec![0u8; 4 * 4096];
+        let page = (memory.as_ptr() as usize).next_multiple_of(4096);
+        let (kept, changed) = (page, page + 4096 + 64);
+        let sent = [(kept, 32, 0), (changed, 240, 256)];
+        let card = vec![0u8; 512];
+        // SAFETY: inside `memory`.
+        unsafe { *(changed as *mut u8).add(88) = 1 };
+        assert!(!late::written(kept, kept + 32) && !late::written(changed, changed + 240));
+        late::compare(&sent, &card);
+        assert!(!late::written(kept, kept + 32));
+        assert!(late::written(changed, changed + 240));
+        assert!(late::written(page + 4096, page + 4096 + 16));
+        drop(memory);
     }
 
     /// Whatever the steps, done level by level (in a level every read

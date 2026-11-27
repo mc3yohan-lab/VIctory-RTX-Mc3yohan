@@ -664,7 +664,22 @@ impl Memory {
             let at = unsafe { self.faults.1.add(i) };
             // SAFETY: as above.
             let page = unsafe { at.read_volatile() };
-            if page != 0 {
+            if page >= victory_shader::emit::PAIR_NOTE {
+                // Not a page: the two host waves of a console wave in some program waited for
+                // each other until they gave up (`pair_wait`), and went on without what the
+                // other was to give. Said once for each program.
+                static SAID_PAIR: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+                let mut said = SAID_PAIR.lock().unwrap_or_else(|e| e.into_inner());
+                if !said.contains(&page) {
+                    said.push(page);
+                    tracing::warn!(
+                        program = format!("{:07x}", page & 0x0FFF_FFFF),
+                        "the two host waves of a console wave gave up waiting for each other in a shader (hash starts with `program`)"
+                    );
+                }
+                // SAFETY: as above.
+                unsafe { at.write_volatile(0) };
+            } else if page != 0 {
                 pages.push(u64::from(page));
                 // SAFETY: as above.
                 unsafe { at.write_volatile(0) };
@@ -888,6 +903,45 @@ fn merge(title: &[u8; PIECE], ours: &mut [u8], never: bool) -> usize {
     changed
 }
 
+impl Memory {
+    fn begin_frame(&mut self, frame: u64) {
+        if self.frame != frame {
+            self.frame = frame;
+            self.refused.clear();
+            self.take_faults();
+            self.look_again();
+            self.report();
+            #[cfg(feature = "diagnostics")]
+            self.trace.look(frame);
+        }
+    }
+}
+
+/// GPU virtual address of the shared fault-notes UAV (`SLOT_FAULTS`) for
+/// shaders that bind `SLOT_FAULTS` without reading title memory by address
+/// (e.g. `pair_wait` timeouts under `VICTORY_PAIR_SYNC=1`), also draining
+/// any pending fault/pair notes once per frame.
+pub(crate) fn faults_va() -> Option<u64> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static VA: AtomicU64 = AtomicU64::new(0);
+    static LAST_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+    let frame = crate::frame::current();
+    let va = VA.load(Ordering::Acquire);
+    if va != 0 && LAST_FRAME.load(Ordering::Relaxed) == frame {
+        return Some(va);
+    }
+    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Memory::new();
+    }
+    let m = guard.as_mut()?;
+    m.begin_frame(frame);
+    let gpu = m.faults.2;
+    VA.store(gpu, Ordering::Release);
+    LAST_FRAME.store(frame, Ordering::Relaxed);
+    Some(gpu)
+}
+
 /// Before a draw whose shader reads title memory by address: what its
 /// root arguments name is made ready (`addresses`: its root views, of them
 /// `written` those it writes; `constants`: its root constants, see the
@@ -909,15 +963,7 @@ pub(crate) fn ready(
     }
     let m = guard.as_mut()?;
     let frame = crate::frame::current();
-    if m.frame != frame {
-        m.frame = frame;
-        m.refused.clear();
-        m.take_faults();
-        m.look_again();
-        m.report();
-        #[cfg(feature = "diagnostics")]
-        m.trace.look(frame);
-    }
+    m.begin_frame(frame);
     #[cfg(feature = "diagnostics")]
     if use_ != Use::Reads {
         m.trace.dispatch(frame, list, addresses, written, constants, threads);

@@ -168,6 +168,34 @@ fn an_explicit_adapter_matches_an_index_or_name() {
 }
 
 impl Host {
+    #[cfg(test)]
+    pub(super) fn check_hardware_validation(&self) {
+        if std::env::var_os("VICTORY_D3D12_DEBUG").is_none() {
+            return;
+        }
+        let queue: ID3D12InfoQueue = self.device.cast().expect("D3D12 debug layer");
+        let (mut errors, mut warnings) = (0, 0);
+        // SAFETY: storage is aligned for the message and sized for its inline text.
+        unsafe {
+            for i in 0..queue.GetNumStoredMessages() {
+                let mut size = 0;
+                queue.GetMessage(i, None, &mut size).unwrap();
+                let mut storage = vec![0u64; size.div_ceil(8)];
+                let message = storage.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                queue.GetMessage(i, Some(message), &mut size).unwrap();
+                let message = &*message;
+                if message.Severity.0 <= D3D12_MESSAGE_SEVERITY_WARNING.0 {
+                    let text = std::slice::from_raw_parts(message.pDescription, message.DescriptionByteLength);
+                    eprintln!("D3D12 #{}: {}", message.ID.0, String::from_utf8_lossy(text).trim_end_matches('\0'));
+                    if message.Severity == D3D12_MESSAGE_SEVERITY_WARNING { warnings += 1 } else { errors += 1 }
+                }
+            }
+            assert_eq!(queue.GetNumMessagesDiscardedByMessageCountLimit(), 0);
+        }
+        eprintln!("D3D12 hardware validation: {errors} errors, {warnings} warnings");
+        assert_eq!(errors, 0);
+    }
+
     /// The preferred hardware adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
@@ -233,6 +261,57 @@ impl Host {
             && waves.WaveLaneCountMax == 64
             && adapter_desc(&self.device).is_ok_and(|desc| desc.VendorId == 0x1002);
         Some((waves.WaveLaneCountMax, rdna))
+    }
+
+    /// What [`super::set_host_native16`] asks of the host: native 16-bit
+    /// operations (D3D12 `Native16BitShaderOpsSupported`, SM 6.2 and up,
+    /// which the device already has) whose 16-bit `FMad` rounds once, as
+    /// the console's `v_fma_f16` does ([`Self::rounds_f16_fmad_once`]). WARP
+    /// has the operations but rounds a 16-bit `FMad` in f32 first.
+    pub fn native16(&self) -> bool {
+        self.native16_ops() && self.rounds_f16_fmad_once().unwrap_or(false)
+    }
+
+    /// Whether the device reports native 16-bit operations.
+    pub fn native16_ops(&self) -> bool {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS4::default();
+        // SAFETY: the query writes the structure of the given size.
+        unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS4,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_ok()
+            && options.Native16BitShaderOpsSupported.as_bool()
+    }
+
+    /// Whether `v_fma_f16`, lowered natively (`half` `FMad`), rounds once
+    /// here: (1 + 2^-10) x 1.5 - 2^-24 (Marvisak/VIctory#2384) is 0x3E01
+    /// rounded once, 0x3E02 rounded in f32 first (WARP). One dispatch.
+    pub fn rounds_f16_fmad_once(&self) -> Result<bool, String> {
+        let shader = fma_f16_probe().map_err(|e| e.to_string())?;
+        let (root, pso) = self.compute_pipeline(&shader)?;
+        let operands = [0x3C01, 0x3E00, 0x8001];
+        let mut user_data = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if u.root == crate::native::RootType::Constants {
+                user_data[u.index as usize] = operands.get(u.dword as usize).copied().unwrap_or(0);
+            }
+        }
+        let out = self.dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(user_data))],
+                views: &[View::RawUav(1)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )?;
+        let bits = out.first().and_then(|w| w.first()).ok_or("no result")?;
+        Ok(bits & 0xFFFF == 0x3E01)
     }
 
     /// The root signature translated shaders expect: user data per stage
@@ -728,8 +807,96 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
     }
 }
 
+/// `v_fma_f16 v0, s0, s1, s2` (through VGPRs, lowered natively) stored to
+/// dword 0 of the raw UAV a table at s4 names, lowered as a title's program
+/// is ([`Host::rounds_f16_fmad_once`]).
+fn fma_f16_probe() -> Result<HostShader, crate::ShaderError> {
+    use crate::native::{
+        ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
+    };
+    use crate::{io, ir, resource, structure};
+    let words: [u32; 10] = [
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0xFA00_0000,
+        0x7E02_0200, // v_mov_b32 v1, s0
+        0x7E04_0201, // v_mov_b32 v2, s1
+        0x7E06_0202, // v_mov_b32 v3, s2
+        0xD74B_0000, // v_fma_f16 v0, v1, v2, v3
+        0x040E_0501,
+        0xE070_0000, // buffer_store_dword v0, off, s[8:11], 0
+        0x8002_0000,
+    ];
+    let code: Vec<u8> = words.iter().chain(&[0xBF81_0000]).flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
+            threads: [1, 1, 1],
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs)?;
+    let st = structure::structure(&p)?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let io = io::raise(&p, &native)?;
+    let lowered = super::lower::lower(&super::lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        native16: true,
+    })?;
+    Ok(HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+        half_views: lowered.half_views,
+    })
+}
+
 /// A root argument for [`Host::draw`].
-#[cfg(test)]
 pub enum Root {
     Constants(Vec<u32>),
     /// A table starting at this heap index.
@@ -1081,7 +1248,6 @@ impl Host {
     }
 }
 
-#[cfg(test)]
 fn transition(
     r: &ID3D12Resource,
     before: D3D12_RESOURCE_STATES,
@@ -1103,7 +1269,6 @@ fn transition(
 }
 
 /// A view in the heap for [`Host::dispatch`].
-#[cfg(test)]
 #[derive(Clone, Copy)]
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
@@ -1128,7 +1293,6 @@ pub enum View<'a> {
 }
 
 /// How [`View::Buffer`] is viewed.
-#[cfg(test)]
 #[derive(Clone, Copy)]
 pub enum Stride {
     Raw,
@@ -1142,7 +1306,6 @@ pub enum Stride {
 
 /// Bindings for [`Host::dispatch`]: root arguments, the view heap in order,
 /// the sampler heap, and the group counts.
-#[cfg(test)]
 pub struct Dispatch<'a> {
     pub roots: Vec<(u32, Root)>,
     pub views: &'a [View<'a>],
@@ -1150,7 +1313,6 @@ pub struct Dispatch<'a> {
     pub groups: [u32; 3],
 }
 
-#[cfg(test)]
 impl Host {
     /// Runs a compute pipeline and returns each UAV's contents in heap
     /// order (texels as float bits, row by row).
@@ -1160,6 +1322,18 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Dispatch,
     ) -> Result<Vec<Vec<u32>>, String> {
+        self.dispatch_repeated(root, pso, d, 1).map(|(output, _)| output)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn dispatch_repeated(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+        passes: u32,
+    ) -> Result<(Vec<Vec<u32>>, f64), String> {
+        assert!(passes > 0);
         let dev = &self.device;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
         // stay alive until the fence says the GPU is done.
@@ -1532,7 +1706,45 @@ impl Host {
                 }
             }
             let [x, y, z] = d.groups;
-            list.Dispatch(x, y, z);
+            let timing = if passes > 1 {
+                let mut query: Option<ID3D12QueryHeap> = None;
+                dev.CreateQueryHeap(
+                    &D3D12_QUERY_HEAP_DESC {
+                        Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                        Count: 2,
+                        NodeMask: 0,
+                    },
+                    &mut query,
+                )
+                .map_err(err)?;
+                let back = make(
+                    D3D12_HEAP_TYPE_READBACK,
+                    &buffer(16, D3D12_RESOURCE_FLAG_NONE),
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )?;
+                let query = query.ok_or("no timestamp query heap")?;
+                list.EndQuery(&query, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                Some((query, back))
+            } else {
+                None
+            };
+            let uav_order = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER::default()),
+                },
+                ..Default::default()
+            };
+            for pass in 0..passes {
+                if pass != 0 {
+                    list.ResourceBarrier(std::slice::from_ref(&uav_order));
+                }
+                list.Dispatch(x, y, z);
+            }
+            if let Some((query, back)) = &timing {
+                list.EndQuery(query, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                list.ResolveQueryData(query, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, back, 0);
+            }
             for (r, size, n, rb) in &uavs {
                 // (Buffers were promoted from the common state by the dispatch.)
                 list.ResourceBarrier(&[transition(
@@ -1586,7 +1798,20 @@ impl Host {
                 out.push(words);
             }
             drop(keep);
-            Ok(out)
+            let ns = if let Some((_, back)) = timing {
+                let mut p = std::ptr::null_mut();
+                back.Map(0, None, Some(&mut p)).map_err(err)?;
+                let [start, end] = *p.cast::<[u64; 2]>();
+                back.Unmap(0, Some(&D3D12_RANGE::default()));
+                if end <= start {
+                    return Err("timestamp batch did not advance".into());
+                }
+                (end - start) as f64 * 1e9 / queue.GetTimestampFrequency().map_err(err)? as f64
+                    / f64::from(passes)
+            } else {
+                0.0
+            };
+            Ok((out, ns))
         }
     }
 }

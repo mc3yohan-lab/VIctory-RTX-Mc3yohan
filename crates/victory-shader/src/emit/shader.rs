@@ -132,10 +132,14 @@ pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    /// 16-bit types are used; with [`NATIVE_LOW_PRECISION`], as native
+    /// 16-bit ones (SM 6.2), not minimum precision.
+    pub const LOW_PRECISION: u64 = 1 << 5;
     pub const DOUBLES: u64 = 1 << 2;
     /// `[earlydepthstencil]`: depth and stencil are tested (and written)
     /// before the pixel program runs. No `SFI0` bit.
     pub const EARLY_DEPTH: u64 = 1 << 3;
+    pub const VIEWPORT_RT_INDEX: u64 = 1 << 9;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     /// Unordered views in a vertex, geometry or mesh program.
@@ -143,6 +147,7 @@ pub(crate) mod flags {
     pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
+    pub const NATIVE_LOW_PRECISION: u64 = 1 << 23;
     pub const INT64: u64 = 1 << 20;
     pub const ATOMIC_TYPED64: u64 = 1 << 27;
     pub const ATOMIC_HEAP64: u64 = 1 << 32;
@@ -615,6 +620,7 @@ impl Shader {
                 (flags::ROVS, used.rovs),
                 (flags::WAVE_OPS, used.wave_ops),
                 (flags::INT64, used.int64),
+                (flags::LOW_PRECISION | flags::NATIVE_LOW_PRECISION, used.native16),
                 (flags::TYPED_UAV_LOADS, used.typed_uav_loads),
                 (flags::RESOURCE_HEAP, used.heap_views),
                 (flags::SAMPLER_HEAP, used.heap_samplers),
@@ -936,6 +942,7 @@ impl Shader {
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
+        self.m.native16 = self.flags & flags::NATIVE_LOW_PRECISION != 0;
         let bitcode = self.m.write();
         super::bitcode::census::note(&self.m, &bitcode);
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
@@ -963,6 +970,9 @@ impl Shader {
         if self.flags & flags::ROVS != 0 {
             features |= 0x1000;
         }
+        if self.flags & flags::VIEWPORT_RT_INDEX != 0 {
+            features |= 0x2000;
+        }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;
         }
@@ -971,6 +981,9 @@ impl Shader {
         }
         if self.flags & flags::BARYCENTRICS != 0 {
             features |= 0x2_0000;
+        }
+        if self.flags & flags::NATIVE_LOW_PRECISION != 0 {
+            features |= 0x4_0000;
         }
         if self.flags & flags::RESOURCE_HEAP != 0 {
             features |= 0x200_0000;

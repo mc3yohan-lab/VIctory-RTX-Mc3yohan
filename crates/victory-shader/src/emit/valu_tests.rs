@@ -104,7 +104,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 
 /// [`build_valu_cs`] with `threads` threads in x (thread index in `v0`
 /// on entry, before `body`) and `lds_bytes` of LDS (a multiple of 512).
-fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
+pub(super) fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -173,6 +173,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        native16: false,
     })
     .expect("lower");
 
@@ -208,7 +209,7 @@ pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(()
 
 /// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
 /// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.
-fn run_cases(
+pub(super) fn run_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
     check: impl FnMut(&str, usize, [u32; 4], u32),
@@ -2080,6 +2081,7 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        native16: false,
     })
     .expect("lower");
 
@@ -2406,6 +2408,7 @@ fn halves_go_through_a_table_as_they_are_and_name_their_views() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        native16: false,
     })
     .expect("lower");
     assert_eq!(lowered.half_views, [(1, 0), (1, 8)]);
@@ -2563,6 +2566,7 @@ fn half_places_are_the_descriptors_the_program_loads() {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            native16: false,
         })
         .expect("lower")
     };
@@ -2685,6 +2689,7 @@ fn a_format_load_read_as_halves_loads_the_integer() {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            native16: false,
         })
         .expect("lower");
         HostShader {

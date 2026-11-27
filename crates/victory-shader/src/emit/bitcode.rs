@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 pub mod census;
+pub mod facts;
 pub mod opt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -31,6 +32,8 @@ enum TypeDef {
     Int(u32),
     Float,
     Double,
+    /// IEEE binary16 (native 16-bit operations, SM 6.2).
+    Half,
     /// Pointee and address space.
     Ptr(Ty, u32),
     Struct(Option<String>, Vec<Ty>),
@@ -108,6 +111,9 @@ pub(crate) enum Cast {
     FpToSi = 4,
     UiToFp = 5,
     SiToFp = 6,
+    /// 32- to 64-bit float: a plain double operation, unlike the integer conversions to
+    /// doubles (which need the double extensions flag).
+    FpExt = 8,
     Bitcast = 11,
 }
 
@@ -246,6 +252,17 @@ pub(crate) struct Module {
     named: Vec<(String, Vec<Md>)>,
     /// See [`Tag`]: by instruction.
     tags: HashMap<u32, Tag>,
+    /// The console operations several instructions make ([`facts::Made`]), by the last one.
+    made: HashMap<u32, facts::Made>,
+    /// What is known of instructions' values so far ([`Module::facts`]).
+    facts_seen: HashMap<u32, facts::Facts>,
+    /// The module uses native 16-bit types (`Usage::native16`): written
+    /// with their data layout.
+    pub native16: bool,
+    /// Written without the fast-math flags whatever [`opt::FAST`] says: a program whose
+    /// float results must be the console's bit for bit (the ordered paired FP32
+    /// reductions), while the others keep the flags.
+    pub exact_floats: bool,
 }
 
 impl Module {
@@ -270,6 +287,9 @@ impl Module {
     }
     pub fn double(&mut self) -> Ty {
         self.ty(TypeDef::Double)
+    }
+    pub fn half(&mut self) -> Ty {
+        self.ty(TypeDef::Half)
     }
     pub fn ptr(&mut self, to: Ty) -> Ty {
         self.ty(TypeDef::Ptr(to, 0))
@@ -409,6 +429,33 @@ impl Module {
     pub fn new_block(&mut self) -> usize {
         self.blocks.push(Block::default());
         self.blocks.len() - 1
+    }
+
+    /// Moves what `block` holds so far (its phis and instructions) into a new block, which has
+    /// no terminator yet, and sends every branch that went to `block` there. `block` goes on
+    /// empty, so code that is still being added to it follows whatever the caller puts
+    /// between the two (a loop that waits, say) without anyone's block number changing.
+    /// Not for block 0, the entry.
+    pub fn split_before(&mut self, block: usize) -> usize {
+        assert_ne!(block, 0, "the entry block stays first");
+        let head = self.new_block();
+        self.blocks[head].phis = std::mem::take(&mut self.blocks[block].phis);
+        self.blocks[head].body = std::mem::take(&mut self.blocks[block].body);
+        for b in &mut self.blocks {
+            match &mut b.term {
+                Some(Term::Br(t)) if *t == block => *t = head,
+                Some(Term::CondBr(_, t, f)) => {
+                    if *t == block {
+                        *t = head;
+                    }
+                    if *f == block {
+                        *f = head;
+                    }
+                }
+                _ => {}
+            }
+        }
+        head
     }
 
     pub fn type_of(&self, v: V) -> Ty {
@@ -603,6 +650,7 @@ impl Module {
                 TypeDef::Void => w.record(2, &[]),
                 TypeDef::Float => w.record(3, &[]),
                 TypeDef::Double => w.record(4, &[]),
+                TypeDef::Half => w.record(10, &[]),
                 TypeDef::Int(b) => w.record(7, &[u64::from(*b)]),
                 TypeDef::Ptr(p, space) => w.record(8, &[u64::from(p.0), u64::from(*space)]),
                 TypeDef::Array(n, e) => w.record(11, &[u64::from(*n), u64::from(e.0)]),
@@ -627,11 +675,15 @@ impl Module {
         w.exit();
 
         w.record(2, &chars("dxil-ms-dx"));
+        // Native 16-bit types are laid out in 16 bits, minimum precision in
+        // 32 (the validator wants the layout that matches the flags).
         w.record(
             3,
-            &chars(
-                "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64",
-            ),
+            &chars(if self.native16 {
+                "e-m:e-p:32:32-i1:32-i8:8-i16:16-i32:32-i64:64-f16:16-f32:32-f64:64-n8:16:32:64"
+            } else {
+                "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64"
+            }),
         );
         let first_const = (self.globals.len() + self.funcs.len()) as u64;
         for g in &self.globals {
@@ -845,7 +897,7 @@ impl Module {
         }
         w.exit();
 
-        let fast_bits = if super::shader_opt() & opt::FAST != 0 {
+        let fast_bits = if !self.exact_floats && super::shader_opt() & opt::FAST != 0 {
             fast_math_bits()
         } else {
             0

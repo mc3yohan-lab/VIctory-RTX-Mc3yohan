@@ -239,6 +239,10 @@ pub(crate) fn drain() -> usize {
 
 /// A list is about to record an upload into `copy`: one on its way here runs
 /// first, and no other is taken after it.
+///
+/// Waits on the atomic state (not just `ON_THEIR_WAY` membership) for up to 10 s
+/// so a list racing with `claim()` while staging is created never records a
+/// duplicate copy-queue vs direct-queue upload (Belobug#536).
 pub(crate) fn listed(copy: &HostTexture) {
     if copy.ahead.compare_exchange(NONE, LISTED, AcqRel, Acquire) != Err(PENDING) {
         return;
@@ -246,10 +250,13 @@ pub(crate) fn listed(copy: &HostTexture) {
     STATS[5].fetch_add(1, Relaxed);
     let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
     let started = std::time::Instant::now();
-    while way.iter().any(|(serial, _)| *serial == copy.serial) {
-        if started.elapsed().as_millis() >= 1000 {
-            tracing::warn!(serial = copy.serial, "timed out waiting for upload ahead");
-            break;
+    while copy.ahead.load(Acquire) == PENDING || way.iter().any(|(serial, _)| *serial == copy.serial) {
+        if started.elapsed().as_secs() >= 10 {
+            tracing::warn!(
+                serial = copy.serial,
+                "an upload ahead of the lists did not run in 10 s: the list's own goes beside it"
+            );
+            return;
         }
         way = LANDED
             .wait_timeout(way, std::time::Duration::from_millis(50))
@@ -477,6 +484,55 @@ pub(crate) fn fresh() -> AtomicU8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A list that records an upload while `claim` is still building its staging
+    /// buffer waits until the copy queue finishes (Belobug#536).
+    #[test]
+    fn a_list_waits_for_an_upload_still_being_taken() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        if crate::host::host().is_none() {
+            return;
+        }
+        let desc = [3u32, 0, 0, 0, 256, 0, 256, 0x9_0001, 98, 1, 0, 0x105, 0, 0];
+        let whole = crate::resource::placed_bytes(&desc).unwrap() as usize;
+        // SAFETY: memory of our own that stays.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), whole, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
+        // SAFETY: as above.
+        unsafe { (0..whole).for_each(|i| at.add(i).write((i * 7 + i / 311) as u8)) };
+        let texture = crate::resource::texture_at(at as u64, &desc).unwrap();
+        crate::resource::want_level(texture, 0);
+        let copy = crate::resource::host_copy(texture).unwrap();
+        if !crate::pool::fresh(&copy.texture) {
+            return;
+        }
+        let held = super::super::STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let raw = texture as usize;
+        let taker = std::thread::spawn(move || match claim(raw as This, 0, u64::MAX) {
+            Some(Taken::New(job)) => {
+                send(&job);
+                true
+            }
+            _ => false,
+        });
+        let started = std::time::Instant::now();
+        while copy.ahead.load(Acquire) != PENDING {
+            assert!(started.elapsed().as_secs() < 10, "the claim never began");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let (told, heard) = std::sync::mpsc::channel();
+        let lister = copy.clone();
+        let list = std::thread::spawn(move || {
+            listed(&lister);
+            told.send(lister.ahead.load(Acquire)).unwrap();
+        });
+        let early = heard.recv_timeout(std::time::Duration::from_millis(300));
+        drop(held);
+        assert!(taker.join().unwrap(), "taken ahead");
+        let seen = early.or_else(|_| heard.recv_timeout(std::time::Duration::from_secs(20)));
+        list.join().unwrap();
+        assert_eq!(seen, Ok(DONE), "the list went on while the upload ahead was still on its way");
+        assert!(there(texture));
+    }
 
     /// The texels of a placed texture arrive by the copy queue, all levels of
     /// them, and what waits for them is called then; a second asking finds the

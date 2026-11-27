@@ -62,6 +62,7 @@ fn build(words: &[u32], srv: (u8, u32)) -> Result<HostShader, ShaderError> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        native16: false,
     })?;
     let shader = HostShader {
         stage: HwStage::Cs,

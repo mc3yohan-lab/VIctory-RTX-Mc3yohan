@@ -241,8 +241,8 @@ impl Default for LauncherConfig {
             live_textures: true,
             video_planes: true,
             ambient_light: true,
-            ambient_most: 2.0,
-            ambient_reflect: 0.6,
+            ambient_most: 4.0,
+            ambient_reflect: 1.2,
             skip_rt_resolve: true,
             skip_raymarched_lights: true,
             port_rt: true,
@@ -279,8 +279,8 @@ impl LauncherConfig {
                 self.live_textures = true;
                 self.video_planes = true;
                 self.ambient_light = true;
-                self.ambient_most = 2.0;
-                self.ambient_reflect = 0.6;
+                self.ambient_most = 4.0;
+                self.ambient_reflect = 1.2;
                 self.send_bar = true;
             }
             Preset::Fluid720p => {
@@ -608,12 +608,13 @@ impl LauncherConfig {
             set("VICTORY_FRAME_INTERVAL_MS", &format!("{interval_ms:.3}"));
         }
 
-        // --- Iluminación ambiental / reflejos (calibrada sin velo blanco ni fantasmas) ---
+        // --- Iluminación ambiental / reflejos (calibrada para interiores oscuros y exteriores nítidos) ---
         if self.ambient_light {
             set("VICTORY_AMBIENT", "1.0");
             set("VICTORY_AMBIENT_AIR", "1.5");
-            set("VICTORY_AMBIENT_MOST", &format!("{:.2}", self.ambient_most.clamp(1.5, 4.5)));
+            set("VICTORY_AMBIENT_MOST", &format!("{:.2}", self.ambient_most.clamp(1.5, 5.0)));
             set("VICTORY_AMBIENT_CLEAN", "1");
+            set("VICTORY_AMBIENT_EXPOSURE_FLOOR", "0.0045");
             set("VICTORY_AMBIENT_SHADE", "0.7,0.5");
             set("VICTORY_AMBIENT_REFL", "2.0");
             set("VICTORY_AMBIENT_REFLECT", &format!("{:.2}", self.ambient_reflect.clamp(0.0, 3.0)));
@@ -986,8 +987,9 @@ mod tests {
         assert_eq!(env.get("VICTORY_PORT_RT").map(String::as_str), Some("1"));
         assert_eq!(env.get("VICTORY_LIVE_TEXTURES").map(String::as_str), Some("1"));
         assert_eq!(env.get("VICTORY_VIDEO_PLANES").map(String::as_str), Some("1"));
-        assert_eq!(env.get("VICTORY_AMBIENT_MOST").map(String::as_str), Some("2.00"));
-        assert_eq!(env.get("VICTORY_AMBIENT_REFLECT").map(String::as_str), Some("0.60"));
+        assert_eq!(env.get("VICTORY_AMBIENT_MOST").map(String::as_str), Some("4.00"));
+        assert_eq!(env.get("VICTORY_AMBIENT_REFLECT").map(String::as_str), Some("1.20"));
+        assert_eq!(env.get("VICTORY_AMBIENT_EXPOSURE_FLOOR").map(String::as_str), Some("0.0045"));
         assert_eq!(env.get("VICTORY_RAYMARCHED_LOCAL_LIGHTS").map(String::as_str), Some("0"));
         assert_eq!(env.get("VICTORY_PORT_CONSTANTS_ORDER_ALONE").map(String::as_str), Some("0"));
         assert_eq!(env.get("VICTORY_SEND_BAR").map(String::as_str), Some("1"));

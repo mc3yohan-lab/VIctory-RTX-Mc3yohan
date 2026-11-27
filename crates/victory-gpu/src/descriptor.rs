@@ -199,9 +199,10 @@ fn sync_early() -> Option<std::time::Duration> {
     })
 }
 
-/// The thread's work: rounds asked for, rounds done.
+/// The thread's work: `(rounds asked for, rounds started, rounds done)`.
 #[cfg(windows)]
-static SYNC_ROUNDS: (std::sync::Mutex<(u64, u64)>, std::sync::Condvar) = (std::sync::Mutex::new((0, 0)), std::sync::Condvar::new());
+static SYNC_ROUNDS: (std::sync::Mutex<(u64, u64, u64)>, std::sync::Condvar) =
+    (std::sync::Mutex::new((0, 0, 0)), std::sync::Condvar::new());
 
 /// [`sync_heaps`], begun; done when it is dropped (with [`sync_aside`]), or
 /// when this returns.
@@ -219,12 +220,15 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
     STARTED.call_once(|| {
         let made = std::thread::Builder::new().name("victory-heap-sync".into()).spawn(|| {
             crate::cores::keep_on_fast_cores("victory-heap-sync");
+            let mut priority = crate::cores::Priority::new();
             let rounds = || SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
-            /// A round is over, however it ends.
-            struct Over;
+            /// Completes all rounds up to `self.0`, however the pass ends.
+            struct Over(u64);
             impl Drop for Over {
                 fn drop(&mut self) {
-                    SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner()).1 += 1;
+                    let mut r = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+                    r.2 = r.2.max(self.0);
+                    drop(r);
                     SYNC_ROUNDS.1.notify_all();
                 }
             }
@@ -232,27 +236,34 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
             let mut last = std::time::Instant::now();
             loop {
                 let mut r = rounds();
-                let mut asked = r.0 != r.1;
-                while !asked {
+                let mut target = if r.0 > r.1 { Some(r.0) } else { None };
+                while target.is_none() {
                     let Some(every) = sync_early().filter(|_| last.elapsed().as_millis() < 500) else {
                         r = SYNC_ROUNDS.1.wait(r).unwrap_or_else(|e| e.into_inner());
-                        asked = r.0 != r.1;
+                        target = if r.0 > r.1 { Some(r.0) } else { None };
                         continue;
                     };
                     let (back, over) = SYNC_ROUNDS.1.wait_timeout(r, every).unwrap_or_else(|e| e.into_inner());
                     r = back;
-                    asked = r.0 != r.1;
+                    target = if r.0 > r.1 { Some(r.0) } else { None };
                     if over.timed_out() {
                         break;
                     }
                 }
+                if let Some(t) = target {
+                    r.1 = t;
+                }
                 drop(r);
-                let _over = asked.then(|| {
+                priority.keep();
+                let _over = target.map(|t| {
                     last = std::time::Instant::now();
-                    Over
+                    Over(t)
                 });
-                let _round =
-                    crate::timeline::span(if asked { "the heaps' records, for a submission" } else { "the heaps' records, early" });
+                let _round = crate::timeline::span(if target.is_some() {
+                    "the heaps' records, for a submission"
+                } else {
+                    "the heaps' records, early"
+                });
                 let _ = std::panic::catch_unwind(sync_heaps);
             }
         });
@@ -263,16 +274,20 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
         return SyncedHeaps(None);
     }
     let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
-    rounds.0 += 1;
-    let mine = rounds.0;
+    let (mine, ask) = crate::port_journal::round_after_started(rounds.0, rounds.1);
+    if ask {
+        rounds.0 = mine;
+    }
     drop(rounds);
-    SYNC_ROUNDS.1.notify_all();
+    if ask {
+        SYNC_ROUNDS.1.notify_all();
+    }
     SyncedHeaps(Some(mine))
 }
 
 /// Renderer port #7 (`crate::port_journal`, from renderer patch #4): [`begin_sync_heaps`] for a
 /// submission that needs round `mark` (one that began after what it waits
-/// for was written, `crate::port_journal::round_after`): asked for if it has not
+/// for was written, `crate::port_journal::round_after_started`): asked for if it has not
 /// been. 0: as [`begin_sync_heaps`].
 #[cfg(windows)]
 pub(crate) fn begin_sync_heaps_after(mark: u64) -> SyncedHeaps {
@@ -281,7 +296,7 @@ pub(crate) fn begin_sync_heaps_after(mark: u64) -> SyncedHeaps {
     }
     // (The thread is started by the first `begin_sync_heaps`.)
     let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
-    if rounds.1 == 0 && rounds.0 == 0 {
+    if rounds.2 == 0 && rounds.0 == 0 {
         drop(rounds);
         return begin_sync_heaps();
     }
@@ -308,10 +323,10 @@ pub(crate) fn round_after_now() -> u64 {
         return 0;
     }
     let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
-    if rounds.1 == 0 && rounds.0 == 0 {
+    if rounds.2 == 0 && rounds.0 == 0 {
         return 0;
     }
-    let (round, ask) = crate::port_journal::round_after(rounds.0, rounds.1);
+    let (round, ask) = crate::port_journal::round_after_started(rounds.0, rounds.1);
     if ask {
         rounds.0 = round;
         drop(rounds);
@@ -329,10 +344,10 @@ pub(crate) fn round_mark() -> u64 {
         return 0;
     }
     let rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
-    if rounds.1 == 0 && rounds.0 == 0 {
+    if rounds.2 == 0 && rounds.0 == 0 {
         return 0;
     }
-    rounds.0 + 1
+    crate::port_journal::round_after_started(rounds.0, rounds.1).0
 }
 
 /// Whether `[at, at + len)` touches the title memory of a placed
@@ -351,7 +366,7 @@ impl Drop for SyncedHeaps {
         };
         let began = std::time::Instant::now();
         let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
-        while rounds.1 < mine {
+        while rounds.2 < mine {
             rounds = SYNC_ROUNDS.1.wait(rounds).unwrap_or_else(|e| e.into_inner());
         }
         drop(rounds);
@@ -1607,6 +1622,20 @@ pub(crate) fn forget(resource: usize) {
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
+    }
+}
+
+/// Fast liveness check for a previously resolved view record `(i, generation)`
+/// without cloning the [`View`]. `CONSTANT` and `PLACED` records stay valid
+/// once emitted (`shapes` is append-only).
+pub(crate) fn view_alive(i: u32, generation: u32) -> bool {
+    match generation >> KIND_SHIFT {
+        0 => {
+            let views = views_read();
+            views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
+        }
+        CONSTANT | PLACED => true,
+        _ => false,
     }
 }
 

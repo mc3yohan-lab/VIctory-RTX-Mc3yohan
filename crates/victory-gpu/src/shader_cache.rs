@@ -113,6 +113,8 @@ fn build() -> [u8; 32] {
             "VICTORY_WAVE_WIDE",
             "VICTORY_WAVE_DEEP_SKIPS",
             "VICTORY_WAVE_OWN_BITS",
+            "VICTORY_PAIR_SYNC",
+            "VICTORY_PAIR_CLAMP",
             "VICTORY_WAVE_LOCAL",
             "VICTORY_LDS_FLAGS",
             "VICTORY_F16_NEAREST",
@@ -127,6 +129,11 @@ fn build() -> [u8; 32] {
             "VICTORY_BVH_BUILDER",
             "VICTORY_NAN_SCRUB",
             "VICTORY_CONSTANT_MARKS",
+            "VICTORY_THREAD_TICKET",
+            "VICTORY_LEGACY_PLAIN",
+            "VICTORY_WAVE_PAIRS",
+            "VICTORY_WAVE_PAIRS_ONLY",
+            "VICTORY_WAVE_PAIRS_FP32",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -158,6 +165,12 @@ fn build() -> [u8; 32] {
     hash.update(fixed);
     for value in victory_shader::emit::host_settings() {
         hash.update(&value.to_le_bytes());
+    }
+    // f16 arithmetic in native `half` (the host decides): only when on, so the
+    // translations cached without it keep their key, and one path's entries
+    // never serve the other.
+    if victory_shader::emit::host_native16() {
+        hash.update(b"native16");
     }
     if victory_shader::emit::constants_raw() && victory_shader::emit::raw_views() == 0 {
         hash.update(if victory_shader::emit::constant_marks() {

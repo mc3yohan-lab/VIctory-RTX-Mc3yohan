@@ -70,7 +70,7 @@ impl Swizzle {
         matches!(self.0, 1 | 5 | 9 | 17 | 21 | 25)
     }
 
-    fn display(self) -> bool {
+    pub(crate) fn display(self) -> bool {
         matches!(self.0, 2 | 6 | 10 | 18 | 22 | 26)
     }
 
@@ -178,10 +178,10 @@ pub struct Layout {
     pub mips: Vec<Mip>,
     /// Byte offsets inside a block for each coordinate, per axis.
     /// Empty for linear and unsupported modes.
-    pattern: &'static SwizzlePattern,
+    pub(crate) pattern: &'static SwizzlePattern,
 }
 
-type SwizzlePattern = [Vec<u32>; 3];
+pub(crate) type SwizzlePattern = [Vec<u32>; 3];
 static EMPTY_PATTERN: SwizzlePattern = [const { Vec::new() }; 3];
 
 /// Micro tile (256 bytes) patterns by log2 of the element size: for each
@@ -274,7 +274,7 @@ const MAX_MIPS: u32 = 16;
 const MAX_EXTENT: u32 = 1 << 14;
 
 /// 256-byte micro tile dimensions by log2 element size, 2D and 3D.
-const BLOCK_256_2D: [[u32; 2]; 5] = [[16, 16], [16, 8], [8, 8], [8, 4], [4, 4]];
+pub(crate) const BLOCK_256_2D: [[u32; 2]; 5] = [[16, 16], [16, 8], [8, 8], [8, 4], [4, 4]];
 const BLOCK_256_3D: [[u32; 3]; 5] = [[8, 4, 8], [4, 4, 8], [4, 4, 4], [4, 2, 4], [2, 2, 4]];
 const BLOCK_1K_3D: [[u32; 3]; 5] = [[16, 8, 8], [8, 8, 8], [8, 8, 4], [8, 4, 4], [4, 4, 4]];
 
@@ -539,7 +539,7 @@ impl Layout {
 
     /// The slice and the depth inside it for `z` (an array slice or a 3D
     /// depth slice).
-    fn split(&self, z: u32) -> (u32, u32) {
+    pub(crate) fn split(&self, z: u32) -> (u32, u32) {
         if self.thick {
             (z / self.block[2], z % self.block[2])
         } else {
@@ -575,7 +575,8 @@ impl Layout {
 
     /// The part of an address that depends on the row (and depth in a
     /// thick block).
-    fn row(&self, m: &Mip, y: u32, z: u32) -> u64 {
+    #[inline]
+    pub(crate) fn row(&self, m: &Mip, y: u32, z: u32) -> u64 {
         let [bw, bh, _] = self.block;
         let log2 = self.alignment.trailing_zeros();
         // In the tail the pattern of the shifted position gives the mip's
@@ -586,7 +587,8 @@ impl Layout {
     }
 
     /// The part of an address that depends on the column.
-    fn column(&self, m: &Mip, x: u32) -> u64 {
+    #[inline]
+    pub(crate) fn column(&self, m: &Mip, x: u32) -> u64 {
         let bw = self.block[0];
         let x = x + m.tail.map_or(0, |t| t.x);
         (u64::from(x / bw) << self.alignment.trailing_zeros())
@@ -654,7 +656,7 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk::<true>(tiled, linear, mip, slice, row_pitch, depth_pitch, None)
+        crate::detile::detile(self, tiled, mip, slice, linear, row_pitch, depth_pitch)
     }
 
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
@@ -667,7 +669,7 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk::<false>(linear, tiled, mip, slice, row_pitch, depth_pitch, None)
+        crate::detile::tile(self, tiled, mip, slice, linear, row_pitch, depth_pitch)
     }
 
     fn checked_mip<const DETILE: bool>(
@@ -681,6 +683,9 @@ impl Layout {
     ) -> Result<&Mip, Error> {
         let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
         let depth = m.depth;
+        if m.width == 0 || m.height == 0 || depth == 0 {
+            return Err(Error::Invalid);
+        }
         if (self.desc.dimension == Dimension::Tex3d && slice != 0) || slice >= self.slices {
             return Err(Error::Invalid);
         }
@@ -867,6 +872,17 @@ impl TilingCache {
         linear: &[u8],
         pitches: (usize, usize),
     ) -> Result<(), Error> {
+        if !layout.thick {
+            return crate::detile::tile(
+                layout,
+                tiled,
+                subresource.0,
+                subresource.1,
+                linear,
+                pitches.0,
+                pitches.1,
+            );
+        }
         layout.walk::<false>(
             linear,
             tiled,
