@@ -139,25 +139,28 @@ Now that we reached **25.7 FPS median / 31–34.7 FPS peak** on RTX 4090 (with t
 
 ### 1. Configure & Build
 ```powershell
-copy victory.example.toml victory.toml
-# Edit victory.toml -> set game_dir = 'D:\path\to\your\dump' (outside this repo)
+# Build both the runtime and the native desktop launcher (VIctory-RTX.exe)
+cargo build --locked --release -p victory -p victory-launcher
 
-# Fast release build (for gameplay)
-cargo build --locked --release -p victory
-
-# Diagnostics build (for -Panel, -GpuTiming, VICTORY_TIMELINE)
+# Optional diagnostics build (for -GpuTiming / VICTORY_TIMELINE)
 cargo build --locked --profile diag -p victory --features diagnostics
 ```
 
-### 2. Pre-Translate Shaders & Warm Pipeline Library (Once per Translator / Driver Update)
-Pass `--nvidia-preset` so `shaders`, `warm`, and `run` share the exact same translator keys (`VICTORY_SHADER_OPT=63`, `VICTORY_WAVE_WIDE=last`, `VICTORY_NAN_SCRUB=1`, `VICTORY_BVH_NO_HIT=1`, `VICTORY_PORT_CBV=1`, `VICTORY_CONSTANT_MARKS=1`):
+### 2. Easiest Way to Run: Native Desktop Launcher (`VIctory-RTX.exe`)
+Double-click **`Launch-VIctory-RTX.cmd`** (or `target\release\VIctory-RTX.exe`) — **no PowerShell flags, no `victory.toml` editing, no manual env vars**:
+1. Click **Change Game Folder** and pick your own Xbox Series X|S dump folder (cover art is loaded locally from your folder at runtime; zero game assets are shipped in this repo).
+2. Open the **Shaders & Pipelines** tab and click **Build Shaders** once (live progress bar, automatically leaves 2 CPU cores free).
+3. Pick a preset on the Play screen (**Fast 1080p**, **Native 1080p**, **720p Ultra**, **4K FSR 3.1**, **Safe**, or **Custom**), optionally toggle **KBM: ON** for GTA mouse-look, and press **▶ PLAY**.
+4. Live FPS, VRAM, logs, and sanitized one-click GitHub diagnostic reports are right inside the **Logs & Crashes** tab.
+
+### 3. CLI / PowerShell Alternative (`scripts\play-nvidia.ps1`)
+If you prefer the command line (first copy `victory.example.toml` -> `victory.toml` and set `game_dir`), you can still pre-translate and launch directly:
 ```powershell
 target\release\victory.exe shaders --nvidia-preset --jobs 16 <path\to\your\dump>
 target\release\victory.exe warm --nvidia-preset --used --jobs 16 --save-library
 ```
 
-### 3. Run via `scripts\play-nvidia.ps1` (Normal, Non-Elevated PowerShell)
-`play-nvidia.ps1` auto-detects the executable from `victory.toml` (or pass `-Exe <path>`) and **automatically tunes VRAM tier (`24GB+` / `16GB` / `12GB` / `8GB`)** via `nvidia-smi`. Press **`F3`** anytime (even in ThinLTO `--release` builds!) to toggle the live telemetry HUD:
+Run via `scripts\play-nvidia.ps1` (Normal, Non-Elevated PowerShell). `play-nvidia.ps1` auto-detects the executable from `victory.toml` (or pass `-Exe <path>`) and **automatically tunes VRAM tier (`24GB+` / `16GB` / `12GB` / `8GB`)** via `nvidia-smi`. Press **`F3`** anytime (even in ThinLTO `--release` builds!) to toggle the live telemetry HUD:
 
 ```powershell
 # Recommended pure-NVIDIA 1080p (720p internal -> 1080p title upscaler, NO FSR, auto VRAM tier)
@@ -244,7 +247,7 @@ history and authors are preserved). Each project's specific contributions integr
 | **[polackangry/POLSKAGUROM](https://github.com/polackangry/POLSKAGUROM)** | `VICTORY_BATCHED_SWEEP=1` (`SweepSchedule` spreading 1s cleanup sweep passes across safe frames to prevent 1s hitch spikes). |
 | **VIctory-RTX3090** | Mid-list depth-plane materialization (`planes_now` / `VICTORY_PLANES_NOW` + 8,192-view ring, adapted for our `fallback_heaps=false` heap rebind), `VICTORY_SMALL_RECHECK` continuous whole-texture LUT/grading rechecks (`16 MiB / 60 ms` budget), clean `WM_CLOSE`/`WM_DESTROY` exit fix (`lifecycle.rs`), and shared wall-clock `FrameDeadline` pipeline waits. |
 | **WASDeKeys/victory-gtx1660 (`Impre-visible`, `antikohza`)** | `STAGING` upload pool 4 GiB idle RAM leak fix (`VICTORY_STAGING_KEPT`), `COMMIT_SCARCE_BYTES` cache shedding, `PRELUDE_IDLE` prelude recycling (`VICTORY_MAX_PRELUDES=64`), `HostList::close` `E_OUTOFMEMORY` sweep-and-retry (`988c9de`), `VICTORY_CARD_AWAKE=idle` zero-contention GPU keep-awake, and opt-in `VICTORY_TEXTURE_MIP_DROP=0..3` (off by default). |
-| **ZigZagBoi1/ScarlettPort & vitutu1/victory-perf** | `crates/victory-loader/src/hooks.rs` (title watchdog disarm `VICTORY_NO_WATCHDOG=1` and render-scale hooks), `resource.rs` `!reserved` levels-on-demand pool skip (`1deb0be4`: enables tiled mip streaming on reserved textures), and `draw.rs` `VICTORY_SAME_HOST_HEAPS` (`1e726507`: skips redundant `SetDescriptorHeaps` + root-signature resets). |
+| **ZigZagBoi1/ScarlettPort & vitutu1/victory-perf** | `crates/victory-loader/src/hooks.rs` (title watchdog disarm `VICTORY_NO_WATCHDOG=1` and render-scale hooks), `resource.rs` `!reserved` levels-on-demand pool skip (`1deb0be4`: enables tiled mip streaming on reserved textures), `draw.rs` `VICTORY_SAME_HOST_HEAPS` (`1e726507`: skips redundant `SetDescriptorHeaps` + root-signature resets), `shadow.rs` loose-window shared read-lock lookup (`e5faadb8`), and `eframe`/`egui` desktop launcher UX inspiration (`apps/victory-launcher`). |
 | **Korinocho, FQY55kai/ZJOU-VICTORY, myokex/victory-amd, Geckomacabre, cxy0072019-sketch, romainhedouin** | Cube-map gradient LOD, Wave32/RT/BVH/tiled-cascade-shadow fixes, and ecosystem diagnostics/research incorporated via upstream & community PRs. |
 | **VIctory-RTX-RAM16 (Community Contributor)** | Automatic `<= 16 GiB` host RAM retention profile (`ram_profile.rs`, `VICTORY_RAM_16GB=0/1`): auto-enables `residency` on `<= 16 GiB` PCs, caps spare list scratch (`64 MiB`), staging blocks (`2`), idle GPU texture pool blocks (`SPARE`), completed snapshot cache (`64 MiB` / `0` under pressure + 1s sweep reclaim + `copystat` category), and thread-local texture read cache (`16 MiB` / `0` under pressure), saving ~632–670 MiB private commit & ~640 MiB idle texture pool with zero impact on 32/64 GB hosts. |
 | **Mc3yohan (`VIctory-RTX-Mc3yohan`, this fork)** | **NVIDIA 1M-heap in-place Port 5** (`VICTORY_PORT_CBV=1` + `VICTORY_CONSTANT_MARKS=1` guarded `rawBufferLoad`, `View::Constant` `buffer_range`/`note_buffer` refresh, coherent `SLOT_STRIDES` upload buffer, `own.between` SRV L1TEX barrier, `raw_dwords` alignment & `SHADER_OPT=63`), **BatchCull Wave32 local-waves unlock** (`CS_Tree_BatchCull` / `ImposterOnly` disjoint commuting LDS atomics + `CS_Prop_BatchCull` barrier-free early-outs), **F3 `CpuMeter::sample` `min > max` crash fix**, **auto-VRAM tiering (`24GB+`/`16GB`/`12GB`/`8GB` with `CardBuffersMinKb=1024` on 8 GB)** + **plain OS-RAM `Card::staging`**, **6-step VRAM `CARD_COMPARE` tree reduction + `differs_gpu`** (`+20.3%`), **12-byte `PORT_DESCRIPTORS` key diff** (opt-in `-PortDescriptors`), **`DIRTY_CARDED` O(dirty)** (including `loose()` `register_carded` fix), **NVIDIA FSR 3.1.6 provider adaptation**, **`--nvidia-preset` for `AmericasLauncher`**, `Role::RayMiss` indoor eye-glow fix + `ambient.rs` asymmetric jump & `x=0` border fix, and `scripts/play-nvidia.ps1`. |
