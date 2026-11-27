@@ -2625,6 +2625,10 @@ enum Step {
     /// list's prelude when changed: once per submission, whichever lists
     /// sample it, until a title copy intervenes.
     Texture(crate::texture::PreludeUpload),
+    /// Fills a per-list upload chunk for a CPU-written linear video/movie plane
+    /// at submission time (`ScarlettPort` movie_plane fix; avoids shared
+    /// staging overwrite races across concurrent flights and write-watch misses).
+    Plane((usize, usize), Box<dyn Fn() + Send>),
     /// A title buffer copy that the list does on the card ([`place`]): what
     /// is done on the CPU for it.
     Placed(place::Placed),
@@ -2638,6 +2642,8 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
+    /// Standalone upload chunks kept through this list's fence (movie planes).
+    plane_uploads: Vec<(Chunk, u64)>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
     /// Host objects the list's commands name (pipelines, root signatures,
@@ -2661,6 +2667,9 @@ struct Deferred {
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Last GPU source copied into each aliased host texture in this list
+    /// (`Vice-Tay #141` / `fxceless #1241`).
+    texture_aliases: std::collections::HashMap<usize, usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -2705,6 +2714,7 @@ impl Deferred {
 
 impl Drop for Deferred {
     fn drop(&mut self) {
+        give_chunks(std::mem::take(&mut self.plane_uploads));
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
     }
@@ -3397,6 +3407,16 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                             LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
                             #[cfg(feature = "diagnostics")]
                             blame("a texture", written, at, len);
+                        }
+                        return Some(WHY_READ);
+                    }
+                }
+                Step::Plane((at, len), _) => {
+                    if touches(written, *at, at.saturating_add(*len)) {
+                        if count {
+                            LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            blame("a movie plane", written, *at, *len);
                         }
                         return Some(WHY_READ);
                     }
@@ -6217,7 +6237,9 @@ impl Host {
                 let before = ranges.len();
                 for list in runs {
                     for step in &list.deferred().copies {
-                        if let Step::Texture(upload) = step {
+                        if let Step::Texture(upload) = step
+                            && upload.plane_source.is_none()
+                        {
                             let (at, len) = upload.staging.memory();
                             if len > 0 {
                                 ranges.push((at, at + len));
@@ -8127,6 +8149,38 @@ impl HostList {
         self.deferred().textures.contains(&key)
     }
 
+    /// Marks `key` used and reports whether `view` has a newer GPU alias source
+    /// (`Vice-Tay #141` / `fxceless #1241`).
+    pub(crate) fn alias_source_changed(
+        &self,
+        key: usize,
+        view: &ID3D12Resource,
+        source: &ID3D12Resource,
+    ) -> bool {
+        use windows::core::Interface;
+        let source = source.as_raw() as usize;
+        let mut deferred = self.deferred();
+        deferred.textures.insert(key);
+        deferred.texture_aliases.insert(view.as_raw() as usize, source) != Some(source)
+    }
+
+    /// Exclusive per-list upload chunk for a CPU-written linear video/movie
+    /// plane, kept alive through this list's fence (`ScarlettPort` movie_plane).
+    pub(crate) fn plane_upload(
+        &self,
+        size: u64,
+        read: (usize, usize),
+        fill: impl Fn(usize) + Send + 'static,
+    ) -> Option<ID3D12Resource> {
+        let chunk = take_chunk(host()?, size)?;
+        let source = chunk.buffer.clone();
+        let destination = chunk.data;
+        let mut deferred = self.deferred();
+        deferred.plane_uploads.push((chunk, size));
+        deferred.copies.push(Step::Plane(read, Box::new(move || fill(destination))));
+        Some(source)
+    }
+
     /// Records a raw title-memory copy in the order of the list's steps.
     pub(crate) fn defer_raw_copy(&self, dst: usize, src: usize, len: usize) {
         if len == 0 {
@@ -8314,10 +8368,17 @@ impl HostList {
                     continue;
                 }
                 Step::Texture(upload) => {
-                    if batch.texture_due(&upload.staging) {
+                    if upload.plane_source.is_none() && batch.texture_due(&upload.staging) {
                         batch.due.push(upload.staging.clone());
                     }
                     textures.push(upload.clone());
+                    continue;
+                }
+                Step::Plane((_, len), fill) => {
+                    let started = std::time::Instant::now();
+                    fill();
+                    PREPARING[2].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    PREPARING[3].fetch_add(*len as u64, Ordering::Relaxed);
                     continue;
                 }
             };
@@ -8733,7 +8794,7 @@ fn list_front(steps: &[Step], textures: bool) -> ListFront {
             Some(Touch::Refresh(key, *from, *from + *len))
         }
         Step::GpuWrite(shadow, ..) => Some(Touch::Write(std::sync::Arc::as_ptr(shadow) as usize)),
-        Step::Texture(upload) if textures => {
+        Step::Texture(upload) if textures && upload.plane_source.is_none() => {
             staged.push(upload.staging.clone());
             None
         }
@@ -9257,7 +9318,7 @@ impl Batch {
                         touches.push(Touch::Refresh(key, *at, *at + *len));
                     }
                     Step::GpuWrite(shadow, ..) => touches.push(Touch::Write(std::sync::Arc::as_ptr(shadow) as usize)),
-                    Step::Texture(upload) if wide_textures() => {
+                    Step::Texture(upload) if wide_textures() && upload.plane_source.is_none() => {
                         if self.texture_due(&upload.staging) {
                             due.push(upload.staging.clone());
                         }

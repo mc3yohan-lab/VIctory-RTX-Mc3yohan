@@ -67,7 +67,8 @@ pub fn run(
     all.sort_by_key(|&n| (!early.contains(keys[n].as_str()), &keys[n]));
     all.truncate(limit.unwrap_or(usize::MAX));
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-    let jobs = jobs.unwrap_or(cores * 2 / 3).max(1);
+    // Keep 2 logical cores free so Windows desktop & launcher UI stay fluid.
+    let jobs = jobs.unwrap_or(cores.saturating_sub(2).clamp(1, 12)).max(1);
     println!(
         "{} pipelines known, {} made before ({fingerprint}), {} bad; {} to make, {jobs} processes",
         keys.len(),
@@ -75,6 +76,7 @@ pub fn run(
         bad.len(),
         all.len()
     );
+    let _ = std::io::stdout().flush();
     let state = Mutex::new((Vec::<f64>::new(), 0usize, 0usize));
     let done_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(&done_file)?);
     // (Read back by the runs: these are made beside the others, not before.)
@@ -92,8 +94,9 @@ pub fn run(
             state.0.push(ms);
             state.1 += usize::from(!there);
             let count = state.0.len();
-            if count.is_multiple_of(1000) {
+            if count.is_multiple_of(25) || count == all.len() {
                 println!("{count} of {}, {:.0} s", all.len(), began.elapsed().as_secs_f64());
+                let _ = std::io::stdout().flush();
             }
             drop(state);
             let _ = writeln!(lock(&done_out), "{fingerprint} {}", keys[n]);

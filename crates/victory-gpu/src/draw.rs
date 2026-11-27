@@ -229,8 +229,30 @@ const BAKE_AHEAD: [u64; 2] = [12, 2];
 /// `PS_BakeDecorations_*`), by the first 16 hex digits of their hash as the
 /// frame listings print it. They draw into a 256x256 corner of 2048x2048
 /// targets and name no texture in a table.
-pub(crate) const BAKE_PIXEL_SHADERS: [&str; 4] =
-    ["c0a7fe77b1862e10", "0d1575a396dfe513", "b7cfd8dda91ebb6b", "280967ad158cee0b"];
+pub(crate) const BAKE_PIXEL_SHADERS: [&str; 7] = [
+    "c0a7fe77b1862e10",
+    "0d1575a396dfe513",
+    "b7cfd8dda91ebb6b",
+    "280967ad158cee0b",
+    "fa455c8a3c32577b",
+    "d126bcae5d5d8d26",
+    "fcee612943c008e0",
+];
+
+/// Geometry stages shared by ped texture compositors and decoration bakes
+/// (`ScarlettPort`: catches pixel permutations beyond `BAKE_PIXEL_SHADERS`).
+const BAKE_GEOMETRY_SHADERS: [&str; 2] = ["089d6271be6650ef", "d4111a6e6ea49d91"];
+
+/// Whether bindless textures found changing after upload (TV / phone-screen
+/// video planes) stay live (checked every frame, full fingerprint <= 4 MiB;
+/// `VICTORY_LIVE_TEXTURES=0` disables). Ported from `avatarmanz/VIctory-7900XTX #390`.
+fn live_textures() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIVE_TEXTURES").is_none_or(|v| v != "0"))
+}
+
+/// Consecutive unchanged frames before a live video slot returns to normal backoff.
+const LIVE_LOOKS: u8 = 120;
 
 /// Where a pixel shader of the title's skin bake finds what it samples
 /// (fork pull request #1264, head 4c14ca41): the root parameter of its one
@@ -2474,6 +2496,22 @@ impl State {
         }
     }
 
+    fn is_bake_draw(&self, p: &HostPipeline) -> bool {
+        if p.stages.iter().any(|s| {
+            let h = s.shader.hash.as_str();
+            BAKE_PIXEL_SHADERS.contains(&h) || BAKE_GEOMETRY_SHADERS.contains(&h)
+        }) {
+            return true;
+        }
+        self.depth == 0
+            && self.targets.len() >= 4
+            && self
+                .targets
+                .first()
+                .and_then(|&t| crate::resource::texture_kind(t as This))
+                .is_some_and(|(w, h, _)| w >= 512 && w == u64::from(h))
+    }
+
     /// [`State::early_textures`]' runs within budgets of their own.
     fn early_textures_budgeted(&self, list: &HostList, p: &HostPipeline) {
         let (early_ms, bake_ms) = early_budgets();
@@ -2482,7 +2520,7 @@ impl State {
         }
         let bake = bake_ms > 0
             && ((bake_sources_mode().0 != BakeMode::Off && bake_tables(p).is_some())
-                || p.stages.iter().any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str())));
+                || self.is_bake_draw(p));
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         // The milliseconds this frame's bake draws have taken so far: a
         // frame has several, and together they get `bake_ms`.
@@ -3044,8 +3082,9 @@ impl State {
             // (all their blocks are shown at other addresses too), and each
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
-            if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                let small = crate::texture::small_recheck(len);
+            let mut live = false;
+            if let Some((at, len, print, looks, uploaded, was_live)) = host.texture_slot_checked(index) {
+                let small = !was_live && crate::texture::small_recheck(len);
                 let late_look = small && usize::from(looks) + 1 >= RECHECK_FRAMES.len();
                 let spread = u64::from(index) % SMALL_RECHECK_FRAMES;
                 if late_look {
@@ -3059,17 +3098,48 @@ impl State {
                             print,
                             looks,
                             uploaded,
+                            false,
                         );
                         continue;
                     }
                     SMALL_RECHECKS[0].fetch_add(1, Ordering::Relaxed);
                     SMALL_RECHECKS[2].fetch_add(len, Ordering::Relaxed);
                 }
-                if crate::texture::fingerprint(at, len) == print {
+                if crate::texture::fingerprint_for(at, len, was_live) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
+                    if was_live {
+                        // Unchanged this frame (e.g. 30 fps phone/TV video between
+                        // frames): stay live until LIVE_LOOKS consecutive unchanged
+                        // frames, then return to normal backoff.
+                        if looks < LIVE_LOOKS {
+                            host.texture_slot_recheck(
+                                index,
+                                write,
+                                frame + 1,
+                                (at, len),
+                                print,
+                                looks + 1,
+                                uploaded,
+                                true,
+                            );
+                        } else {
+                            let print = crate::texture::fingerprint(at, len);
+                            host.texture_slot_recheck(
+                                index,
+                                write,
+                                frame + RECHECK_FRAMES[1],
+                                (at, len),
+                                print,
+                                1,
+                                uploaded,
+                                false,
+                            );
+                        }
+                        continue;
+                    }
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
-                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
+                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded, false)
                         }
                         None if small => host.texture_slot_recheck(
                             index,
@@ -3079,6 +3149,7 @@ impl State {
                             print,
                             looks,
                             uploaded,
+                            false,
                         ),
                         None => host.texture_slot_done(index, write, None),
                     }
@@ -3099,6 +3170,7 @@ impl State {
                 if recheck_soon() {
                     again_in = 1;
                 }
+                live = live_textures();
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
                 if n < 200 || n.is_multiple_of(1000) {
                     // Whether its pages are the title's at other addresses
@@ -3281,8 +3353,8 @@ impl State {
                 let memory = if again.is_none() && heap_recheck() { crate::texture::title_span(resource, first) } else { None };
                 match memory {
                     Some((at, len)) => {
-                        let print = crate::texture::fingerprint(at, len);
-                        host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
+                        let print = crate::texture::fingerprint_for(at, len, live);
+                        host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame, live);
                     }
                     None => host.texture_slot_done(index, write, again),
                 }
@@ -3412,8 +3484,8 @@ impl State {
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
-                    let print = crate::texture::fingerprint(at, len);
-                    host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
+                    let print = crate::texture::fingerprint_for(at, len, live);
+                    host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame, live);
                 }
                 None => host.texture_slot_done(index, write, again),
             }

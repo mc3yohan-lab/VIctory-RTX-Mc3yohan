@@ -1,123 +1,105 @@
-//! Runtime hero artwork and window icon.
-//!
-//! No copyrighted artwork is shipped in the repository: when the user selects
-//! their own game dump folder, the launcher reads `xbs_splash.png` (or the
-//! largest `xbs_logo_*.png`) directly from that local folder at runtime.
-//! Otherwise, it renders a dark obsidian-emerald procedural banner.
+//! Carga de arte de portada en tiempo de ejecución desde la carpeta local del
+//! juego (cero imágenes con copyright en Git) + ícono procedural Quantico.
 
 use std::path::{Path, PathBuf};
 
-use eframe::egui::{ColorImage, IconData};
+use eframe::egui::{self, ColorImage, IconData, TextureHandle, TextureOptions};
 
-/// Pick the best banner artwork from a user's local game dump folder.
-pub fn pick(game_dir: &Path) -> Option<PathBuf> {
+/// Carga `xbs_splash.png` o el mayor `xbs_logo_*.png` desde la carpeta local del
+/// juego (sin incluir jamás arte propietario en el repositorio).
+pub fn load_game_banner_texture(
+    ctx: &egui::Context,
+    game_dir: &Path,
+) -> Option<TextureHandle> {
+    let candidate = find_best_banner_image(game_dir)?;
+    let img = image::open(&candidate).ok()?.to_rgba8();
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let (w, h, raw) = if w > 1600 {
+        let nh = ((h as f64) * (1600.0 / w as f64)).round().max(1.0) as u32;
+        let resized = image::imageops::resize(&img, 1600, nh, image::imageops::FilterType::Triangle);
+        let (rw, rh) = resized.dimensions();
+        (rw as usize, rh as usize, resized.into_raw())
+    } else {
+        (w as usize, h as usize, img.into_raw())
+    };
+    let color = ColorImage::from_rgba_unmultiplied([w, h], &raw);
+    Some(ctx.load_texture("quantico_banner_art", color, TextureOptions::LINEAR))
+}
+
+fn find_best_banner_image(game_dir: &Path) -> Option<PathBuf> {
     let splash = game_dir.join("xbs_splash.png");
     if splash.is_file() {
         return Some(splash);
     }
-    std::fs::read_dir(game_dir)
-        .ok()?
-        .flatten()
-        .filter(|entry| {
-            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-            name.starts_with("xbs_logo_") && name.ends_with(".png")
-        })
-        .filter_map(|entry| Some((entry.metadata().ok()?.len(), entry.path())))
-        .max_by_key(|(len, _)| *len)
-        .map(|(_, path)| path)
-}
-
-/// Load and downscale the user's local splash/logo image to at most 1600 px wide.
-pub fn from_game(game_dir: &Path) -> Option<ColorImage> {
-    let img = image::open(pick(game_dir)?).ok()?;
-    let img = if img.width() > 1600 {
-        let new_h = (1600 * img.height() / img.width().max(1)).max(1);
-        img.resize(1600, new_h, image::imageops::FilterType::Triangle)
-    } else {
-        img
+    let mut best: Option<(u64, PathBuf)> = None;
+    let Ok(entries) = std::fs::read_dir(game_dir) else {
+        return None;
     };
-    let rgba = img.to_rgba8();
-    Some(ColorImage::from_rgba_unmultiplied(
-        [rgba.width() as usize, rgba.height() as usize],
-        rgba.as_raw(),
-    ))
-}
-
-/// Clean procedural obsidian-emerald-crimson gradient banner used before a
-/// game folder is configured (or when the folder contains no PNG banner).
-pub fn fallback_banner() -> ColorImage {
-    let (w, h) = (320usize, 128usize);
-    let mut pixels = Vec::with_capacity(w * h * 4);
-    for y in 0..h {
-        let ny = y as f32 / (h - 1) as f32;
-        for x in 0..w {
-            let nx = x as f32 / (w - 1) as f32;
-            // Subtle NVIDIA emerald glow top-left fading into deep carbon & warm crimson hint right.
-            let g_glow = ((1.0 - nx).powf(2.2) * (1.0 - ny).powf(1.4)).clamp(0.0, 1.0);
-            let r_glow = (nx.powf(2.4) * (1.0 - ny * 0.6)).clamp(0.0, 1.0);
-            let r = (14.0 + r_glow * 58.0 + g_glow * 8.0).min(255.0) as u8;
-            let g = (17.0 + g_glow * 62.0 + r_glow * 14.0).min(255.0) as u8;
-            let b = (24.0 + g_glow * 34.0 + r_glow * 24.0).min(255.0) as u8;
-            pixels.extend_from_slice(&[r, g, b, 255]);
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if (name.starts_with("xbs_logo") || name.contains("splash") || name.contains("banner"))
+            && name.ends_with(".png")
+            && let Ok(meta) = entry.metadata()
+            && best.as_ref().is_none_or(|(b, _)| meta.len() > *b)
+        {
+            best = Some((meta.len(), path));
         }
     }
-    ColorImage::from_rgba_unmultiplied([w, h], &pixels)
+    best.map(|(_, p)| p)
 }
 
-/// Procedural 64x64 RGBA window icon (obsidian rounded badge + crisp emerald-white "V").
+/// Ícono procedural de ventana 64×64: anillo blanco Quantico + barra diagonal azul #007BFF.
 pub fn app_icon() -> IconData {
     let size = 64usize;
     let mut rgba = vec![0u8; size * size * 4];
+    let cx = 31.5_f32;
+    let cy = 31.5_f32;
     for y in 0..size {
         for x in 0..size {
-            let fx = x as f32 + 0.5;
-            let fy = y as f32 + 0.5;
-            // Rounded square SDF (radius 14).
-            let dx = (fx - 32.0).abs() - 18.0;
-            let dy = (fy - 32.0).abs() - 18.0;
-            let out = (dx.max(0.0).hypot(dy.max(0.0)) + dx.max(dy).min(0.0)) - 14.0;
-            if out > 0.5 {
+            let idx = (y * size + x) * 4;
+            let fx = x as f32;
+            let fy = y as f32;
+            let dx = fx - cx;
+            let dy = fy - cy;
+            let r = (dx * dx + dy * dy).sqrt();
+
+            // Fondo carbón Quantico redondeado.
+            let corner_x = (dx.abs() - 18.0).max(0.0);
+            let corner_y = (dy.abs() - 18.0).max(0.0);
+            if corner_x * corner_x + corner_y * corner_y > 14.0 * 14.0 {
                 continue;
             }
-            let alpha = (0.5 - out).clamp(0.0, 1.0);
-            let mut r = 20.0f32;
-            let mut g = 24.0f32;
-            let mut b = 32.0f32;
+            let mut col = [10u8, 14, 22, 255];
 
-            // Emerald accent border.
-            if out > -2.6 {
-                r = 16.0;
-                g = 185.0;
-                b = 129.0;
+            // Borde sutil azul Quantico.
+            if dx.abs() > 29.0 || dy.abs() > 29.0 {
+                col = [0, 123, 255, 220];
             }
 
-            // Crisp bold "V" strokes from (17,17)->(32,48) and (47,17)->(32,48).
-            let dist_seg = |px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32| -> f32 {
-                let vx = bx - ax;
-                let vy = by - ay;
-                let t = (((px - ax) * vx + (py - ay) * vy) / (vx * vx + vy * vy)).clamp(0.0, 1.0);
-                (px - (ax + vx * t)).hypot(py - (ay + vy * t))
-            };
-            let d_left = dist_seg(fx, fy, 18.0, 17.0, 32.0, 47.0);
-            let d_right = dist_seg(fx, fy, 46.0, 17.0, 32.0, 47.0);
-            let d_v = d_left.min(d_right);
-            if d_v < 4.8 {
-                let blend = (4.8 - d_v).clamp(0.0, 1.0);
-                let (tr, tg, tb) = if d_right < d_left {
-                    (16.0, 215.0, 148.0)
-                } else {
-                    (244.0, 247.0, 252.0)
-                };
-                r = r + (tr - r) * blend;
-                g = g + (tg - g) * blend;
-                b = b + (tb - b) * blend;
+            // Anillo blanco de la Q.
+            if (13.0..=19.2).contains(&r) {
+                col = [248, 250, 252, 255];
             }
 
-            let idx = (y * size + x) * 4;
-            rgba[idx] = r as u8;
-            rgba[idx + 1] = g as u8;
-            rgba[idx + 2] = b as u8;
-            rgba[idx + 3] = (alpha * 255.0) as u8;
+            // Barra diagonal azul Quantico (#007BFF) hacia abajo-derecha (53.8°).
+            let proj = (dx - 3.0) * 0.68 + (dy - 3.0) * 0.73;
+            let perp = ((dx - 3.0) * 0.73 - (dy - 3.0) * 0.68).abs();
+            if proj >= 0.0 && proj <= 24.5 && perp <= 3.6 {
+                col = [0, 123, 255, 255];
+            }
+
+            rgba[idx..idx + 4].copy_from_slice(&col);
         }
     }
     IconData {
@@ -133,15 +115,20 @@ mod tests {
 
     #[test]
     fn picks_splash_then_largest_logo() {
-        let dir = std::env::temp_dir().join(format!("vrtx-art-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("victory-art-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(pick(&dir), None);
-        std::fs::write(dir.join("xbs_logo_small.png"), [0u8; 16]).unwrap();
-        std::fs::write(dir.join("xbs_logo_large.png"), [0u8; 64]).unwrap();
-        assert_eq!(pick(&dir), Some(dir.join("xbs_logo_large.png")));
-        std::fs::write(dir.join("xbs_splash.png"), [0u8; 8]).unwrap();
-        assert_eq!(pick(&dir), Some(dir.join("xbs_splash.png")));
+        std::fs::write(dir.join("xbs_logo_small.png"), vec![0u8; 32]).unwrap();
+        std::fs::write(dir.join("xbs_logo_big.png"), vec![0u8; 512]).unwrap();
+        assert_eq!(
+            find_best_banner_image(&dir).unwrap().file_name().unwrap(),
+            "xbs_logo_big.png"
+        );
+        std::fs::write(dir.join("xbs_splash.png"), vec![0u8; 64]).unwrap();
+        assert_eq!(
+            find_best_banner_image(&dir).unwrap().file_name().unwrap(),
+            "xbs_splash.png"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

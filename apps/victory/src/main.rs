@@ -375,6 +375,7 @@ fn apply_nvidia_preset(run_console: Option<Console>) {
         ("VICTORY_UPLOAD_AHEAD", "1"),
         ("VICTORY_SHOW_AFTER", "1"),
         ("VICTORY_VIDEO_PLANES", "1"),
+        ("VICTORY_LIVE_TEXTURES", "1"),
         ("VICTORY_RELAY", "2"),
         ("VICTORY_CARD_STEPS", "2"),
         ("VICTORY_WIDE_BACK", "1"),
@@ -430,11 +431,11 @@ fn apply_nvidia_preset(run_console: Option<Console>) {
         set_default("VICTORY_SKIP_PREFIXES", "CS_RaytracingResolve");
         set_default("VICTORY_AMBIENT", "1.0");
         set_default("VICTORY_AMBIENT_AIR", "1.5");
-        set_default("VICTORY_AMBIENT_MOST", "2.0");
+        set_default("VICTORY_AMBIENT_MOST", "3.0");
         set_default("VICTORY_AMBIENT_SHADE", "0.7,0.5");
         set_default("VICTORY_AMBIENT_REFL", "2.0");
-        set_default("VICTORY_AMBIENT_REFLECT", "0.5");
-        set_default("VICTORY_AMBIENT_REFLECT_LEAST", "0.25");
+        set_default("VICTORY_AMBIENT_REFLECT", "1.0");
+        set_default("VICTORY_AMBIENT_REFLECT_LEAST", "0.35");
     }
     let fsr_on = std::env::var("VICTORY_FSR_4K").is_ok_and(|v| !v.is_empty() && v != "0");
     if !fsr_on {

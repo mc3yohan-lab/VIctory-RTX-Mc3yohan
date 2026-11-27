@@ -825,6 +825,42 @@ pub(crate) static PAGE_WRITES: [std::sync::atomic::AtomicU64; 4] =
 /// two frames on takes those of the next frame with it.
 const PAGE_WRITE_AFTER: u64 = 2;
 
+const MAX_PENDING_TEXTURE_CHANGES: usize = 1 << 15;
+
+/// Queues `[start, end)` and compacts overflowing queues without dropping
+/// coverage (`Vice-Tay #137` / `fxceless #896`). Returns entries compacted.
+fn remember_texture_change(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64) -> usize {
+    if let Some(last) = ranges.last_mut()
+        && last.1 == start
+    {
+        last.1 = end;
+        return 0;
+    }
+    let mut compacted = 0usize;
+    if ranges.len() >= MAX_PENDING_TEXTURE_CHANGES {
+        let before = ranges.len();
+        join(ranges);
+        compacted += before.saturating_sub(ranges.len());
+        if ranges.len() >= MAX_PENDING_TEXTURE_CHANGES {
+            // Still full with disjoint spans: coalesce adjacent pairs so no
+            // updated texture span is ever silently dropped.
+            let mut merged = Vec::with_capacity(ranges.len().div_ceil(2) + 1);
+            let mut iter = std::mem::take(ranges).into_iter();
+            while let Some(a) = iter.next() {
+                if let Some(b) = iter.next() {
+                    merged.push((a.0.min(b.0), a.1.max(b.1)));
+                    compacted += 1;
+                } else {
+                    merged.push(a);
+                }
+            }
+            *ranges = merged;
+        }
+    }
+    ranges.push((start, end));
+    compacted
+}
+
 /// The bytes of a write the guards do not see are in title memory `[at,
 /// at + len)`: the placed textures there changed with no descriptor
 /// written and nothing mapped. Kept for the next texture pass
@@ -832,25 +868,16 @@ const PAGE_WRITE_AFTER: u64 = 2;
 /// ranges; locks one mutex and calls nothing.
 pub(crate) fn page_written(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
     let mut ranges = PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     PAGE_WRITES[0].fetch_add(1, Relaxed);
-    if let Some(last) = ranges.last_mut()
-        && last.1 == start
-    {
-        last.1 = end;
-        return;
+    let compacted = remember_texture_change(&mut ranges, start, end);
+    if compacted != 0 {
+        PAGE_WRITES[1].fetch_add(compacted as u64, Relaxed);
     }
-    if ranges.len() >= MOST {
-        PAGE_WRITES[1].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
-    }
-    ranges.push((start, end));
 }
 
 /// Title memory the runtime mapped, unmapped or is about to write since a
@@ -894,28 +921,16 @@ fn stale_rule() -> Rule {
 /// locks held: this locks one mutex of its own and calls nothing.
 pub(crate) fn remapped(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
-    // Pages are mapped one after the other.
-    if let Some(last) = ranges.last_mut()
-        && last.1 == start
-    {
-        last.1 = end;
-        return;
+    let compacted = remember_texture_change(&mut ranges, start, end);
+    if compacted != 0 {
+        STALE[2].fetch_add(compacted as u64, Relaxed);
     }
-    if ranges.len() >= MOST {
-        // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
-        STALE[2].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
-    }
-    ranges.push((start, end));
 }
 
 /// Ranges of memory, those that touch made one (DexNom/VIctory 921d8d3b:
@@ -1016,6 +1031,9 @@ pub(crate) struct TextureQueue {
     /// Which slots are in `slots`, for those who only want one out
     /// ([`Queued`]).
     queued: std::sync::Arc<Queued>,
+    /// Slots found changed after their upload (TV / phone-screen video planes,
+    /// `VICTORY_LIVE_TEXTURES` from `avatarmanz/VIctory-7900XTX #390`).
+    live: std::collections::HashSet<u32>,
 }
 
 /// Only a pass that did not overlap another can certify a bake. Ordinary
@@ -1112,6 +1130,7 @@ impl TextureQueue {
         if was {
             self.queued.set(index, false);
         }
+        self.live.remove(&index);
         was
     }
 
@@ -1282,10 +1301,25 @@ impl TextureQueue {
     /// title that fills a texture's memory after it wrote the view (the
     /// `looks`-th such look; `uploaded` is the upload's frame).
     #[allow(clippy::too_many_arguments)]
-    fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
+    fn recheck(
+        &mut self,
+        index: u32,
+        write: u64,
+        due: u64,
+        at: (u64, u64),
+        print: u64,
+        looks: u8,
+        uploaded: u64,
+        live: bool,
+    ) {
         if let Some(w) = self.reschedule(index, write) {
             (w.due, w.looks, w.mapped) = (due, 1, 0);
             w.checked = (at.0, at.1, print, looks, uploaded);
+            if live {
+                self.live.insert(index);
+            } else {
+                self.live.remove(&index);
+            }
         }
     }
 
@@ -1323,9 +1357,11 @@ impl TextureQueue {
     }
 
     /// What [`TextureQueue::recheck`] noted of slot `index`, if it is
-    /// waiting for such a look.
-    fn checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
-        self.slots.get(&index).map(|w| w.checked).filter(|c| c.2 != 0)
+    /// waiting for such a look, and whether it is live (`VICTORY_LIVE_TEXTURES`).
+    fn checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64, bool)> {
+        let (at, len, print, looks, uploaded) =
+            self.slots.get(&index).map(|w| w.checked).filter(|c| c.2 != 0)?;
+        Some((at, len, print, looks, uploaded, self.live.contains(&index)))
     }
 
     /// The memory slot `index`'s texture lies in was mapped, unmapped or
@@ -1745,11 +1781,13 @@ fn dynamic_slots(count: u32, null: u32) -> u32 {
             .and_then(|v| v.trim().parse().ok())
     });
     if null < PORTABLE_VIEWS {
-        // On 1M-capped hosts (NVIDIA), default to DYNAMIC (262,144) leaving
-        // ~737k title slots, while still honoring an explicit override bounded
+        // On 1M-capped hosts (NVIDIA), default to 327,680 dynamic slots leaving
+        // ~672k title slots so heavy RTX scenes never hit `no free dynamic
+        // descriptor slots`, while still honoring an explicit override bounded
         // so at least 524,288 title slots remain.
+        let default_capped = 327_680_u32.min(null.saturating_sub(1 << 19).max(DYNAMIC));
         let max_on_capped = null.saturating_sub(1 << 19).max(DYNAMIC);
-        return asked.unwrap_or(DYNAMIC).clamp(DYNAMIC / 2, max_on_capped);
+        return asked.unwrap_or(default_capped).clamp(DYNAMIC / 2, max_on_capped);
     }
     let most = asked.unwrap_or(DYNAMIC << 2);
     null.saturating_sub(count).min(most).max(DYNAMIC)
@@ -2264,13 +2302,14 @@ impl HostHeap {
         print: u64,
         looks: u8,
         uploaded: u64,
+        live: bool,
     ) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures.recheck(index, write, due, at, print, looks, uploaded);
+        textures.recheck(index, write, due, at, print, looks, uploaded, live);
     }
 
     /// See [`TextureQueue::checked`].
-    pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
+    pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64, bool)> {
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index)
     }
 
@@ -6219,7 +6258,7 @@ mod tests {
         assert_eq!(q.due(4, 3), due);
         for (slot, write) in due {
             match slot {
-                1 => q.recheck(slot, write, 10, (16, 8), 1, 0, 4),
+                1 => q.recheck(slot, write, 10, (16, 8), 1, 0, 4, false),
                 2 => q.partly(slot, write, 8, 4),
                 _ => q.hold(slot, write, 12),
             }
@@ -6722,7 +6761,7 @@ mod bake_queue_tests {
         };
         assert_eq!(named(&q, false), [5, 6, 7]);
         assert_eq!(q.queued(&[7], false), [(7, write(7))], "with the write the pass hands back");
-        q.recheck(5, write(5), 9, (0x1000, 0x100), 1234, 0, 1);
+        q.recheck(5, write(5), 9, (0x1000, 0x100), 1234, 0, 1, false);
         assert_eq!(named(&q, false), [6, 7]);
         assert_eq!(named(&q, true), [5, 6, 7], "rechecks included when bake_exact asks");
         let six = q.queued(&[6], false);

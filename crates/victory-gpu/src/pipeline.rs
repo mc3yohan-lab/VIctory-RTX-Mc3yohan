@@ -556,7 +556,25 @@ fn skip_prefixes() -> &'static [Vec<u8>] {
 }
 
 #[cfg(windows)]
+fn skip_raymarched_local_lights() -> bool {
+    static SKIP: OnceLock<bool> = OnceLock::new();
+    *SKIP.get_or_init(|| {
+        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        if builder {
+            return std::env::var_os("VICTORY_RAYMARCHED_LOCAL_LIGHTS").is_some_and(|v| v == "0");
+        }
+        std::env::var_os("VICTORY_RAYMARCHED_LOCAL_LIGHTS").is_none_or(|v| v == "0")
+    })
+}
+
+#[cfg(windows)]
 fn matches_skip_prefix(container: &[u8]) -> bool {
+    if skip_raymarched_local_lights() {
+        const PAT: &[u8] = b"CS_GatherRaymarchedLocalLightsClassified";
+        if container.windows(PAT.len()).any(|w| w == PAT) {
+            return true;
+        }
+    }
     let prefixes = skip_prefixes();
     if prefixes.is_empty() {
         return false;

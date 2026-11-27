@@ -277,7 +277,15 @@ impl Drop for Recording {
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
             }
-            held(&BACKS).push(inner.back);
+            let mut backs = held(&BACKS);
+            if backs.len() < 64 {
+                backs.push(inner.back);
+            } else {
+                drop(backs);
+                // SAFETY: `back_list` allocates this `List` with `Box::into_raw`
+                // and nothing else references it once its `Recording` drops.
+                unsafe { drop(Box::from_raw(inner.back as *mut List)) };
+            }
         }
     }
 }

@@ -444,6 +444,11 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                         asked: touches(written, at, at + len),
                     }
                 }
+                Step::Plane((at, len), _) => Does::Read {
+                    from: *at,
+                    to: at.saturating_add(*len),
+                    asked: touches(written, *at, at.saturating_add(*len)),
+                },
                 &Step::Host(_, (from, to)) if from < to => Does::Read { from, to, asked: false },
                 Step::Refresh(shadow, at, len) => Does::Refresh {
                     shadow: Arc::as_ptr(shadow) as usize,

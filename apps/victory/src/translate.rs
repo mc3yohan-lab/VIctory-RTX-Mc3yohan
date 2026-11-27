@@ -179,7 +179,10 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>, wave: Option<
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let paths = crate::default_paths(paths)?;
-    let threads = jobs.unwrap_or(4).max(1);
+    let threads = jobs.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map_or(4, |n| n.get().saturating_sub(2).clamp(4, 16))
+    });
     let began = std::time::Instant::now();
     let done = Mutex::new(HashSet::new());
     let counts = [const { AtomicUsize::new(0) }; 5];
@@ -412,8 +415,11 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>, list: Option<PathBuf
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let paths = crate::default_paths(paths)?;
-    let threads =
-        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let threads = jobs.unwrap_or_else(|| {
+        // Leave 2 logical cores free so Windows and the launcher UI stay responsive.
+        std::thread::available_parallelism()
+            .map_or(4, |n| n.get().saturating_sub(2).max(2))
+    });
     let started = std::time::Instant::now();
     let seen = Mutex::new(HashSet::new());
     let done = AtomicUsize::new(0);
@@ -436,8 +442,10 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>, list: Option<PathBuf
                             match victory_hle::modules::d3d12x::precompile(&bytes) {
                                 Ok(_) => {
                                     let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                                    if n.is_multiple_of(1000) {
+                                    if n.is_multiple_of(100) {
+                                        use std::io::Write;
                                         println!("{n} shaders in the cache, {:.0} s", started.elapsed().as_secs_f64());
+                                        let _ = std::io::stdout().flush();
                                     }
                                 }
                                 Err(why) => {

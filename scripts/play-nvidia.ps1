@@ -132,9 +132,10 @@ $autoCardBuffersMb = 0
 $vramTier = '24GB+'
 if ($gpuTotalMb -gt 0 -and $gpuTotalMb -lt 10000) {
     $vramTier = '8GB'
-    if ($WindowsBarMb -lt 0)     { $WindowsBarMb = 1536 }
+    if ($WindowsBarMb -lt 0)     { $WindowsBarMb = 1024 }
     if ($MipDrop -lt 0)          { $MipDrop = 2 }
     if ($CardBuffersMinKb -lt 0) { $CardBuffersMinKb = 1024 }
+    $autoCardBuffersMb = 1280
     if (-not $SeriesX -and -not $Full720p -and -not $Full1440p -and -not $Full4K -and -not $Fsr4K) {
         $SeriesS = $true
     }
@@ -142,13 +143,13 @@ if ($gpuTotalMb -gt 0 -and $gpuTotalMb -lt 10000) {
     $vramTier = '12GB'
     if ($WindowsBarMb -lt 0)     { $WindowsBarMb = 2048 }
     if ($MipDrop -lt 0)          { $MipDrop = 1 }
-    if ($CardBuffersMinKb -lt 0) { $CardBuffersMinKb = 64 }
+    if ($CardBuffersMinKb -lt 0) { $CardBuffersMinKb = 1024 }
     $autoCardBuffersMb = 2560
 } elseif ($gpuTotalMb -ge 14000 -and $gpuTotalMb -lt 20000) {
     $vramTier = '16GB'
     if ($WindowsBarMb -lt 0)     { $WindowsBarMb = 3584 }
     if ($MipDrop -lt 0)          { $MipDrop = 1 }
-    if ($CardBuffersMinKb -lt 0) { $CardBuffersMinKb = 64 }
+    if ($CardBuffersMinKb -lt 0) { $CardBuffersMinKb = 1024 }
     $autoCardBuffersMb = 4096
 } else {
     # 24 GB+ VRAM (e.g., RTX 4090 / 3090 / 5090): 8 GiB ReBAR window cap pulls hot loose
@@ -168,10 +169,10 @@ try {
     $totalPhysGb = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
     $freePhysGb = [math]::Round($os.FreePhysicalMemory / 1MB, 1)
     $freeCommitGb = [math]::Round($os.FreeVirtualMemory / 1MB, 1)
-    $ram16Tag = if ($Ram16) { ', 16 GiB RAM profile: forced ON' } elseif ($NoRam16) { ', 16 GiB RAM profile: forced OFF' } elseif ($totalPhysGb -le 16.5) { ', 16 GiB RAM profile: auto ON' } else { '' }
+    $ram16Tag = if ($Ram16) { ', low-RAM profile: forced ON' } elseif ($NoRam16) { ', low-RAM profile: forced OFF' } elseif ($totalPhysGb -le 24.5 -or $freeCommitGb -lt 8.0) { ', low-RAM profile: auto ON' } else { '' }
     Write-Host ("Memory check: {0} GB free / {1} GB total RAM, {2} GB free commit{3}" -f $freePhysGb, $totalPhysGb, $freeCommitGb, $ram16Tag)
-    if ($Ram16 -and $totalPhysGb -ge 24.0) {
-        Write-Warning "-Ram16 is forced ON on a ${totalPhysGb} GB RAM system. This caps pools for 16 GB PCs and can hurt FPS; omit -Ram16 on 32/64 GB RAM."
+    if ($Ram16 -and $totalPhysGb -ge 31.0) {
+        Write-Warning "-Ram16 is forced ON on a ${totalPhysGb} GB RAM system. This caps pools for <=24 GB PCs and can hurt FPS; omit -Ram16 on 32/64 GB RAM."
     }
     if ($freeCommitGb -lt 44) {
         Write-Warning "Free Windows commit ($freeCommitGb GB) is tight for open-world play (needs ~40-46 GB). Close heavy apps if crashes.log shows error 1455."
@@ -205,6 +206,7 @@ $settings = @{
     VICTORY_UPLOAD_AHEAD               = '1'
     VICTORY_SHOW_AFTER                 = '1'
     VICTORY_VIDEO_PLANES               = '1'
+    VICTORY_LIVE_TEXTURES              = '1'
     VICTORY_RELAY                      = '2'
     VICTORY_CARD_STEPS                 = '2'
     VICTORY_WIDE_BACK                  = '1'
@@ -400,13 +402,13 @@ if ($Quality) {
 if (-not $NoAmbient -and -not $RayTracing) {
     $settings.VICTORY_AMBIENT               = '1.0'
     $settings.VICTORY_AMBIENT_AIR           = '1.5'
-    # Cap at 2.0 (matches ambient.rs / megafork) to prevent overbright glare near indoor windows.
-    $settings.VICTORY_AMBIENT_MOST          = '2.0'
+    # 3.0 keeps bright local emissive light (lit phone screens, lamps) vivid without indoor glare.
+    $settings.VICTORY_AMBIENT_MOST          = '3.0'
     $settings.VICTORY_AMBIENT_SHADE         = '0.7,0.5'
     $settings.VICTORY_AMBIENT_REFL          = '2.0'
-    # Clamp CS_UpdateHistory (Role::Reflect) to eliminate HDR bloom orange/white square halos.
-    $settings.VICTORY_AMBIENT_REFLECT       = '0.5'
-    $settings.VICTORY_AMBIENT_REFLECT_LEAST = '0.25'
+    # 1.0 / 0.35 preserves cutscene phone/glass specular reflections while scrubbing NaN bloom squares.
+    $settings.VICTORY_AMBIENT_REFLECT       = '1.0'
+    $settings.VICTORY_AMBIENT_REFLECT_LEAST = '0.35'
 }
 
 if ($RayTracing) {
@@ -446,6 +448,10 @@ if ($Fsr4K) {
 } elseif ($SeriesS) {
     $settings.VICTORY_PLANES   = '1'
     $settings.VICTORY_UPSCALER = $(if ($FidelityFx) { '7' } else { '6' })
+    if ($vramTier -eq '8GB' -and -not $Full1440p -and -not $Full4K) {
+        # Prevent 3.7 GiB PCIe VRAM spill on 8 GB cards (RTX 3060 Ti / 4060 / 5050).
+        $settings.VICTORY_OUTPUT = '1280x720'
+    }
     # Series S at scale 1.0 hits a title breakpoint on start (trustno1-coder 033be27f); default to 720p internal (0.667).
     if ($Scale -le 0.0) { $Scale = 0.667 }
 } else {

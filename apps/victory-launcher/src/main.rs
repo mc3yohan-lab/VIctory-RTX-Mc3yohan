@@ -1,10 +1,9 @@
-//! VIctory-RTX-Mc3yohan — Native Windows Desktop Launcher (eframe / egui).
-//!
-//! Zero PowerShell, zero manual env-var setup: pick your own game dump folder,
-//! build Wave32 shaders / warm pipelines with live progress, choose a preset,
-//! monitor live logs/FPS/crashes, and press PLAY.
-
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+//! VIctory-RTX · Launcher Nativo Quantico Systems (100% Español)
+//! Estética oficial Quantico (#007BFF + #4DA3FF + carbón profundo + barra 53.8°),
+//! diseñado para cualquier usuario: búsqueda automática del juego, importador de
+//! caché, precarga guiada, logs fáciles para enviar y actualización por Git.
 
 mod art;
 mod config;
@@ -13,916 +12,1430 @@ mod runner;
 mod theme;
 
 use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Align, Button, Color32, CornerRadius, Layout, Margin, ProgressBar, RichText, ScrollArea,
-    Stroke, TextureHandle, TextureOptions, Vec2,
+    self, Align, Button, Color32, CornerRadius, Frame, Layout, Margin, Rect, RichText, ScrollArea,
+    Sense, Stroke, TextureHandle, Vec2, pos2, vec2,
 };
 
 use config::{
-    ConsoleModel, FsrMode, GameFilesStatus, LauncherConfig, OutputRes, Preset, TriState, cache_dir,
-    data_dir,
+    ConsoleModel, FsrQuality, GameFilesStatus, LauncherConfig, OutputRes, Preset, TextureQuality,
+    TriState,
 };
-use hardware::{HardwareInfo, detected_controllers};
-use runner::{CacheStatus, EnginePaths, LogFileEntry, ProcessRunner, TaskKind};
-use theme::{NavIcon, RowIcon};
+use hardware::{ControllerPoller, HardwareInfo};
+use runner::{CacheStatus, EnginePaths, GitInfo, LogFileEntry, ProcessRunner, TaskKind};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
-    Play,
-    Shaders,
+    Inicio,
+    Configuracion,
     Logs,
-    Settings,
-    Links,
+    Actualizar,
 }
 
-struct LauncherApp {
+impl Tab {
+    fn label_es(self) -> &'static str {
+        match self {
+            Self::Inicio => "Inicio",
+            Self::Configuracion => "Configuración",
+            Self::Logs => "Logs y Soporte",
+            Self::Actualizar => "Actualizar",
+        }
+    }
+}
+
+struct VictoryLauncherApp {
     tab: Tab,
-    engine: EnginePaths,
-    hw: HardwareInfo,
     cfg: LauncherConfig,
-    game_files: GameFilesStatus,
+    hw: HardwareInfo,
+    engine: EnginePaths,
+    game: GameFilesStatus,
     cache: CacheStatus,
+    git: Arc<Mutex<GitInfo>>,
+    git_checking: Arc<Mutex<bool>>,
+    controllers: ControllerPoller,
     runner: ProcessRunner,
-    last_finished_seq: u64,
-    // Artwork texture loaded from user's local game folder (or procedural fallback).
-    hero_tex: Option<TextureHandle>,
-    hero_loaded_for: String,
-    // UI state
-    prep_jobs: usize,
+    banner_tex: Option<TextureHandle>,
+    banner_loaded_for: String,
     log_filter: String,
-    auto_scroll: bool,
-    log_entries: Vec<LogFileEntry>,
-    selected_crash_preview: String,
-    toast: Option<String>,
+    log_files: Vec<LogFileEntry>,
+    viewing_file_name: Option<String>,
+    viewing_file_lines: Vec<String>,
+    last_finished_seq: u64,
+    toast: Option<(String, Color32, Instant)>,
 }
 
-impl LauncherApp {
+impl VictoryLauncherApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        theme::apply(&cc.egui_ctx);
+        theme::apply_quantico_theme(&cc.egui_ctx);
         let engine = EnginePaths::discover();
         let hw = HardwareInfo::probe();
-        let cfg = LauncherConfig::load(engine.repo_root.as_deref());
-        let game_files = GameFilesStatus::inspect(Path::new(&cfg.game_dir));
+        let cfg = config::load_config(engine.repo_root.as_deref());
+        let game = GameFilesStatus::inspect(Path::new(&cfg.game_dir));
         let cache = CacheStatus::scan();
-        let prep_jobs = hw.recommended_shader_jobs();
-        let log_entries = runner::scan_data_logs();
-
-        let mut app = Self {
-            tab: Tab::Play,
-            engine,
-            hw,
-            cfg,
-            game_files,
-            cache,
-            runner: ProcessRunner::new(),
-            last_finished_seq: 0,
-            hero_tex: None,
-            hero_loaded_for: String::new(),
-            prep_jobs,
-            log_filter: String::new(),
-            auto_scroll: true,
-            log_entries,
-            selected_crash_preview: String::new(),
-            toast: None,
+        let git_local = GitInfo::probe_local(engine.repo_root.as_deref());
+        let log_files = runner::scan_data_logs();
+        let banner_tex = if !cfg.game_dir.is_empty() {
+            art::load_game_banner_texture(&cc.egui_ctx, Path::new(&cfg.game_dir))
+        } else {
+            None
         };
-        app.reload_hero(&cc.egui_ctx);
-        app
+        let banner_loaded_for = cfg.game_dir.clone();
+
+        Self {
+            tab: Tab::Inicio,
+            cfg,
+            hw,
+            engine,
+            game,
+            cache,
+            git: Arc::new(Mutex::new(git_local)),
+            git_checking: Arc::new(Mutex::new(false)),
+            controllers: ControllerPoller::default(),
+            runner: ProcessRunner::default(),
+            banner_tex,
+            banner_loaded_for,
+            log_filter: String::new(),
+            log_files,
+            viewing_file_name: None,
+            viewing_file_lines: Vec::new(),
+            last_finished_seq: 0,
+            toast: None,
+        }
     }
 
-    fn reload_hero(&mut self, ctx: &egui::Context) {
-        let img = if !self.cfg.game_dir.is_empty() {
-            art::from_game(Path::new(&self.cfg.game_dir)).unwrap_or_else(art::fallback_banner)
-        } else {
-            art::fallback_banner()
-        };
-        self.hero_tex = Some(ctx.load_texture("hero_banner", img, TextureOptions::LINEAR));
-        self.hero_loaded_for = self.cfg.game_dir.clone();
+    fn set_toast(&mut self, msg: impl Into<String>, color: Color32) {
+        self.toast = Some((msg.into(), color, Instant::now()));
+    }
+
+    fn refresh_status(&mut self, ctx: &egui::Context) {
+        self.engine = EnginePaths::discover();
+        self.game = GameFilesStatus::inspect(Path::new(&self.cfg.game_dir));
+        self.cache = CacheStatus::scan();
+        self.log_files = runner::scan_data_logs();
+        if self.cfg.game_dir != self.banner_loaded_for {
+            self.banner_tex = if !self.cfg.game_dir.is_empty() {
+                art::load_game_banner_texture(ctx, Path::new(&self.cfg.game_dir))
+            } else {
+                None
+            };
+            self.banner_loaded_for = self.cfg.game_dir.clone();
+        }
+    }
+
+    fn persist(&mut self) {
+        if let Err(e) = config::save_config(&self.cfg, self.engine.repo_root.as_deref()) {
+            self.set_toast(e, theme::STATUS_ERR);
+        }
     }
 
     fn pick_game_folder(&mut self, ctx: &egui::Context) {
-        let mut dialog = rfd::FileDialog::new().set_title("Select Xbox Series X|S Game Dump Folder");
+        let mut dialog = rfd::FileDialog::new().set_title("Selecciona la carpeta del juego");
         if !self.cfg.game_dir.is_empty() {
-            let p = Path::new(&self.cfg.game_dir);
-            if p.is_dir() {
-                dialog = dialog.set_directory(p);
-            }
+            dialog = dialog.set_directory(&self.cfg.game_dir);
         }
         if let Some(folder) = dialog.pick_folder() {
             self.cfg.game_dir = folder.to_string_lossy().into_owned();
-            self.cfg.save(self.engine.repo_root.as_deref());
-            self.game_files = GameFilesStatus::inspect(&folder);
-            self.reload_hero(ctx);
-            self.toast = if self.game_files.ready() {
-                Some("Game folder verified and saved to victory.toml.".into())
+            self.persist();
+            self.refresh_status(ctx);
+            if self.game.ready() {
+                self.set_toast("Carpeta del juego detectada correctamente.", theme::STATUS_OK);
             } else {
-                Some("Folder selected, but no .exe was found inside.".into())
-            };
+                self.set_toast(
+                    "Esa carpeta no contiene los archivos del juego (MicrosoftGame.config / .exe).",
+                    theme::STATUS_WARN,
+                );
+            }
         }
     }
 
-    fn refresh_status(&mut self) {
-        self.game_files = GameFilesStatus::inspect(Path::new(&self.cfg.game_dir));
-        self.cache = CacheStatus::scan();
-        self.log_entries = runner::scan_data_logs();
-    }
-
-    fn save_cfg(&self) {
-        self.cfg.save(self.engine.repo_root.as_deref());
-    }
-
-    fn trigger_play(&mut self) {
-        if self.runner.running().is_some() {
-            self.runner.stop();
-            return;
+    fn auto_search_game(&mut self, ctx: &egui::Context) {
+        match config::auto_find_game_dir(self.engine.repo_root.as_deref()) {
+            Some(found) => {
+                self.cfg.game_dir = found.to_string_lossy().into_owned();
+                self.persist();
+                self.refresh_status(ctx);
+                self.set_toast(
+                    format!("Juego encontrado en {}", self.cfg.game_dir),
+                    theme::STATUS_OK,
+                );
+            }
+            None => {
+                self.set_toast(
+                    "No se encontró automáticamente. Pulsa 'Elegir carpeta' para seleccionarlo.",
+                    theme::STATUS_WARN,
+                );
+            }
         }
-        let Some(exe) = self.game_files.exe_path.clone() else {
-            self.toast = Some("Select your game folder first (Change Game Folder).".into());
+    }
+
+    fn trigger_git_check(&mut self) {
+        let Some(root) = self.engine.repo_root.clone() else {
+            self.set_toast("No hay repositorio Git en esta carpeta.", theme::STATUS_WARN);
             return;
         };
-        self.save_cfg();
-        match self.runner.start_play(&self.engine, &self.cfg, &self.hw, &exe) {
-            Ok(()) => self.toast = Some("Launching VIctory-RTX-Mc3yohan...".into()),
-            Err(e) => self.toast = Some(e),
+        {
+            let mut checking = self.git_checking.lock().unwrap_or_else(|e| e.into_inner());
+            if *checking {
+                return;
+            }
+            *checking = true;
         }
+        let git_arc = self.git.clone();
+        let flag_arc = self.git_checking.clone();
+        std::thread::spawn(move || {
+            let info = GitInfo::fetch_remote_status(&root);
+            *git_arc.lock().unwrap_or_else(|e| e.into_inner()) = info;
+            *flag_arc.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        });
     }
 
-    fn trigger_prep(&mut self, kind: TaskKind) {
-        if self.runner.running().is_some() {
-            self.runner.stop();
-            return;
-        }
-        self.save_cfg();
-        match self.runner.start_prep(kind, &self.engine, &self.cfg, self.prep_jobs) {
-            Ok(()) => {
-                self.toast = Some(format!("{} started...", kind.label()));
-            }
-            Err(e) => self.toast = Some(e),
-        }
-    }
-}
+    fn ui_top_header(&mut self, ui: &mut egui::Ui, snap: &runner::RunnerSnapshot) {
+        let git_snapshot = self.git.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
-impl eframe::App for LauncherApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let running = self.runner.running();
-        let seq = self.runner.finished_seq();
-        if seq != self.last_finished_seq {
-            self.last_finished_seq = seq;
-            self.refresh_status();
-            if let Some(note) = self.runner.last_exit_note() {
-                self.toast = Some(note);
-            }
-        }
-        if running.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(120));
-        } else {
-            // Light 2s heartbeat for controller hot-plug updates.
-            ctx.request_repaint_after(Duration::from_secs(2));
-        }
-
-        // Left navigation sidebar
-        egui::SidePanel::left("nav_rail")
-            .exact_width(64.0)
-            .resizable(false)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::BG_SIDEBAR)
-                    .stroke(Stroke::new(1.0_f32, theme::BORDER))
-                    .inner_margin(Margin::symmetric(10, 14)),
-            )
-            .show(ctx, |ui| {
-                ui.vertical_centered(|ui| {
-                    let (badge_rect, _) = ui.allocate_exact_size(Vec2::new(36.0, 36.0), egui::Sense::hover());
-                    theme::draw_brand_badge(ui.painter(), badge_rect);
-                    ui.add_space(18.0);
-
-                    self.nav_button(ui, Tab::Play, NavIcon::Play, "Play");
-                    ui.add_space(6.0);
-                    self.nav_button(ui, Tab::Shaders, NavIcon::Shaders, "Shaders & Pipelines");
-                    ui.add_space(6.0);
-                    self.nav_button(ui, Tab::Logs, NavIcon::Logs, "Logs & Crashes");
-                    ui.add_space(6.0);
-                    self.nav_button(ui, Tab::Links, NavIcon::Links, "Links & Credits");
-                });
-
-                ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
-                    ui.label(RichText::new("v0.6.0").color(theme::TEXT_DIM).size(10.5));
-                    ui.label(RichText::new("RTX").color(theme::EMERALD).strong().size(10.0));
-                    ui.add_space(10.0);
-                    self.nav_button(ui, Tab::Settings, NavIcon::Settings, "Settings");
-                });
-            });
-
-        // Main content area
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::BG_CANVAS)
-                    .inner_margin(Margin::symmetric(20, 16)),
-            )
-            .show(ctx, |ui| {
-                match self.tab {
-                    Tab::Play => self.ui_play(ui, ctx),
-                    Tab::Shaders => self.ui_shaders(ui),
-                    Tab::Logs => self.ui_logs(ui),
-                    Tab::Settings => self.ui_settings(ui, ctx),
-                    Tab::Links => self.ui_links(ui),
-                }
-            });
-    }
-}
-
-impl LauncherApp {
-    fn nav_button(&mut self, ui: &mut egui::Ui, tab: Tab, icon: NavIcon, tooltip: &str) {
-        let active = self.tab == tab;
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(42.0, 42.0), egui::Sense::click());
-        let bg = if active {
-            theme::ACCENT_RED_DIM
-        } else if resp.hovered() {
-            theme::BG_CARD_ALT
-        } else {
-            Color32::TRANSPARENT
-        };
-        let fg = if active {
-            theme::TEXT_PRIMARY
-        } else if resp.hovered() {
-            theme::TEXT_PRIMARY
-        } else {
-            theme::TEXT_SECONDARY
-        };
-        ui.painter().rect_filled(rect, CornerRadius::same(9), bg);
-        if active {
-            let bar = egui::Rect::from_min_size(
-                egui::pos2(rect.left() - 10.0, rect.top() + 8.0),
-                Vec2::new(3.0, rect.height() - 16.0),
-            );
-            ui.painter().rect_filled(bar, CornerRadius::same(2), theme::ACCENT_RED);
-        }
-        theme::draw_nav_icon(ui.painter(), icon, rect.center(), fg);
-        if resp.clicked() {
-            self.tab = tab;
-            if tab == Tab::Logs {
-                self.log_entries = runner::scan_data_logs();
-            }
-        }
-        resp.on_hover_text(tooltip);
-    }
-
-    fn ui_play(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let running = self.runner.running();
-        let controllers = detected_controllers();
-
-        ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            // --- Hero Banner Card ---
-            let hero_w = ui.available_width();
-            let hero_h = 186.0;
-            let (hero_rect, _) = ui.allocate_exact_size(Vec2::new(hero_w, hero_h), egui::Sense::hover());
-            let painter = ui.painter();
-
-            if let Some(tex) = &self.hero_tex {
-                let tex_size = tex.size_vec2();
-                let img_aspect = tex_size.x / tex_size.y.max(1.0);
-                let box_aspect = hero_rect.width() / hero_rect.height().max(1.0);
-                let uv = if img_aspect > box_aspect {
-                    let frac = box_aspect / img_aspect;
-                    let pad = (1.0 - frac) * 0.5;
-                    egui::Rect::from_min_max(egui::pos2(pad, 0.0), egui::pos2(1.0 - pad, 1.0))
-                } else {
-                    let frac = img_aspect / box_aspect;
-                    let pad = (1.0 - frac) * 0.5;
-                    egui::Rect::from_min_max(egui::pos2(0.0, pad), egui::pos2(1.0, 1.0 - pad))
-                };
-                painter.image(tex.id(), hero_rect, uv, Color32::WHITE);
-            } else {
-                painter.rect_filled(hero_rect, CornerRadius::same(12), theme::BG_CARD);
-            }
-
-            // Dark scrim for guaranteed high-contrast text over any splash image.
-            painter.rect_filled(
-                hero_rect,
-                CornerRadius::same(12),
-                Color32::from_rgba_unmultiplied(10, 12, 18, 155),
-            );
-            let bottom_scrim = egui::Rect::from_min_max(
-                egui::pos2(hero_rect.left(), hero_rect.bottom() - 96.0),
-                hero_rect.max,
-            );
-            painter.rect_filled(
-                bottom_scrim,
-                CornerRadius::same(12),
-                Color32::from_rgba_unmultiplied(10, 12, 18, 175),
-            );
-            painter.rect_stroke(
-                hero_rect,
-                CornerRadius::same(12),
-                Stroke::new(1.0_f32, theme::BORDER),
-                egui::StrokeKind::Inside,
-            );
-
-            // Overlay widgets inside hero card.
-            let inner = hero_rect.shrink2(Vec2::new(20.0, 16.0));
-            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inner), |ui| {
-                // Top row: tag left + Change Game Folder button right.
+        Frame::new()
+            .fill(theme::BG_HEADER)
+            .stroke(Stroke::new(1.0_f32, theme::BORDER))
+            .inner_margin(Margin::symmetric(18, 10))
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("NVIDIA RTX  ·  WAVE32  ·  SERIES X|S")
-                            .color(theme::EMERALD)
-                            .strong()
-                            .size(11.0),
-                    );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let btn = Button::new(
-                            RichText::new("CHANGE GAME FOLDER")
+                    // Emblema Quantico + nombre.
+                    let (mark_rect, _) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::hover());
+                    theme::paint_quantico_mark(ui.painter(), mark_rect);
+                    ui.add_space(4.0);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.label(
+                            RichText::new("VIctory-RTX")
                                 .strong()
-                                .size(11.5)
+                                .size(15.5)
                                 .color(theme::TEXT_PRIMARY),
-                        )
-                        .fill(Color32::from_rgba_unmultiplied(18, 22, 32, 220))
-                        .stroke(Stroke::new(1.0_f32, theme::BORDER_ACTIVE))
-                        .corner_radius(CornerRadius::same(7))
-                        .min_size(Vec2::new(165.0, 32.0));
+                        );
+                        ui.label(
+                            RichText::new("QUANTICO SYSTEMS")
+                                .size(9.5)
+                                .strong()
+                                .color(theme::QUANTICO_BLUE_LIGHT),
+                        );
+                    });
+
+                    ui.add_space(24.0);
+
+                    // Pestañas claras horizontales (diseño propio, cero sidebar copiado).
+                    for tab in [Tab::Inicio, Tab::Configuracion, Tab::Logs, Tab::Actualizar] {
+                        let active = self.tab == tab;
+                        let fill = if active {
+                            theme::QUANTICO_BLUE_SOFT
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+                        let stroke = if active {
+                            Stroke::new(1.0_f32, theme::QUANTICO_BLUE)
+                        } else {
+                            Stroke::NONE
+                        };
+                        let text_col = if active {
+                            Color32::WHITE
+                        } else {
+                            theme::TEXT_SECONDARY
+                        };
+                        let mut label = tab.label_es().to_owned();
+                        if tab == Tab::Actualizar && git_snapshot.behind_count > 0 {
+                            label = format!("Actualizar ({})", git_snapshot.behind_count);
+                        }
+                        let btn = Button::new(RichText::new(label).color(text_col).strong().size(13.0))
+                            .fill(fill)
+                            .stroke(stroke)
+                            .corner_radius(CornerRadius::same(8))
+                            .min_size(vec2(88.0, 32.0));
                         if ui.add(btn).clicked() {
-                            self.pick_game_folder(ctx);
+                            self.tab = tab;
+                            if tab == Tab::Logs {
+                                self.log_files = runner::scan_data_logs();
+                            }
+                        }
+                    }
+
+                    // Derecha: estado rápido y versión.
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let ver = format!("v0.7.0 · {}", env!("VICTORY_GIT_SHA"));
+                        ui.label(RichText::new(ver).color(theme::TEXT_MUTED).size(11.0));
+                        ui.add_space(8.0);
+                        if let Some(task) = snap.running {
+                            theme::status_pill(ui, task.label_es(), theme::QUANTICO_BLUE_LIGHT);
+                        } else if git_snapshot.behind_count > 0 {
+                            theme::status_pill(ui, "Actualización lista", theme::STATUS_OK);
+                        } else if self.game.ready() && self.cache.shaders_ready() {
+                            theme::status_pill(ui, "Listo para jugar", theme::STATUS_OK);
                         }
                     });
                 });
+            });
+    }
 
-                // Bottom row: Title + subtitle left, giant PLAY / STOP CTA right.
-                ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.label(
-                                RichText::new("VIctory-RTX-Mc3yohan")
-                                    .color(theme::TEXT_PRIMARY)
-                                    .strong()
-                                    .size(26.0),
-                            );
-                            let sub = if let Some(kind) = running {
-                                format!(
-                                    "{} ({} s)  ·  {}",
-                                    kind.label(),
-                                    self.runner.elapsed_secs(),
-                                    self.hw.summary_line()
-                                )
+    fn ui_inicio(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        snap: &runner::RunnerSnapshot,
+    ) {
+        let is_running = snap.running.is_some();
+
+        // --- Banner Hero Quantico (215 px, amplio, cero superposiciones) ---
+        let avail_w = ui.available_width();
+        let banner_h = 212.0_f32;
+        let (banner_rect, _) = ui.allocate_exact_size(vec2(avail_w, banner_h), Sense::hover());
+
+        if let Some(tex) = &self.banner_tex {
+            let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+            ui.painter()
+                .image(tex.id(), banner_rect, uv, Color32::WHITE);
+        }
+        theme::paint_quantico_banner_overlay(ui.painter(), banner_rect, self.banner_tex.is_some());
+
+        // Contenido dentro del banner con márgenes holgados.
+        let inner = banner_rect.shrink2(vec2(24.0, 20.0));
+        let mut child_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(inner)
+                .layout(Layout::left_to_right(Align::Center)),
+        );
+
+        child_ui.horizontal(|ui| {
+            // Bloque izquierdo: identidad + hardware en lenguaje humano.
+            ui.allocate_ui_with_layout(
+                vec2((inner.width() - 250.0).max(260.0), inner.height()),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new("QUANTICO SYSTEMS  ·  EDICIÓN NVIDIA RTX")
+                            .color(theme::QUANTICO_BLUE_LIGHT)
+                            .strong()
+                            .size(11.0),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("VIctory-RTX")
+                            .color(Color32::WHITE)
+                            .strong()
+                            .size(34.0),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(self.hw.summary_line_es())
+                            .color(theme::TEXT_SECONDARY)
+                            .size(13.0),
+                    );
+                    ui.add_space(10.0);
+                    let subtitle = if let Some(task) = snap.running {
+                        format!(
+                            "{} · {:02}:{:02}",
+                            task.label_es(),
+                            snap.elapsed_secs / 60,
+                            snap.elapsed_secs % 60
+                        )
+                    } else if !self.game.ready() {
+                        "Selecciona o busca la carpeta de tu juego para empezar.".to_owned()
+                    } else if !self.cache.shaders_ready() {
+                        "Te recomendamos preparar los gráficos (1 sola vez) para jugar sin tirones.".to_owned()
+                    } else if let Some(med) = snap.metrics.median_fps() {
+                        format!(
+                            "Última partida: {:.1} FPS promedio (máx {:.1} FPS) · {} shaders listos",
+                            med, snap.metrics.best_fps, self.cache.shader_files
+                        )
+                    } else {
+                        format!(
+                            "{} shaders listos · Perfil activo: {}",
+                            self.cache.shader_files,
+                            self.cfg.preset.label_es()
+                        )
+                    };
+                    ui.label(RichText::new(subtitle).color(theme::TEXT_PRIMARY).size(12.5));
+                },
+            );
+
+            // Bloque derecho: CTA gigante azul Quantico + botón carpeta.
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 10.0;
+                    if is_running {
+                        let stop = Button::new(
+                            RichText::new("DETENER").strong().size(16.0).color(Color32::WHITE),
+                        )
+                        .fill(theme::STATUS_ERR)
+                        .stroke(Stroke::new(1.0_f32, theme::STATUS_ERR_DARK))
+                        .corner_radius(CornerRadius::same(10))
+                        .min_size(vec2(210.0, 50.0));
+                        if ui.add(stop).clicked() {
+                            self.runner.stop();
+                        }
+                    } else {
+                        let can_play = self.game.ready()
+                            && self.engine.active_victory(self.cfg.use_diag_build).is_some();
+                        let fill = if can_play {
+                            theme::QUANTICO_BLUE
+                        } else {
+                            Color32::from_rgb(38, 46, 62)
+                        };
+                        let play = Button::new(
+                            RichText::new("JUGAR AHORA")
+                                .strong()
+                                .size(16.0)
+                                .color(if can_play { Color32::WHITE } else { theme::TEXT_MUTED }),
+                        )
+                        .fill(fill)
+                        .stroke(Stroke::new(
+                            1.0_f32,
+                            if can_play {
+                                theme::QUANTICO_BLUE_LIGHT
                             } else {
-                                self.hw.summary_line()
-                            };
-                            ui.label(RichText::new(sub).color(theme::TEXT_SECONDARY).size(12.5));
-                        });
-
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let (btn_text, btn_color, enabled) = match running {
-                                Some(TaskKind::Play) => ("■  STOP", Color32::from_rgb(185, 28, 28), true),
-                                Some(_) => ("■  CANCEL", theme::AMBER, true),
-                                None => {
-                                    let ready = self.game_files.ready()
-                                        && self.engine.active_exe(self.cfg.diag_build || self.cfg.gpu_timing).is_some();
-                                    ("▶  PLAY", theme::ACCENT_RED, ready)
+                                theme::BORDER
+                            },
+                        ))
+                        .corner_radius(CornerRadius::same(10))
+                        .min_size(vec2(210.0, 50.0));
+                        if ui.add_enabled(can_play, play).clicked() {
+                            match self.runner.start_play(&self.engine, &self.cfg, &self.hw) {
+                                Ok(()) => {
+                                    self.set_toast(
+                                        "Iniciando juego... Puedes ver los FPS en vivo en 'Logs y Soporte'.",
+                                        theme::QUANTICO_BLUE_LIGHT,
+                                    );
                                 }
-                            };
-                            let play_btn = Button::new(
-                                RichText::new(btn_text)
-                                    .color(Color32::WHITE)
-                                    .strong()
-                                    .size(15.0),
+                                Err(e) => self.set_toast(e, theme::STATUS_ERR),
+                            }
+                        }
+                    }
+
+                    let folder_btn = Button::new(
+                        RichText::new("Elegir carpeta del juego")
+                            .size(12.5)
+                            .color(theme::TEXT_PRIMARY),
+                    )
+                    .fill(Color32::from_rgba_unmultiplied(15, 22, 34, 225))
+                    .stroke(Stroke::new(1.0_f32, theme::BORDER_STRONG))
+                    .corner_radius(CornerRadius::same(8))
+                    .min_size(vec2(210.0, 34.0));
+                    if ui.add(folder_btn).clicked() {
+                        self.pick_game_folder(ctx);
+                    }
+                });
+            });
+        });
+
+        ui.add_space(10.0);
+
+        // --- Alertas contextuales útiles (solo aparecen cuando hacen falta) ---
+        if self.hw.is_elevated_admin {
+            theme::alert_banner(theme::STATUS_WARN, Color32::from_rgb(34, 25, 12)).show(ui, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Aviso: abriste el launcher como Administrador. Ciérralo y ábrelo de forma normal para que NVIDIA guarde bien la caché de shaders.",
+                    )
+                    .color(theme::STATUS_WARN)
+                    .size(12.0),
+                );
+            });
+            ui.add_space(6.0);
+        }
+
+        if let Some(legacy) = self.cache.legacy_importable.clone()
+            && !is_running
+        {
+            theme::alert_banner(theme::QUANTICO_BLUE, Color32::from_rgb(12, 24, 44)).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("Detectamos caché previa de gráficos en tu PC")
+                                .strong()
+                                .color(Color32::WHITE)
+                                .size(13.0),
+                        );
+                        let mut extras = Vec::new();
+                        if legacy.has_fidelityfx {
+                            extras.push("FidelityFX DLL");
+                        }
+                        if legacy.has_saves {
+                            extras.push("partidas guardadas");
+                        }
+                        let extra_str = if extras.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" + {}", extras.join(" y "))
+                        };
+                        ui.label(
+                            RichText::new(format!(
+                                "Encontramos {} shaders y {} MB de escenas ya compiladas{extra_str} en ScarlettPort. Puedes importarlas en 1 clic sin esperar.",
+                                legacy.shader_files, legacy.pipeline_mb
+                            ))
+                            .color(theme::TEXT_SECONDARY)
+                            .size(12.0),
+                        );
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let btn = Button::new(
+                            RichText::new("Importar caché ahora")
+                                .strong()
+                                .color(Color32::WHITE),
+                        )
+                        .fill(theme::QUANTICO_BLUE)
+                        .corner_radius(CornerRadius::same(8));
+                        if ui.add(btn).clicked() {
+                            if let Err(e) = self.runner.start_import_legacy_cache(legacy) {
+                                self.set_toast(e, theme::STATUS_ERR);
+                            }
+                        }
+                    });
+                });
+            });
+            ui.add_space(6.0);
+        }
+
+        // Barra de progreso en vivo cuando se preparan gráficos / importa caché / actualiza.
+        if let Some(task) = snap.running
+            && task != TaskKind::Play
+        {
+            theme::bento_card().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(&snap.progress.step_label)
+                            .strong()
+                            .color(theme::QUANTICO_BLUE_LIGHT)
+                            .size(13.5),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "Tiempo: {:02}:{:02}",
+                                snap.elapsed_secs / 60,
+                                snap.elapsed_secs % 60
+                            ))
+                            .color(theme::TEXT_SECONDARY)
+                            .size(12.0),
+                        );
+                    });
+                });
+                ui.add_space(4.0);
+                let frac = snap.progress.fraction();
+                let bar = egui::ProgressBar::new(frac)
+                    .fill(theme::QUANTICO_BLUE)
+                    .desired_height(16.0)
+                    .show_percentage();
+                ui.add(bar);
+                if !snap.progress.last_summary.is_empty() {
+                    ui.label(
+                        RichText::new(&snap.progress.last_summary)
+                            .color(theme::TEXT_MUTED)
+                            .size(11.5),
+                    );
+                }
+            });
+            ui.add_space(8.0);
+        }
+
+        // --- Cuadrícula Bento 2×2 limpia (sin superposición de texto jamás) ---
+        ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.columns(2, |cols| {
+                    // TARJETA 1: Archivos del juego
+                    theme::bento_card().show(&mut cols[0], |ui| {
+                        ui.horizontal(|ui| {
+                            theme::paint_badge_icon(
+                                ui,
+                                theme::BadgeKind::Folder,
+                                if self.game.ready() {
+                                    theme::STATUS_OK
+                                } else {
+                                    theme::STATUS_WARN
+                                },
+                            );
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                ui.label(RichText::new("Archivos del juego").strong().size(14.5));
+                                ui.label(
+                                    RichText::new("Tu copia legal del juego de consola")
+                                        .color(theme::TEXT_MUTED)
+                                        .size(11.5),
+                                );
+                            });
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if self.game.ready() {
+                                    theme::status_pill(ui, "Listo", theme::STATUS_OK);
+                                } else {
+                                    theme::status_pill(ui, "Falta carpeta", theme::STATUS_WARN);
+                                }
+                            });
+                        });
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(self.game.summary_es())
+                                .color(theme::TEXT_SECONDARY)
+                                .size(12.0),
+                        );
+                        if !self.cfg.game_dir.is_empty() {
+                            ui.label(
+                                RichText::new(&self.cfg.game_dir)
+                                    .color(theme::TEXT_MUTED)
+                                    .size(11.0),
+                            );
+                        }
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Buscar automáticamente").clicked() {
+                                self.auto_search_game(ctx);
+                            }
+                            if ui.button("Elegir carpeta").clicked() {
+                                self.pick_game_folder(ctx);
+                            }
+                        });
+                    });
+
+                    // TARJETA 2: Preparación de gráficos (Shaders + Escenas)
+                    theme::bento_card().show(&mut cols[1], |ui| {
+                        let ready = self.cache.shaders_ready();
+                        ui.horizontal(|ui| {
+                            theme::paint_badge_icon(
+                                ui,
+                                theme::BadgeKind::Bolt,
+                                if ready {
+                                    theme::QUANTICO_BLUE_LIGHT
+                                } else {
+                                    theme::STATUS_WARN
+                                },
+                            );
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                ui.label(RichText::new("Gráficos pre-cargados").strong().size(14.5));
+                                ui.label(
+                                    RichText::new("Evita congelamientos y tirones al jugar")
+                                        .color(theme::TEXT_MUTED)
+                                        .size(11.5),
+                                );
+                            });
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ready && self.cache.pipeline_lib_exists {
+                                    theme::status_pill(ui, "Completo", theme::STATUS_OK);
+                                } else if ready {
+                                    theme::status_pill(ui, "Shaders listos", theme::QUANTICO_BLUE_LIGHT);
+                                } else {
+                                    theme::status_pill(ui, "Pendiente", theme::STATUS_WARN);
+                                }
+                            });
+                        });
+                        ui.add_space(8.0);
+                        let shaders_txt = if ready {
+                            format!(
+                                "Shaders: {} listos ({} MB) · Escenas pre-calentadas: {}",
+                                self.cache.shader_files,
+                                self.cache.shader_mb,
+                                if self.cache.pipeline_lib_exists {
+                                    format!("{} MB", self.cache.pipeline_lib_mb)
+                                } else if self.cache.early_pipelines_count > 0 {
+                                    format!("{} listas para acelerar", self.cache.early_pipelines_count)
+                                } else {
+                                    "se crean tras entrar 1 vez al juego".to_owned()
+                                }
                             )
-                            .fill(if enabled { btn_color } else { theme::BG_CARD_ALT })
-                            .corner_radius(CornerRadius::same(8))
-                            .min_size(Vec2::new(152.0, 44.0));
-                            if ui.add_enabled(enabled, play_btn).clicked() {
-                                self.trigger_play();
+                        } else {
+                            "Aún no preparados. Ejecútalo 1 sola vez (2–6 min) dejando 2 núcleos libres para tu PC.".to_owned()
+                        };
+                        ui.label(RichText::new(shaders_txt).color(theme::TEXT_SECONDARY).size(12.0));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            let prep_btn = Button::new(
+                                RichText::new("Preparar gráficos (1 clic)")
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(theme::QUANTICO_BLUE_STRONG);
+                            if ui
+                                .add_enabled(!is_running && self.game.ready(), prep_btn)
+                                .clicked()
+                            {
+                                if let Err(e) =
+                                    self.runner.start_prep(&self.engine, &self.cfg, TaskKind::PrepareAll)
+                                {
+                                    self.set_toast(e, theme::STATUS_ERR);
+                                }
+                            }
+                            if self.cache.early_pipelines_count > 0
+                                && ui
+                                    .add_enabled(!is_running, Button::new("Acelerar escenas"))
+                                    .clicked()
+                            {
+                                if let Err(e) =
+                                    self.runner.start_prep(&self.engine, &self.cfg, TaskKind::Warm)
+                                {
+                                    self.set_toast(e, theme::STATUS_ERR);
+                                }
                             }
                         });
                     });
                 });
-            });
 
-            if let Some(toast) = self.toast.clone() {
-                ui.add_space(6.0);
-                egui::Frame::new()
-                    .fill(Color32::from_rgba_unmultiplied(16, 185, 129, 26))
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(16, 185, 129, 90)))
-                    .corner_radius(CornerRadius::same(8))
-                    .inner_margin(Margin::symmetric(12, 7))
-                    .show(ui, |ui| {
+                ui.add_space(10.0);
+
+                ui.columns(2, |cols| {
+                    // TARJETA 3: Perfil rápido de calidad (rejilla ordenada, cero solapamientos)
+                    theme::bento_card().show(&mut cols[0], |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(&toast).color(theme::TEXT_PRIMARY).size(12.5));
+                            theme::paint_badge_icon(
+                                ui,
+                                theme::BadgeKind::Sliders,
+                                theme::QUANTICO_BLUE_LIGHT,
+                            );
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                ui.label(RichText::new("Calidad y Rendimiento").strong().size(14.5));
+                                ui.label(
+                                    RichText::new("Elige cómo quieres priorizar FPS vs nitidez")
+                                        .color(theme::TEXT_MUTED)
+                                        .size(11.5),
+                                );
+                            });
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.small_button("Dismiss").clicked() {
-                                    self.toast = None;
-                                }
+                                theme::status_pill(
+                                    ui,
+                                    self.cfg.preset.label_es(),
+                                    theme::QUANTICO_BLUE_LIGHT,
+                                );
                             });
                         });
-                    });
-            }
-
-            if let Some(kind) = running
-                && kind != TaskKind::Play
-            {
-                let prog = self.runner.snapshot_progress();
-                ui.add_space(6.0);
-                theme::card_frame().show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(&prog.step_label).strong().color(theme::CYAN));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(
-                                RichText::new(format!("{} s elapsed", self.runner.elapsed_secs()))
-                                    .color(theme::TEXT_SECONDARY)
-                                    .size(12.0),
-                            );
+                        ui.add_space(8.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                            for preset in [
+                                Preset::Auto,
+                                Preset::Fluid720p,
+                                Preset::Balanced1080p,
+                                Preset::Native1080p,
+                                Preset::High1440p,
+                                Preset::Fsr4K,
+                                Preset::Safe,
+                            ] {
+                                let active = self.cfg.preset == preset;
+                                let btn = Button::new(
+                                    RichText::new(preset.label_es())
+                                        .size(12.0)
+                                        .color(if active { Color32::WHITE } else { theme::TEXT_SECONDARY })
+                                        .strong(),
+                                )
+                                .fill(if active { theme::QUANTICO_BLUE } else { theme::BG_CARD_ALT })
+                                .stroke(Stroke::new(
+                                    1.0_f32,
+                                    if active { theme::QUANTICO_BLUE_LIGHT } else { theme::BORDER },
+                                ))
+                                .corner_radius(CornerRadius::same(7));
+                                if ui.add(btn).clicked() {
+                                    self.cfg.apply_preset(preset);
+                                    self.persist();
+                                }
+                            }
                         });
-                    });
-                    ui.add_space(4.0);
-                    ui.add(
-                        ProgressBar::new(prog.fraction())
-                            .desired_height(8.0)
-                            .show_percentage(),
-                    );
-                });
-            }
-
-            ui.add_space(10.0);
-
-            // --- Row 1: Game files ---
-            self.status_row(
-                ui,
-                RowIcon::Folder,
-                "Game files",
-                &self.game_files.detail_line(&self.cfg.game_dir),
-                |ui| {
-                    if self.game_files.ready() {
-                        theme::status_pill(ui, "Ready", theme::EMERALD);
-                    } else {
-                        theme::status_pill(ui, "Select folder", theme::AMBER);
-                    }
-                },
-            );
-            ui.add_space(6.0);
-
-            // --- Row 2: Engine & GPU Auto-Tier ---
-            let want_diag = self.cfg.diag_build || self.cfg.gpu_timing;
-            let engine_ok = self.engine.active_exe(want_diag).is_some();
-            let ram16_note = match self.cfg.ram16_profile {
-                TriState::On => " · RAM16 ON",
-                TriState::Off => " · RAM16 OFF",
-                TriState::Auto if self.hw.auto_ram16() => " · RAM16 Auto ON",
-                TriState::Auto => "",
-            };
-            let engine_detail = format!(
-                "{} build  ·  Tier {} (ReBAR {} MiB, MipDrop {})  ·  Thin={} {}",
-                if want_diag { "Diagnostics" } else { "Release ThinLTO + mimalloc" },
-                self.hw.vram_tier.label(),
-                self.cfg.effective_windows_bar_mb(&self.hw),
-                self.cfg.effective_mip_drop(&self.hw),
-                if self.cfg.effective_thin(&self.hw) { "ON" } else { "OFF" },
-                ram16_note,
-            );
-            self.status_row(ui, RowIcon::CpuGpu, "Engine & GPU Auto-Tier", &engine_detail, |ui| {
-                if engine_ok {
-                    theme::status_pill(ui, "Ready", theme::EMERALD);
-                } else {
-                    theme::status_pill(ui, "Build required", theme::AMBER);
-                }
-            });
-            ui.add_space(6.0);
-
-            // --- Row 3: Shaders ---
-            let shader_detail = if self.cache.shaders_ready() {
-                format!(
-                    "{} Wave32 shaders cached ({} MB) — built for this runtime",
-                    self.cache.shader_files, self.cache.shader_mb
-                )
-            } else {
-                "Not built yet — run once (~2-10 min) so gameplay has zero shader compile stutters".to_owned()
-            };
-            let mut build_shaders_clicked = false;
-            self.status_row(ui, RowIcon::Download, "Shaders", &shader_detail, |ui| {
-                if self.cache.shaders_ready() {
-                    theme::status_pill(ui, "Ready", theme::EMERALD);
-                } else {
-                    if ui
-                        .add_enabled(
-                            running.is_none() && self.game_files.ready(),
-                            Button::new("Build Shaders"),
-                        )
-                        .clicked()
-                    {
-                        build_shaders_clicked = true;
-                    }
-                    theme::status_pill(ui, "Pending", theme::AMBER);
-                }
-            });
-            if build_shaders_clicked {
-                self.tab = Tab::Shaders;
-                self.trigger_prep(TaskKind::Shaders);
-            }
-            ui.add_space(6.0);
-
-            // --- Row 4: World pipelines ---
-            let pipe_detail = if self.cache.pipeline_lib_exists {
-                format!(
-                    "host-pipelines.bin cached ({} MB) — instant PSO loads",
-                    self.cache.pipeline_lib_mb
-                )
-            } else {
-                "Optional: warm pipelines after your first run to remove driver hitching".to_owned()
-            };
-            let mut warm_clicked = false;
-            self.status_row(ui, RowIcon::Layers, "World pipelines", &pipe_detail, |ui| {
-                if self.cache.pipeline_lib_exists {
-                    theme::status_pill(ui, "Ready", theme::EMERALD);
-                } else {
-                    if ui
-                        .add_enabled(running.is_none() && self.cache.shaders_ready(), Button::new("Warm"))
-                        .clicked()
-                    {
-                        warm_clicked = true;
-                    }
-                    theme::status_pill(ui, "Optional", theme::TEXT_SECONDARY);
-                }
-            });
-            if warm_clicked {
-                self.tab = Tab::Shaders;
-                self.trigger_prep(TaskKind::Warm);
-            }
-            ui.add_space(6.0);
-
-            // --- Row 5: Controller & Input ---
-            let (ctrl_detail, ctrl_badge, ctrl_ok) = controllers.describe(self.cfg.kbm_gta);
-            let mut toggle_kbm = false;
-            self.status_row(ui, RowIcon::Gamepad, "Controller & Input", &ctrl_detail, |ui| {
-                let kbm_btn = Button::new(
-                    RichText::new(if self.cfg.kbm_gta { "KBM: ON" } else { "KBM: OFF" }).size(12.0),
-                )
-                .fill(if self.cfg.kbm_gta {
-                    Color32::from_rgba_unmultiplied(16, 185, 129, 55)
-                } else {
-                    theme::BG_CARD_ALT
-                });
-                if ui.add(kbm_btn).on_hover_text("Toggle GTA PC Keyboard + Mouse-Look (F2 / ~)").clicked() {
-                    toggle_kbm = true;
-                }
-                if ctrl_ok {
-                    theme::status_pill(ui, ctrl_badge, theme::EMERALD);
-                } else {
-                    ui.label(RichText::new(ctrl_badge).color(theme::TEXT_DIM).size(13.0));
-                }
-            });
-            if toggle_kbm {
-                self.cfg.kbm_gta = !self.cfg.kbm_gta;
-                self.save_cfg();
-            }
-            ui.add_space(6.0);
-
-            // --- Row 6: Preset selector ---
-            let mut picked_preset = None;
-            let preset_desc = self.cfg.preset.summary();
-            self.status_row(ui, RowIcon::Sliders, "Preset", preset_desc, |ui| {
-                for preset in Preset::ALL {
-                    let active = self.cfg.preset == preset;
-                    let btn = Button::new(
-                        RichText::new(preset.label())
-                            .color(if active { Color32::WHITE } else { theme::TEXT_SECONDARY })
-                            .strong()
-                            .size(12.0),
-                    )
-                    .fill(if active { theme::ACCENT_RED } else { theme::BG_CARD_ALT })
-                    .corner_radius(CornerRadius::same(6));
-                    if ui.add(btn).clicked() {
-                        picked_preset = Some(preset);
-                    }
-                }
-            });
-            if let Some(p) = picked_preset {
-                self.cfg.apply_preset(p);
-                self.save_cfg();
-                if p == Preset::Custom {
-                    self.tab = Tab::Settings;
-                }
-            }
-        });
-    }
-
-    fn status_row(
-        &self,
-        ui: &mut egui::Ui,
-        icon: RowIcon,
-        title: &str,
-        detail: &str,
-        right: impl FnOnce(&mut egui::Ui),
-    ) {
-        theme::card_frame().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                theme::draw_row_icon(ui, icon);
-                ui.add_space(6.0);
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(title).color(theme::TEXT_PRIMARY).strong().size(14.0));
-                    ui.label(RichText::new(detail).color(theme::TEXT_SECONDARY).size(12.0));
-                });
-                ui.with_layout(Layout::right_to_left(Align::Center), right);
-            });
-        });
-    }
-
-    fn ui_shaders(&mut self, ui: &mut egui::Ui) {
-        let running = self.runner.running();
-        let prog = self.runner.snapshot_progress();
-
-        ui.label(RichText::new("Shaders & Pipeline Library").strong().size(22.0));
-        ui.label(
-            RichText::new(
-                "Pre-translate all ~26,084 console shaders to NVIDIA Wave32 DXIL once, then warm your D3D12 pipeline library so gameplay stays smooth.",
-            )
-            .color(theme::TEXT_SECONDARY)
-            .size(12.5),
-        );
-        ui.add_space(12.0);
-
-        theme::card_frame().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Worker threads:").strong());
-                ui.add(egui::Slider::new(&mut self.prep_jobs, 1..=self.hw.logical_cpus.max(2)));
-                ui.label(
-                    RichText::new("(leaves 2 cores free for desktop by default)")
-                        .color(theme::TEXT_DIM)
-                        .size(11.5),
-                );
-            });
-            ui.add_space(10.0);
-
-            ui.horizontal(|ui| {
-                let can_run = running.is_none() && self.game_files.ready();
-                let primary = Button::new(RichText::new("Prepare All (Shaders + Warm)").strong().color(Color32::WHITE))
-                    .fill(if can_run { theme::ACCENT_RED } else { theme::BG_CARD_ALT })
-                    .min_size(Vec2::new(210.0, 36.0));
-                if ui.add_enabled(can_run, primary).clicked() {
-                    self.trigger_prep(TaskKind::PrepareAll);
-                }
-                if ui
-                    .add_enabled(can_run, Button::new("Build Shaders Only").min_size(Vec2::new(150.0, 36.0)))
-                    .clicked()
-                {
-                    self.trigger_prep(TaskKind::Shaders);
-                }
-                if ui
-                    .add_enabled(
-                        running.is_none() && self.cache.shaders_ready(),
-                        Button::new("Warm Pipelines").min_size(Vec2::new(140.0, 36.0)),
-                    )
-                    .clicked()
-                {
-                    self.trigger_prep(TaskKind::Warm);
-                }
-                if running.is_some() && ui.button("Stop").clicked() {
-                    self.runner.stop();
-                }
-            });
-
-            if running.is_some() || prog.done > 0 {
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(&prog.step_label).strong().color(theme::CYAN));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add_space(6.0);
                         ui.label(
-                            RichText::new(format!("{} s", self.runner.elapsed_secs()))
-                                .color(theme::TEXT_SECONDARY),
+                            RichText::new(self.cfg.preset.description_es(&self.hw))
+                                .color(theme::TEXT_SECONDARY)
+                                .size(11.8),
                         );
                     });
-                });
-                ui.add(ProgressBar::new(prog.fraction()).desired_height(10.0).show_percentage());
-                if !prog.last_summary.is_empty() {
-                    ui.label(RichText::new(&prog.last_summary).color(theme::TEXT_SECONDARY).size(12.0));
-                }
-            }
-        });
 
-        ui.add_space(10.0);
-        theme::card_frame().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(RichText::new("Cache Folder").strong().size(14.0));
-                    ui.label(
-                        RichText::new(format!(
-                            "{}  ·  {} shaders ({} MB)  ·  host-pipelines.bin: {} MB",
-                            cache_dir().display(),
-                            self.cache.shader_files,
-                            self.cache.shader_mb,
-                            self.cache.pipeline_lib_mb
-                        ))
+                    // TARJETA 4: Control y Teclado
+                    let pad = self.controllers.poll().clone();
+                    theme::bento_card().show(&mut cols[1], |ui| {
+                        ui.horizontal(|ui| {
+                            theme::paint_badge_icon(
+                                ui,
+                                theme::BadgeKind::Pad,
+                                if pad.any() || self.cfg.kbm_gta {
+                                    theme::STATUS_OK
+                                } else {
+                                    theme::TEXT_MUTED
+                                },
+                            );
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                ui.label(RichText::new("Control y Teclado").strong().size(14.5));
+                                ui.label(
+                                    RichText::new("Compatible con Xbox, PlayStation y PC")
+                                        .color(theme::TEXT_MUTED)
+                                        .size(11.5),
+                                );
+                            });
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let badge = if self.cfg.kbm_gta {
+                                    "Teclado + Ratón".to_owned()
+                                } else {
+                                    pad.badge_es()
+                                };
+                                let col = if pad.any() || self.cfg.kbm_gta {
+                                    theme::STATUS_OK
+                                } else {
+                                    theme::TEXT_MUTED
+                                };
+                                theme::status_pill(ui, &badge, col);
+                            });
+                        });
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(pad.summary_es())
+                                .color(theme::TEXT_SECONDARY)
+                                .size(12.0),
+                        );
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .checkbox(
+                                    &mut self.cfg.kbm_gta,
+                                    "Jugar con Teclado y Ratón (F2 fija la cámara)",
+                                )
+                                .changed()
+                            {
+                                self.persist();
+                            }
+                        });
+                        if self.hw.low_ram_auto() {
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new("Modo de ahorro de RAM activado automáticamente para tu memoria.")
+                                    .color(theme::QUANTICO_BLUE_LIGHT)
+                                    .size(11.5),
+                            );
+                        }
+                    });
+                });
+            });
+    }
+
+    fn ui_configuracion(&mut self, ui: &mut egui::Ui) {
+        let mut changed = false;
+
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new("Configuración").strong().size(22.0));
+                ui.label(
+                    RichText::new("Ajustes claros arriba y control total para usuarios expertos abajo.")
                         .color(theme::TEXT_SECONDARY)
-                        .size(12.0),
+                        .size(12.5),
+                );
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.button("Restaurar recomendados").clicked() {
+                    let saved_dir = self.cfg.game_dir.clone();
+                    self.cfg = LauncherConfig::default();
+                    self.cfg.game_dir = saved_dir;
+                    changed = true;
+                    self.set_toast("Ajustes restaurados al perfil recomendado.", theme::STATUS_OK);
+                }
+            });
+        });
+        ui.add_space(10.0);
+
+        ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                // --- Bloque 1: Ajustes fáciles ---
+                theme::bento_card().show(ui, |ui| {
+                    ui.label(
+                        RichText::new("Pantalla y Calidad Gráfica")
+                            .strong()
+                            .color(theme::QUANTICO_BLUE_LIGHT)
+                            .size(14.5),
                     );
-                });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("Open Cache Folder").clicked() {
-                        runner::open_folder(&cache_dir());
+                    ui.add_space(8.0);
+
+                    egui::Grid::new("easy_settings_grid")
+                        .num_columns(2)
+                        .spacing([24.0, 10.0])
+                        .show(ui, |ui| {
+                            ui.label("Resolución de salida:");
+                            egui::ComboBox::from_id_salt("out_res")
+                                .selected_text(self.cfg.output.label_es())
+                                .show_ui(ui, |ui| {
+                                    for opt in [
+                                        OutputRes::Auto,
+                                        OutputRes::P720,
+                                        OutputRes::P1080,
+                                        OutputRes::P1440,
+                                        OutputRes::P4K,
+                                    ] {
+                                        if ui
+                                            .selectable_value(&mut self.cfg.output, opt, opt.label_es())
+                                            .changed()
+                                        {
+                                            self.cfg.preset = Preset::Custom;
+                                            changed = true;
+                                        }
+                                    }
+                                });
+                            ui.end_row();
+
+                            ui.label("Perfil de consola:");
+                            egui::ComboBox::from_id_salt("console_sel")
+                                .selected_text(self.cfg.console.label_es())
+                                .show_ui(ui, |ui| {
+                                    for opt in [
+                                        ConsoleModel::Auto,
+                                        ConsoleModel::SeriesX,
+                                        ConsoleModel::SeriesS,
+                                    ] {
+                                        if ui
+                                            .selectable_value(&mut self.cfg.console, opt, opt.label_es())
+                                            .changed()
+                                        {
+                                            self.cfg.preset = Preset::Custom;
+                                            changed = true;
+                                        }
+                                    }
+                                });
+                            ui.end_row();
+
+                            ui.label("Detalle de texturas:");
+                            egui::ComboBox::from_id_salt("tex_qual")
+                                .selected_text(self.cfg.texture_quality.label_es())
+                                .show_ui(ui, |ui| {
+                                    for opt in [
+                                        TextureQuality::Auto,
+                                        TextureQuality::Max,
+                                        TextureQuality::High,
+                                        TextureQuality::Medium,
+                                    ] {
+                                        if ui
+                                            .selectable_value(
+                                                &mut self.cfg.texture_quality,
+                                                opt,
+                                                opt.label_es(),
+                                            )
+                                            .changed()
+                                        {
+                                            self.cfg.preset = Preset::Custom;
+                                            changed = true;
+                                        }
+                                    }
+                                });
+                            ui.end_row();
+
+                            ui.label("Límite de FPS (0 = sin límite):");
+                            ui.add(
+                                egui::Slider::new(&mut self.cfg.fps_cap, 0..=120)
+                                    .suffix(" FPS"),
+                            )
+                            .changed()
+                            .then(|| changed = true);
+                            ui.end_row();
+
+                            ui.label("Escala interna (0 = automático):");
+                            ui.add(
+                                egui::Slider::new(&mut self.cfg.render_scale, 0.0..=1.0)
+                                    .fixed_decimals(2),
+                            )
+                            .changed()
+                            .then(|| {
+                                self.cfg.preset = Preset::Custom;
+                                changed = true;
+                            });
+                            ui.end_row();
+
+                            ui.label("Reescalado FSR 3.1 (4K):");
+                            egui::ComboBox::from_id_salt("fsr_sel")
+                                .selected_text(self.cfg.fsr_4k.label_es())
+                                .show_ui(ui, |ui| {
+                                    for opt in [
+                                        FsrQuality::Off,
+                                        FsrQuality::Quality,
+                                        FsrQuality::Balanced,
+                                        FsrQuality::Performance,
+                                    ] {
+                                        if ui
+                                            .selectable_value(&mut self.cfg.fsr_4k, opt, opt.label_es())
+                                            .changed()
+                                        {
+                                            self.cfg.preset = Preset::Custom;
+                                            changed = true;
+                                        }
+                                    }
+                                });
+                            ui.end_row();
+                        });
+
+                    if self.cfg.fsr_4k != FsrQuality::Off && !self.cache.ffx_dll_exists {
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new("Falta amd_fidelityfx_upscaler_dx12.dll en %LOCALAPPDATA%\\victory\\fidelityfx para usar FSR 4K.")
+                                .color(theme::STATUS_WARN)
+                                .size(11.5),
+                        );
                     }
-                    if ui.button("Refresh").clicked() {
-                        self.refresh_status();
+
+                    ui.add_space(6.0);
+                    if ui
+                        .checkbox(
+                            &mut self.cfg.smooth_motion,
+                            "NVIDIA Smooth Motion (duplica FPS visuales usando victory_sm.exe en NVIDIA App)",
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    if ui
+                        .checkbox(
+                            &mut self.cfg.tex_store,
+                            "Guardar caché de texturas en disco (acelera al volver a zonas ya visitadas)",
+                        )
+                        .changed()
+                    {
+                        changed = true;
                     }
                 });
+
+                ui.add_space(10.0);
+
+                // --- Bloque 2: Controles ---
+                theme::bento_card().show(ui, |ui| {
+                    ui.label(
+                        RichText::new("Teclado, Ratón y Escenas")
+                            .strong()
+                            .color(theme::QUANTICO_BLUE_LIGHT)
+                            .size(14.5),
+                    );
+                    ui.add_space(6.0);
+                    if ui
+                        .checkbox(
+                            &mut self.cfg.kbm_gta,
+                            "Activar controles de PC estilo GTA (F2 bloquea/desbloquea la cámara con ratón)",
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    if self.cfg.kbm_gta {
+                        ui.horizontal(|ui| {
+                            ui.label("Sensibilidad del ratón:");
+                            if ui
+                                .add(egui::Slider::new(&mut self.cfg.mouse_sens, 0.2..=3.0))
+                                .changed()
+                            {
+                                changed = true;
+                            }
+                            if ui
+                                .checkbox(&mut self.cfg.mouse_invert_y, "Invertir eje Y")
+                                .changed()
+                            {
+                                changed = true;
+                            }
+                        });
+                    }
+                    if ui
+                        .checkbox(
+                            &mut self.cfg.video_planes,
+                            "Pantallas y videos en cinemáticas (teléfono encendido, TVs e intros)",
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    if ui
+                        .checkbox(
+                            &mut self.cfg.live_textures,
+                            "Actualización en vivo de texturas dinámicas (evita pantallas congeladas)",
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                });
+
+                ui.add_space(10.0);
+
+                // --- Bloque 3: Opciones avanzadas (desplegable para no abrumar a principiantes) ---
+                theme::bento_card().show(ui, |ui| {
+                    egui::CollapsingHeader::new(
+                        RichText::new("Opciones avanzadas (para usuarios expertos y pruebas)")
+                            .strong()
+                            .size(14.0),
+                    )
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Listas rápidas (Thin Lists):");
+                            egui::ComboBox::from_id_salt("thin_sel")
+                                .selected_text(self.cfg.thin_lists.label_es())
+                                .show_ui(ui, |ui| {
+                                    for opt in [TriState::Auto, TriState::On, TriState::Off] {
+                                        if ui
+                                            .selectable_value(&mut self.cfg.thin_lists, opt, opt.label_es())
+                                            .changed()
+                                        {
+                                            self.cfg.preset = Preset::Custom;
+                                            changed = true;
+                                        }
+                                    }
+                                });
+                            ui.add_space(16.0);
+                            ui.label("Perfil ahorro de RAM (<=24 GB):");
+                            egui::ComboBox::from_id_salt("ram_sel")
+                                .selected_text(self.cfg.ram_low_profile.label_es())
+                                .show_ui(ui, |ui| {
+                                    for opt in [TriState::Auto, TriState::On, TriState::Off] {
+                                        if ui
+                                            .selectable_value(
+                                                &mut self.cfg.ram_low_profile,
+                                                opt,
+                                                opt.label_es(),
+                                            )
+                                            .changed()
+                                        {
+                                            self.cfg.preset = Preset::Custom;
+                                            changed = true;
+                                        }
+                                    }
+                                });
+                        });
+
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Ventana ReBAR VRAM en MB (0 = automático):");
+                            if ui
+                                .add(egui::DragValue::new(&mut self.cfg.windows_bar_mb_override).range(0..=16384))
+                                .changed()
+                            {
+                                self.cfg.preset = Preset::Custom;
+                                changed = true;
+                            }
+                        });
+
+                        ui.add_space(4.0);
+                        if ui
+                            .checkbox(
+                                &mut self.cfg.port_rt,
+                                "Port RT (elimina esperas mem_read en RTX 30/40/50 — muy recomendado)",
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        if ui
+                            .checkbox(
+                                &mut self.cfg.skip_rt_resolve,
+                                "Omitir CS_RaytracingResolve cuando Ray Tracing está apagado (+FPS)",
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        if ui
+                            .checkbox(
+                                &mut self.cfg.skip_raymarched_lights,
+                                "Omitir luces locales raymarched sin BVH (+FPS en RTX)",
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        if ui
+                            .checkbox(
+                                &mut self.cfg.ambient_light,
+                                "Iluminación ambiental sustituta y filtro anti-cuadros magenta",
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        if self.cfg.ambient_light {
+                            ui.horizontal(|ui| {
+                                ui.label("Tope luz ambiental:");
+                                if ui
+                                    .add(egui::Slider::new(&mut self.cfg.ambient_most, 1.5..=4.5))
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                ui.label("Tope reflejos:");
+                                if ui
+                                    .add(egui::Slider::new(&mut self.cfg.ambient_reflect, 0.2..=2.5))
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                            });
+                        }
+                        if ui
+                            .checkbox(
+                                &mut self.cfg.port_descriptors,
+                                "Port 2 experimental (VICTORY_PORT_DESCRIPTORS=1 — desactivado por defecto)",
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        if ui
+                            .checkbox(&mut self.cfg.send_bar, "VICTORY_SEND_BAR (memoria de envío en VRAM)")
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        if ui
+                            .checkbox(&mut self.cfg.wc_no_back, "VICTORY_WC_NO_BACK (saltar readback de buffers grandes)")
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        if ui
+                            .checkbox(&mut self.cfg.wait_textures, "Esperar carga completa de texturas (más lento, menos pop-in)")
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        if ui
+                            .checkbox(&mut self.cfg.record_pipelines, "Grabar catálogo de pipelines (VICTORY_PIPELINE_BOOK=1)")
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        if ui
+                            .checkbox(&mut self.cfg.use_diag_build, "Usar compilación de diagnóstico (diag/victory.exe)")
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        if ui
+                            .checkbox(&mut self.cfg.gpu_timing, "Medir tiempos GPU por shader (VICTORY_GPU_TIMING=1)")
+                            .changed()
+                        {
+                            changed = true;
+                        }
+
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new("Variables de entorno extra (una por línea, ej. VICTORY_FPS=30):")
+                                .color(theme::TEXT_SECONDARY)
+                                .size(12.0),
+                        );
+                        if ui
+                            .add(
+                                egui::TextEdit::multiline(&mut self.cfg.extra_env)
+                                    .desired_rows(3)
+                                    .desired_width(f32::INFINITY)
+                                    .code_editor(),
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                    });
+                });
+            });
+
+        if changed {
+            self.persist();
+        }
+    }
+
+    fn ui_logs(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, snap: &runner::RunnerSnapshot) {
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new("Logs y Soporte").strong().size(22.0));
+                ui.label(
+                    RichText::new(
+                        "Comparte tus logs en 1 clic sin buscar carpetas ni exponer tu nombre de usuario.",
+                    )
+                    .color(theme::TEXT_SECONDARY)
+                    .size(12.5),
+                );
+            });
+        });
+        ui.add_space(8.0);
+
+        // --- Barra gigante de 3 acciones claras (nadie vuelve a confundirse para pasar logs) ---
+        theme::bento_card().show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let copy_btn = Button::new(
+                    RichText::new("Copiar reporte para enviar")
+                        .strong()
+                        .color(Color32::WHITE)
+                        .size(13.0),
+                )
+                .fill(theme::QUANTICO_BLUE)
+                .corner_radius(CornerRadius::same(8))
+                .min_size(vec2(215.0, 36.0));
+                if ui.add(copy_btn).clicked() {
+                    let report = runner::build_diagnostic_report(
+                        &self.hw,
+                        &self.cfg,
+                        &self.cache,
+                        &snap.metrics,
+                        &snap.logs,
+                    );
+                    ctx.copy_text(report);
+                    self.set_toast(
+                        "Reporte copiado al portapapeles (sin datos privados). ¡Pégalo en el chat!",
+                        theme::STATUS_OK,
+                    );
+                }
+
+                let desk_btn = Button::new(
+                    RichText::new("Guardar reporte en el Escritorio (.txt)")
+                        .strong()
+                        .color(theme::TEXT_PRIMARY)
+                        .size(13.0),
+                )
+                .fill(theme::BG_CARD_ALT)
+                .stroke(Stroke::new(1.0_f32, theme::QUANTICO_BLUE_LIGHT))
+                .corner_radius(CornerRadius::same(8))
+                .min_size(vec2(250.0, 36.0));
+                if ui.add(desk_btn).clicked() {
+                    match runner::save_report_to_desktop(
+                        &self.hw,
+                        &self.cfg,
+                        &self.cache,
+                        &snap.metrics,
+                        &snap.logs,
+                    ) {
+                        Ok(p) => self.set_toast(
+                            format!(
+                                "Guardado en tu Escritorio: {}",
+                                p.file_name().unwrap_or_default().to_string_lossy()
+                            ),
+                            theme::STATUS_OK,
+                        ),
+                        Err(e) => self.set_toast(e, theme::STATUS_ERR),
+                    }
+                }
+
+                let open_btn = Button::new(
+                    RichText::new("Abrir carpeta de logs").size(13.0),
+                )
+                .min_size(vec2(170.0, 36.0));
+                if ui.add(open_btn).clicked() {
+                    runner::open_folder(&runner::data_dir());
+                }
             });
         });
 
         ui.add_space(10.0);
-        ui.label(RichText::new("Recent output").strong().size(13.0));
-        let lines = self.runner.logs_filtered("");
-        theme::card_frame().show(ui, |ui| {
-            ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .max_height(ui.available_height().max(180.0))
-                .show(ui, |ui| {
-                    let start = lines.len().saturating_sub(250);
-                    for line in &lines[start..] {
-                        ui.label(RichText::new(line).monospace().size(11.5).color(theme::TEXT_SECONDARY));
-                    }
-                });
-        });
-    }
 
-    fn ui_logs(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Logs and crashes").strong().size(22.0));
-        ui.add_space(8.0);
-
-        let avail_w = ui.available_width();
-        let right_w = 300.0f32.min(avail_w * 0.34);
-        let left_w = (avail_w - right_w - 14.0).max(320.0);
-
-        ui.horizontal_top(|ui| {
-            // Left: Live Log stream
-            ui.vertical(|ui| {
-                ui.set_width(left_w);
+        // --- Panel de 2 columnas: consola a la izquierda, última partida y archivos a la derecha ---
+        let avail_h = (ui.available_height() - 6.0).max(260.0);
+        ui.columns(2, |cols| {
+            // Izquierda: Consola en vivo o archivo seleccionado.
+            cols[0].vertical(|ui| {
                 ui.horizontal(|ui| {
+                    let title = match &self.viewing_file_name {
+                        Some(name) => format!("Viendo archivo: {name}"),
+                        None => format!("REGISTRO EN VIVO ({} líneas)", snap.logs.len()),
+                    };
                     ui.label(
-                        RichText::new(format!("LIVE LOG  ·  {} LINES", self.runner.total_lines()))
-                            .color(theme::TEXT_SECONDARY)
+                        RichText::new(title)
                             .strong()
-                            .size(11.5),
+                            .color(theme::QUANTICO_BLUE_LIGHT)
+                            .size(12.0),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.log_filter)
-                                .hint_text("Filter...")
-                                .desired_width(140.0),
+                                .hint_text("Buscar (ej: fps, error, warn)...")
+                                .desired_width(180.0),
                         );
-                        if ui.small_button("Copy").clicked() {
-                            ui.ctx().copy_text(self.runner.all_logs_text());
-                            self.toast = Some("Live log copied to clipboard.".into());
-                        }
-                        if ui.small_button("Logs folder").clicked() {
-                            runner::open_folder(&data_dir());
-                        }
-                        if ui.small_button("Clear").clicked() {
+                        if self.viewing_file_name.is_some() {
+                            if ui.button("Volver al vivo").clicked() {
+                                self.viewing_file_name = None;
+                                self.viewing_file_lines.clear();
+                            }
+                        } else if ui.button("Limpiar").clicked() {
                             self.runner.clear_logs();
                         }
                     });
                 });
-                ui.add_space(4.0);
-                let lines = self.runner.logs_filtered(&self.log_filter);
-                theme::card_frame().show(ui, |ui| {
-                    ui.set_min_height((ui.available_height() - 12.0).max(380.0));
-                    ScrollArea::vertical()
-                        .stick_to_bottom(self.auto_scroll)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            if lines.is_empty() {
-                                ui.label(
-                                    RichText::new("No log lines yet. Start a run or build shaders to see live output here.")
-                                        .color(theme::TEXT_DIM)
-                                        .monospace()
+                ui.add_space(6.0);
+
+                Frame::new()
+                    .fill(theme::BG_INPUT)
+                    .stroke(Stroke::new(1.0_f32, theme::BORDER))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::same(10))
+                    .show(ui, |ui| {
+                        let source: &[String] = if self.viewing_file_name.is_some() {
+                            &self.viewing_file_lines
+                        } else {
+                            &snap.logs
+                        };
+                        let needle = self.log_filter.to_ascii_lowercase();
+                        ScrollArea::vertical()
+                            .max_height((avail_h - 46.0).max(180.0))
+                            .stick_to_bottom(self.viewing_file_name.is_none())
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if source.is_empty() {
+                                    ui.label(
+                                        RichText::new(
+                                            "Aquí aparecerán los FPS y mensajes del motor en tiempo real cuando pulses Jugar.",
+                                        )
+                                        .color(theme::TEXT_MUTED)
                                         .size(12.0),
-                                );
-                            } else {
-                                for line in &lines {
-                                    let col = if line.contains("ERROR") || line.contains("panic") || line.contains("failed") {
-                                        theme::ACCENT_RED
-                                    } else if line.contains("WARN") {
-                                        theme::AMBER
+                                    );
+                                }
+                                for line in source {
+                                    if !needle.is_empty()
+                                        && !line.to_ascii_lowercase().contains(&needle)
+                                    {
+                                        continue;
+                                    }
+                                    let col = if line.contains("ERROR") || line.contains("error") {
+                                        theme::STATUS_ERR
+                                    } else if line.contains("WARN") || line.contains("warn") {
+                                        theme::STATUS_WARN
                                     } else if line.contains(" fps, ") {
-                                        theme::EMERALD
+                                        theme::STATUS_OK
                                     } else {
                                         theme::TEXT_SECONDARY
                                     };
-                                    ui.label(RichText::new(line).monospace().size(11.5).color(col));
+                                    ui.label(RichText::new(line).monospace().color(col).size(11.5));
                                 }
-                            }
-                        });
-                });
+                            });
+                    });
             });
 
-            ui.add_space(12.0);
-
-            // Right: Crashes + Copy Report + Last Run Readout
-            ui.vertical(|ui| {
-                ui.set_width(right_w);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("CRASHES & RUN LOGS").color(theme::TEXT_SECONDARY).strong().size(11.5));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.small_button("Refresh").clicked() {
-                            self.log_entries = runner::scan_data_logs();
-                        }
-                    });
-                });
-                ui.add_space(4.0);
-
-                theme::card_frame().show(ui, |ui| {
-                    ScrollArea::vertical().max_height(210.0).show(ui, |ui| {
-                        if self.log_entries.is_empty() {
-                            ui.label(
-                                RichText::new("No log or crash files found yet in %LOCALAPPDATA%\\victory\\data.")
-                                    .color(theme::TEXT_DIM)
-                                    .size(12.0),
-                            );
-                        } else {
-                            let entries = self.log_entries.clone();
-                            for entry in entries {
-                                ui.horizontal(|ui| {
-                                    let col = if entry.is_crash { theme::ACCENT_RED } else { theme::TEXT_PRIMARY };
-                                    if ui
-                                        .selectable_label(false, RichText::new(&entry.name).color(col).size(12.0))
-                                        .clicked()
-                                        && let Ok(text) = std::fs::read_to_string(&entry.path)
-                                    {
-                                        let tail: Vec<&str> = text.lines().rev().take(25).collect();
-                                        self.selected_crash_preview =
-                                            tail.into_iter().rev().collect::<Vec<_>>().join("\n");
-                                    }
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        ui.label(
-                                            RichText::new(format!("{} KB", entry.size_kb))
-                                                .color(theme::TEXT_DIM)
-                                                .size(11.0),
-                                        );
-                                    });
-                                });
-                            }
-                        }
-                    });
-                });
-
-                if !self.selected_crash_preview.is_empty() {
+            // Derecha: Última partida + archivos recientes.
+            cols[1].vertical(|ui| {
+                theme::bento_card().show(ui, |ui| {
+                    ui.label(
+                        RichText::new("Resumen de la última partida")
+                            .strong()
+                            .color(theme::QUANTICO_BLUE_LIGHT)
+                            .size(13.5),
+                    );
                     ui.add_space(6.0);
-                    theme::card_frame().show(ui, |ui| {
-                        ScrollArea::vertical().max_height(110.0).show(ui, |ui| {
-                            ui.label(
-                                RichText::new(&self.selected_crash_preview)
-                                    .monospace()
-                                    .size(10.5)
-                                    .color(theme::TEXT_SECONDARY),
-                            );
-                        });
-                    });
-                }
-
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    let report_btn = Button::new(RichText::new("Copy report").strong().color(Color32::WHITE))
-                        .fill(theme::ACCENT_RED)
-                        .min_size(Vec2::new(138.0, 34.0));
-                    if ui.add(report_btn).clicked() {
-                        let metrics = self.runner.snapshot_metrics();
-                        let logs = self.runner.logs_filtered("");
-                        let rep = runner::build_diagnostic_report(&self.hw, &self.cfg, &self.cache, &metrics, &logs);
-                        ui.ctx().copy_text(rep);
-                        self.toast = Some("Sanitized diagnostic report copied to clipboard.".into());
-                    }
-                    if ui.add(Button::new("Logs folder").min_size(Vec2::new(138.0, 34.0))).clicked() {
-                        runner::open_folder(&data_dir());
-                    }
-                });
-
-                ui.add_space(8.0);
-                let m = self.runner.snapshot_metrics();
-                theme::card_frame().show(ui, |ui| {
-                    ui.label(RichText::new("Last run").strong().size(13.5));
-                    ui.add_space(4.0);
+                    let m = &snap.metrics;
                     if let Some(med) = m.median_fps() {
                         ui.label(
                             RichText::new(format!(
-                                "Median: {:.1} fps  (range {:.1} – {:.1} fps)",
+                                "{:.1} FPS promedio  (mín {:.1} · máx {:.1})",
                                 med, m.worst_fps, m.best_fps
                             ))
-                            .color(theme::EMERALD)
                             .strong()
-                            .size(12.5),
+                            .color(theme::STATUS_OK)
+                            .size(15.0),
                         );
                         if let Some(ms) = m.last_ms {
-                            let draws_s = m
-                                .last_draws
-                                .map(|d| format!(" · {d} draws"))
-                                .unwrap_or_default();
                             ui.label(
-                                RichText::new(format!("Last sample: {:.1} ms/frame{draws_s}", ms))
-                                    .color(theme::TEXT_SECONDARY)
-                                    .size(12.0),
+                                RichText::new(format!(
+                                    "Último cuadro: {:.1} ms  ·  Dibujos: {}",
+                                    ms,
+                                    m.last_draws.unwrap_or(0)
+                                ))
+                                .color(theme::TEXT_SECONDARY)
+                                .size(12.0),
                             );
                         }
                         if !m.last_vram_line.is_empty() {
                             ui.label(
                                 RichText::new(&m.last_vram_line)
-                                    .color(theme::TEXT_DIM)
+                                    .color(theme::TEXT_MUTED)
                                     .size(11.0),
                             );
                         }
@@ -930,358 +1443,363 @@ impl LauncherApp {
                             && let Some(name) = log_path.file_name().and_then(|s| s.to_str())
                         {
                             ui.label(
-                                RichText::new(format!("Log: {name}"))
-                                    .color(theme::TEXT_DIM)
+                                RichText::new(format!("Archivo guardado: {name}"))
+                                    .color(theme::TEXT_MUTED)
                                     .size(11.0),
                             );
                         }
                     } else {
                         ui.label(
-                            RichText::new("Play once for a readout: median FPS, min/max frame rate, draws, and VRAM.")
-                                .color(theme::TEXT_DIM)
+                            RichText::new("Juega una partida para ver aquí tus FPS promedio, mínimo, máximo y uso de memoria.")
+                                .color(theme::TEXT_SECONDARY)
                                 .size(12.0),
                         );
                     }
                 });
+
+                ui.add_space(10.0);
+
+                theme::bento_card().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Partidas y cierres recientes")
+                                .strong()
+                                .size(13.5),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button("Recargar").clicked() {
+                                self.log_files = runner::scan_data_logs();
+                            }
+                        });
+                    });
+                    ui.add_space(6.0);
+                    ScrollArea::vertical()
+                        .max_height((avail_h - 195.0).max(120.0))
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if self.log_files.is_empty() {
+                                ui.label(
+                                    RichText::new("Todavía no hay archivos de log guardados.")
+                                        .color(theme::TEXT_MUTED)
+                                        .size(12.0),
+                                );
+                            }
+                            let entries = self.log_files.clone();
+                            for entry in entries {
+                                ui.horizontal(|ui| {
+                                    let col = if entry.is_crash {
+                                        theme::STATUS_ERR
+                                    } else {
+                                        theme::TEXT_PRIMARY
+                                    };
+                                    ui.label(
+                                        RichText::new(format!("{} ({} KB)", entry.name, entry.size_kb))
+                                            .color(col)
+                                            .size(12.0),
+                                    );
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if ui.small_button("Abrir").clicked() {
+                                            runner::open_file(&entry.path);
+                                        }
+                                        if ui.small_button("Ver").clicked() {
+                                            self.viewing_file_name = Some(entry.name.clone());
+                                            self.viewing_file_lines =
+                                                runner::read_log_tail(&entry.path, 400);
+                                        }
+                                    });
+                                });
+                            }
+                        });
+                });
             });
         });
     }
 
-    fn ui_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let mut changed = false;
+    fn ui_actualizar(&mut self, ui: &mut egui::Ui, snap: &runner::RunnerSnapshot) {
+        let is_running = snap.running.is_some();
+        let checking = *self.git_checking.lock().unwrap_or_else(|e| e.into_inner());
+        let git_info = self.git.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Settings").strong().size(22.0));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button("Reset to Recommended").clicked() {
-                    let saved_dir = self.cfg.game_dir.clone();
-                    self.cfg = LauncherConfig::default();
-                    self.cfg.game_dir = saved_dir;
-                    changed = true;
-                }
-            });
-        });
-        ui.add_space(8.0);
+        ui.label(RichText::new("Actualizaciones y Créditos").strong().size(22.0));
+        ui.label(
+            RichText::new(
+                "Mantén VIctory-RTX al día desde GitHub en 1 clic sin borrar tus partidas ni tu caché de shaders.",
+            )
+            .color(theme::TEXT_SECONDARY)
+            .size(12.5),
+        );
+        ui.add_space(10.0);
 
-        ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            // --- Display & Upscaling ---
-            theme::card_frame().show(ui, |ui| {
-                ui.label(RichText::new("Display & Upscaling").strong().size(15.0));
-                ui.add_space(6.0);
-
-                ui.horizontal(|ui| {
-                    ui.label("Console profile:");
-                    egui::ComboBox::from_id_salt("console_combo")
-                        .selected_text(self.cfg.console.label())
-                        .show_ui(ui, |ui| {
-                            for opt in [ConsoleModel::Auto, ConsoleModel::SeriesX, ConsoleModel::SeriesS] {
-                                if ui.selectable_value(&mut self.cfg.console, opt, opt.label()).changed() {
-                                    self.cfg.preset = Preset::Custom;
-                                    changed = true;
-                                }
+        ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                theme::bento_card().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new("Actualización automática por Git")
+                                    .strong()
+                                    .color(theme::QUANTICO_BLUE_LIGHT)
+                                    .size(15.0),
+                            );
+                            if git_info.available {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Rama activa: {}  ·  Versión instalada: {}",
+                                        git_info.branch, git_info.local_sha
+                                    ))
+                                    .color(theme::TEXT_SECONDARY)
+                                    .size(12.5),
+                                );
+                            } else {
+                                ui.label(
+                                    RichText::new("Carpeta portable sin Git detectado.")
+                                        .color(theme::TEXT_SECONDARY)
+                                        .size(12.5),
+                                );
                             }
                         });
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Output resolution:");
-                    egui::ComboBox::from_id_salt("res_combo")
-                        .selected_text(self.cfg.output.label())
-                        .show_ui(ui, |ui| {
-                            for opt in [OutputRes::P720, OutputRes::P1080, OutputRes::P1440, OutputRes::P4K] {
-                                if ui.selectable_value(&mut self.cfg.output, opt, opt.label()).changed() {
-                                    self.cfg.preset = Preset::Custom;
-                                    changed = true;
-                                }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if checking {
+                                theme::status_pill(ui, "Comprobando...", theme::QUANTICO_BLUE_LIGHT);
+                            } else if git_info.behind_count > 0 {
+                                theme::status_pill(
+                                    ui,
+                                    &format!("{} nueva(s)", git_info.behind_count),
+                                    theme::STATUS_OK,
+                                );
+                            } else if git_info.checked_once {
+                                theme::status_pill(ui, "Al día", theme::STATUS_OK);
                             }
                         });
-                });
+                    });
 
-                ui.horizontal(|ui| {
-                    ui.label("Internal render scale (0 = title default 0.667):");
-                    if ui
-                        .add(egui::Slider::new(&mut self.cfg.render_scale, 0.0..=1.0).fixed_decimals(2))
-                        .changed()
-                    {
-                        self.cfg.preset = Preset::Custom;
-                        changed = true;
-                    }
-                });
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(&git_info.last_status_es)
+                            .color(theme::TEXT_PRIMARY)
+                            .size(12.5),
+                    );
 
-                ui.horizontal(|ui| {
-                    ui.label("FPS cap (0 = uncapped):");
-                    if ui.add(egui::Slider::new(&mut self.cfg.fps_cap, 0..=120)).changed() {
-                        changed = true;
-                    }
-                });
-
-                ui.horizontal(|ui| {
-                    if ui
-                        .checkbox(&mut self.cfg.fsr_4k, "Native PC FidelityFX 4K (FSR 3.1.6 / FSR 4)")
-                        .changed()
-                    {
-                        self.cfg.preset = Preset::Custom;
-                        changed = true;
-                    }
-                    if self.cfg.fsr_4k {
-                        egui::ComboBox::from_id_salt("fsr_combo")
-                            .selected_text(self.cfg.fsr_mode.label())
-                            .show_ui(ui, |ui| {
-                                for m in [FsrMode::Performance, FsrMode::Balanced, FsrMode::Quality] {
-                                    if ui.selectable_value(&mut self.cfg.fsr_mode, m, m.label()).changed() {
-                                        changed = true;
-                                    }
+                    if !git_info.pending_commits.is_empty() {
+                        ui.add_space(6.0);
+                        Frame::new()
+                            .fill(theme::BG_INPUT)
+                            .stroke(Stroke::new(1.0_f32, theme::BORDER))
+                            .corner_radius(CornerRadius::same(8))
+                            .inner_margin(Margin::same(10))
+                            .show(ui, |ui| {
+                                for c in git_info.pending_commits.iter().take(10) {
+                                    ui.label(
+                                        RichText::new(format!("• {c}"))
+                                            .monospace()
+                                            .color(theme::TEXT_SECONDARY)
+                                            .size(11.5),
+                                    );
                                 }
                             });
                     }
-                });
 
-                if ui
-                    .checkbox(
-                        &mut self.cfg.smooth_motion,
-                        "NVIDIA Smooth Motion copy (launches victory_sm.exe for 2x visual FPS in NVIDIA App)",
-                    )
-                    .changed()
-                {
-                    changed = true;
-                }
-            });
-
-            ui.add_space(8.0);
-
-            // --- NVIDIA Performance & VRAM / RAM ---
-            theme::card_frame().show(ui, |ui| {
-                ui.label(RichText::new("NVIDIA Performance, ReBAR & Memory").strong().size(15.0));
-                ui.add_space(6.0);
-
-                if ui
-                    .checkbox(
-                        &mut self.cfg.skip_rt_resolve,
-                        "Skip CS_RaytracingResolve when RT is off (saves ~18 ms GPU/frame, keeps shadows & ambient intact)",
-                    )
-                    .changed()
-                {
-                    changed = true;
-                }
-                if ui
-                    .checkbox(&mut self.cfg.ray_tracing, "Enable real Wave32 Ray Tracing (heavy GPU load)")
-                    .changed()
-                {
-                    self.cfg.preset = Preset::Custom;
-                    changed = true;
-                }
-                if ui
-                    .checkbox(&mut self.cfg.send_bar, "ReBAR submission upload buffers (VICTORY_SEND_BAR=1)")
-                    .changed()
-                {
-                    changed = true;
-                }
-                if ui
-                    .checkbox(
-                        &mut self.cfg.wc_no_back,
-                        "Skip readback on large (>=16 MiB) write-combined buffers (VICTORY_WC_NO_BACK=1)",
-                    )
-                    .changed()
-                {
-                    changed = true;
-                }
-                if ui
-                    .checkbox(&mut self.cfg.tex_store, "Disk mip cache (VICTORY_TEXTURE_STORE) for faster revisits")
-                    .changed()
-                {
-                    changed = true;
-                }
-                if ui
-                    .checkbox(&mut self.cfg.wait_textures, "Wait for texture remaps (VICTORY_TEXTURE_NO_WAIT=0)")
-                    .changed()
-                {
-                    changed = true;
-                }
-
-                ui.horizontal(|ui| {
-                    ui.label("ReBAR window cap MiB (-1 = auto by GPU tier):");
-                    if ui.add(egui::DragValue::new(&mut self.cfg.windows_bar_mb).range(-1..=16384).speed(256)).changed() {
-                        changed = true;
-                    }
-                    ui.label(
-                        RichText::new(format!("(effective: {} MiB)", self.cfg.effective_windows_bar_mb(&self.hw)))
-                            .color(theme::TEXT_DIM)
-                            .size(11.5),
-                    );
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Texture mip drop (-1 = auto by VRAM tier, 0..3):");
-                    if ui.add(egui::DragValue::new(&mut self.cfg.mip_drop).range(-1..=3)).changed() {
-                        changed = true;
-                    }
-                    ui.label(
-                        RichText::new(format!("(effective: {})", self.cfg.effective_mip_drop(&self.hw)))
-                            .color(theme::TEXT_DIM)
-                            .size(11.5),
-                    );
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Deferred thin lists (auto OFF on RTX 50 Blackwell):");
-                    for opt in [TriState::Auto, TriState::On, TriState::Off] {
-                        if ui.selectable_value(&mut self.cfg.thin_lists, opt, opt.label()).changed() {
-                            changed = true;
-                        }
-                    }
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("16 GiB RAM retention profile (leave Auto on 32/64 GB RAM):");
-                    for opt in [TriState::Auto, TriState::On, TriState::Off] {
-                        if ui.selectable_value(&mut self.cfg.ram16_profile, opt, opt.label()).changed() {
-                            changed = true;
-                        }
-                    }
-                });
-                if self.cfg.ram16_profile == TriState::On && self.hw.ram_total_gb >= 24.0 {
-                    ui.label(
-                        RichText::new(format!(
-                            "Warning: RAM16 is forced ON on your {:.0} GB RAM PC — set Auto/Off for best FPS.",
-                            self.hw.ram_total_gb
-                        ))
-                        .color(theme::AMBER)
-                        .size(12.0),
-                    );
-                }
-            });
-
-            ui.add_space(8.0);
-
-            // --- Input ---
-            theme::card_frame().show(ui, |ui| {
-                ui.label(RichText::new("Keyboard & Mouse Input").strong().size(15.0));
-                ui.add_space(6.0);
-                if ui
-                    .checkbox(
-                        &mut self.cfg.kbm_gta,
-                        "GTA V PC Keyboard + Mouse-Look (press F2 or ~ in-game to lock/hide cursor)",
-                    )
-                    .changed()
-                {
-                    changed = true;
-                }
-                if self.cfg.kbm_gta {
-                    ui.horizontal(|ui| {
-                        ui.label("Mouse sensitivity:");
+                    ui.add_space(10.0);
+                    ui.horizontal_wrapped(|ui| {
+                        let check_btn = Button::new(
+                            RichText::new(if checking {
+                                "Comprobando GitHub..."
+                            } else {
+                                "Buscar actualizaciones"
+                            })
+                            .strong(),
+                        )
+                        .min_size(vec2(180.0, 36.0));
                         if ui
-                            .add(egui::Slider::new(&mut self.cfg.mouse_sens, 0.25..=3.0).fixed_decimals(2))
-                            .changed()
+                            .add_enabled(git_info.available && !checking && !is_running, check_btn)
+                            .clicked()
                         {
-                            changed = true;
+                            self.trigger_git_check();
                         }
-                        if ui.checkbox(&mut self.cfg.mouse_invert_y, "Invert Y").changed() {
-                            changed = true;
+
+                        if git_info.available
+                            && let Some(root) = self.engine.repo_root.clone()
+                        {
+                            let pull_btn = Button::new(
+                                RichText::new("Descargar y compilar actualización")
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(theme::QUANTICO_BLUE)
+                            .corner_radius(CornerRadius::same(8))
+                            .min_size(vec2(245.0, 36.0));
+                            if ui.add_enabled(!is_running && !checking, pull_btn).clicked() {
+                                if let Err(e) = self.runner.start_git_update(root, true) {
+                                    self.set_toast(e, theme::STATUS_ERR);
+                                } else {
+                                    self.set_toast(
+                                        "Descargando y compilando actualización en segundo plano...",
+                                        theme::QUANTICO_BLUE_LIGHT,
+                                    );
+                                }
+                            }
+                        }
+
+                        if ui.button("Abrir repositorio en GitHub").clicked() {
+                            runner::open_url("https://github.com/mc3yohan-lab/VIctory-RTX-Mc3yohan");
                         }
                     });
-                }
-            });
-
-            ui.add_space(8.0);
-
-            // --- Renderer Ports & Diagnostics ---
-            theme::card_frame().show(ui, |ui| {
-                ui.label(RichText::new("Renderer Ports & Diagnostics").strong().size(15.0));
-                ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
-                    changed |= ui.checkbox(&mut self.cfg.port_constants, "Port 1 (Constants)").changed();
-                    changed |= ui.checkbox(&mut self.cfg.port_cbv, "Port 5 (NVIDIA CBV)").changed();
-                    changed |= ui.checkbox(&mut self.cfg.port_guard, "Port 6 (Guard)").changed();
-                    changed |= ui.checkbox(&mut self.cfg.port_journal, "Port 7 (Journal)").changed();
-                    changed |= ui.checkbox(&mut self.cfg.port_rt, "Port RT (Fill Forward)").changed();
-                    changed |= ui.checkbox(&mut self.cfg.port_descriptors, "Port 2 (Opt-in Descriptors)").changed();
                 });
-                ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
-                    changed |= ui.checkbox(&mut self.cfg.panel_hud, "Show F3 HUD on start").changed();
-                    changed |= ui.checkbox(&mut self.cfg.diag_build, "Use diag build").changed();
-                    if ui.checkbox(&mut self.cfg.gpu_timing, "15s GPU timing profile (uses diag build)").changed() {
-                        if self.cfg.gpu_timing {
-                            self.cfg.diag_build = true;
-                        }
-                        changed = true;
+
+                ui.add_space(10.0);
+
+                theme::bento_card().show(ui, |ui| {
+                    ui.label(
+                        RichText::new("Créditos y Licencia Open Source (GPL-3.0-or-later)")
+                            .strong()
+                            .color(theme::QUANTICO_BLUE_LIGHT)
+                            .size(14.5),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(
+                            "VIctory-RTX-Mc3yohan · Interfaz diseñada con la identidad Quantico Systems. \
+                             Este proyecto no incluye archivos, ejecutables ni imágenes con derechos de autor del juego.",
+                        )
+                        .color(theme::TEXT_SECONDARY)
+                        .size(12.0),
+                    );
+                    ui.add_space(6.0);
+                    for (name, desc, url) in [
+                        (
+                            "mc3yohan-lab / VIctory-RTX-Mc3yohan",
+                            "Fork NVIDIA RTX Wave32 + Launcher Quantico Systems",
+                            "https://github.com/mc3yohan-lab/VIctory-RTX-Mc3yohan",
+                        ),
+                        (
+                            "Marvisak / VIctory",
+                            "Proyecto base open-source GPL-3.0-or-later",
+                            "https://github.com/Marvisak/VIctory",
+                        ),
+                        (
+                            "TaynanGT / Vice-Tay",
+                            "Fixes de alias GPU, colas de texturas, reflejos y optimizaciones RTX 4090",
+                            "https://github.com/TaynanGT/Vice-Tay",
+                        ),
+                        (
+                            "ZigZagBoi1 / ScarlettPort",
+                            "Planos de video en cinemáticas (teléfono/TV), BCPack, formatos y bloqueo compartido",
+                            "https://github.com/ZigZagBoi1/ScarlettPort",
+                        ),
+                        (
+                            "avatarmanz / VIctory-7900XTX",
+                            "Renderer Ports 1–7, Live Textures #390 y mejoras Wave32",
+                            "https://github.com/avatarmanz/VIctory-7900XTX",
+                        ),
+                        (
+                            "Comunidad (fxceless, Peppacodes, VIctory-DXR, Yaekai, Belobug, RAM16)",
+                            "Mejoras de FPS, memoria baja 16–24 GB, controles PC y estabilidad",
+                            "https://github.com/fxceless/victory-fork",
+                        ),
+                    ] {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(name).strong().size(12.5));
+                            ui.label(RichText::new(format!("— {desc}")).color(theme::TEXT_MUTED).size(11.8));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.small_button("Abrir").clicked() {
+                                    runner::open_url(url);
+                                }
+                            });
+                        });
                     }
                 });
-                ui.add_space(6.0);
-                if ui.button("Change Game Folder...").clicked() {
-                    self.pick_game_folder(ctx);
-                }
             });
-        });
+    }
+}
 
-        if changed {
-            self.save_cfg();
+impl eframe::App for VictoryLauncherApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let snap = self.runner.snapshot();
+
+        if snap.finished_seq != self.last_finished_seq {
+            self.last_finished_seq = snap.finished_seq;
+            self.refresh_status(ctx);
+            if let Some(note) = &snap.last_exit_note {
+                let col = if note.contains("correctamente")
+                    || note.contains("completad")
+                    || note.contains("lista")
+                {
+                    theme::STATUS_OK
+                } else {
+                    theme::STATUS_WARN
+                };
+                self.set_toast(note.clone(), col);
+            }
+            // Refrescar estado local de Git tras actualizar.
+            if let Some(root) = self.engine.repo_root.as_deref() {
+                *self.git.lock().unwrap_or_else(|e| e.into_inner()) =
+                    GitInfo::probe_local(Some(root));
+            }
         }
-    }
 
-    fn ui_links(&self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Links & Open-Source Credits").strong().size(22.0));
-        ui.add_space(10.0);
+        if snap.running.is_some() || *self.git_checking.lock().unwrap_or_else(|e| e.into_inner()) {
+            ctx.request_repaint_after(Duration::from_millis(120));
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(800));
+        }
 
-        ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.label(RichText::new("PROJECT").color(theme::TEXT_DIM).strong().size(11.0));
-            ui.add_space(4.0);
+        // Cabecera superior Quantico.
+        egui::TopBottomPanel::top("quantico_header")
+            .frame(Frame::NONE)
+            .show(ctx, |ui| {
+                self.ui_top_header(ui, &snap);
+            });
 
-            self.link_card(
-                ui,
-                "VIctory-RTX-Mc3yohan Repository",
-                "mc3yohan-lab/VIctory-RTX-Mc3yohan — NVIDIA RTX / Wave32 fork (GPL-3.0-or-later)",
-                "https://github.com/mc3yohan-lab/VIctory-RTX-Mc3yohan",
-            );
-            ui.add_space(6.0);
-            self.link_card(
-                ui,
-                "Maintainer Profile (Mc3yohan)",
-                "github.com/Mc3yohan",
-                "https://github.com/Mc3yohan",
-            );
-
-            ui.add_space(14.0);
-            ui.label(RichText::new("UPSTREAM & COMMUNITY CREDITS (GPL-3.0)").color(theme::TEXT_DIM).strong().size(11.0));
-            ui.add_space(4.0);
-
-            for (title, desc, url) in [
-                ("Marvisak/VIctory", "Original PE/XEX loader, HLE runtime, D3D12 backend & GFX10-to-DXIL recompiler", "https://github.com/Marvisak/VIctory"),
-                ("avatarmanz/VIctory-7900XTX", "Renderer Ports 1–7 & RT Part 1, VICTORY_OUTPUT, thin lists, async submit & relay", "https://github.com/avatarmanz/VIctory-7900XTX"),
-                ("codec-d/cool_fox", "Wave32 guarded joins, LDS atomic ordering, WaitOnAddress, texback & fence guards", "https://github.com/codec-d/cool_fox"),
-                ("trustno1-coder/VIctory-NVIDIA", "D3D12 538/646 fixes, mimalloc, Blackwell thin guard, texback async", "https://github.com/trustno1-coder/VIctory-NVIDIA"),
-                ("fxceless/victory-fork", "Face animation, target variants, FEED_ONE_CALL, Shadow::differing fix", "https://github.com/fxceless/victory-fork"),
-                ("Belobug/VIctory-Belobug-AMD", "ThinLTO, PreludeUpload, F3 HUD, GTA KBM mouse-look, FidelityFX DX12 bridge", "https://github.com/Belobug/VIctory-Belobug-AMD"),
-                ("Peppacodes / TaynanGT / Geckomacabre / TheUnrealZaka / polackangry / ScarlettPort", "WRITE_JOBS, Vice-Tay #27/#45/#116, ambient Role::Reflect + bilinear/NaN scrub, readback pool, batched sweep, MMCSS Pro Audio, levels-on-demand fix", "https://github.com/ZigZagBoi1/ScarlettPort"),
-            ] {
-                self.link_card(ui, title, desc, url);
-                ui.add_space(6.0);
+        // Toast inferior discreto (desaparece solo a los 6s).
+        if let Some((msg, col, at)) = self.toast.clone() {
+            if at.elapsed() > Duration::from_secs(6) {
+                self.toast = None;
+            } else {
+                egui::TopBottomPanel::bottom("quantico_toast")
+                    .frame(
+                        Frame::new()
+                            .fill(Color32::from_rgb(13, 18, 28))
+                            .stroke(Stroke::new(1.0_f32, col))
+                            .inner_margin(Margin::symmetric(18, 8)),
+                    )
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&msg).color(col).strong().size(12.5));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.small_button("Cerrar").clicked() {
+                                    self.toast = None;
+                                }
+                            });
+                        });
+                    });
             }
-        });
-    }
+        }
 
-    fn link_card(&self, ui: &mut egui::Ui, title: &str, subtitle: &str, url: &str) {
-        self.status_row(ui, RowIcon::Link, title, subtitle, |ui| {
-            if ui.button("Open").clicked() {
-                runner::open_url(url);
-            }
-        });
+        egui::CentralPanel::default()
+            .frame(Frame::new().fill(theme::BG_CANVAS).inner_margin(Margin::same(16)))
+            .show(ctx, |ui| match self.tab {
+                Tab::Inicio => self.ui_inicio(ui, ctx, &snap),
+                Tab::Configuracion => self.ui_configuracion(ui),
+                Tab::Logs => self.ui_logs(ui, ctx, &snap),
+                Tab::Actualizar => self.ui_actualizar(ui, &snap),
+            });
     }
 }
 
 fn main() -> eframe::Result<()> {
-    let viewport = egui::ViewportBuilder::default()
-        .with_title("VIctory-RTX-Mc3yohan")
-        .with_inner_size([1080.0, 710.0])
-        .with_min_inner_size([920.0, 600.0])
-        .with_icon(Arc::new(art::app_icon()));
     let options = eframe::NativeOptions {
-        viewport,
+        viewport: egui::ViewportBuilder::default()
+            .with_title("VIctory-RTX · Quantico Systems")
+            .with_inner_size([1120.0, 740.0])
+            .with_min_inner_size([920.0, 620.0])
+            .with_icon(art::app_icon()),
         ..Default::default()
     };
+
     eframe::run_native(
-        "VIctory-RTX-Mc3yohan",
+        "VIctory-RTX · Quantico Systems",
         options,
-        Box::new(|cc| Ok(Box::new(LauncherApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(VictoryLauncherApp::new(cc)))),
     )
 }

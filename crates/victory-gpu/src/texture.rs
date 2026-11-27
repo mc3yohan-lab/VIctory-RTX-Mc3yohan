@@ -322,7 +322,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             }
         }
     };
-    let first = list.first_use(placed as usize);
+    let new_source = list.alias_source_changed(placed as usize, to, from);
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
@@ -337,7 +337,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         unsafe { list.list.barriers(&[barrier]) };
         before
     });
-    if !first && before.is_none() {
+    if !new_source && before.is_none() {
         return true;
     }
     card_writes(list, placed, to, None);
@@ -864,6 +864,29 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         };
         staging.expected.store(there, Relaxed);
     }
+    // CPU-written linear R8_UNORM video/movie planes (Bink intro, TV, and phone
+    // screens — ported from ScarlettPort movie_plane): use an exclusive per-list
+    // upload chunk filled at submission time so concurrent RELAY=2 flights never
+    // overwrite each other and write-watch/guard misses never freeze video frames.
+    if staging.movie_plane() {
+        let (at, len) = staging.memory();
+        let footprint = staging.footprints[0].Footprint;
+        let pitch = footprint.RowPitch as usize;
+        let bytes = pitch * staging.rows[0] as usize;
+        let plane = staging.clone();
+        if let Some(source) = list.plane_upload(bytes as u64, (at, len), move |dst| {
+            fill_plane(&plane.layout, at, len, dst, bytes, pitch);
+        }) {
+            list.defer_texture(PreludeUpload {
+                staging,
+                copy,
+                resource: resource as usize,
+                on_demand: None,
+                plane_source: Some(source),
+            });
+            return;
+        }
+    }
     // Deferred submission-time prelude upload (from Belobug): `staging.refresh()`
     // runs at submission time first, then `PreludeUpload::finish_refresh` claims
     // changed/un-uploaded textures for `HostList::prelude` to record
@@ -874,6 +897,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         copy,
         resource: resource as usize,
         on_demand,
+        plane_source: None,
     });
 }
 
@@ -898,6 +922,10 @@ pub(crate) struct PreludeUpload {
     pub(crate) copy: Arc<crate::resource::HostTexture>,
     resource: usize,
     on_demand: Option<crate::resource::OnDemand>,
+    /// Exclusive per-list upload resource for CPU-written linear movie planes
+    /// (`Staging::movie_plane`). Always uploads from offset 0 without touching
+    /// the shared staging buffer.
+    pub(crate) plane_source: Option<ID3D12Resource>,
 }
 
 impl PreludeUpload {
@@ -906,6 +934,13 @@ impl PreludeUpload {
     /// list's prelude must record `CopyTextureRegion` into `self.copy.texture`.
     pub(crate) fn finish_refresh(&self) -> Option<bool> {
         use std::sync::atomic::Ordering::Relaxed;
+        if self.plane_source.is_some() {
+            let was_uploaded = self.staging.uploaded.swap(true, std::sync::atomic::Ordering::AcqRel);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexUploads, 1);
+            self.staging.note_held();
+            return Some(!was_uploaded);
+        }
         let has_prefill = self.copy.prefill.as_deref().is_some_and(Prefill::has_pending);
         let first_upload = match claim_upload(&self.staging.uploaded, &self.staging.dirty) {
             Some(first) => first,
@@ -958,6 +993,31 @@ impl PreludeUpload {
                 self.staging.memory as u64,
                 claim,
             );
+        }
+        if let Some(plane_source) = &self.plane_source {
+            let footprint = self.staging.footprints[0];
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: a borrowed pointer the location never releases.
+                pResource: unsafe { std::mem::transmute_copy(texture) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: self.staging.first - self.staging.level0,
+                },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: as above.
+                pResource: unsafe { std::mem::transmute_copy(plane_source) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        ..footprint
+                    },
+                },
+            };
+            // SAFETY: an open prelude list; both locations name live resources.
+            unsafe { cmd_list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+            return;
         }
         for (i, footprint) in self.staging.footprints.iter().enumerate() {
             let to = D3D12_TEXTURE_COPY_LOCATION {
@@ -1363,6 +1423,25 @@ impl Staging {
         read
     }
 
+    /// Whether this staging buffer is a CPU-written linear single-level R8_UNORM
+    /// 2D video/movie plane (Bink intro, TV, and phone-screen video; ported from
+    /// ScarlettPort). `VICTORY_VIDEO_PLANES=0` turns it off.
+    pub(crate) fn movie_plane(&self) -> bool {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UNORM;
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| std::env::var_os("VICTORY_VIDEO_PLANES").is_none_or(|v| v != "0"));
+        let desc = &self.layout.desc;
+        on && !self.on_demand
+            && desc.dimension == victory_formats::texture::Dimension::Tex2d
+            && desc.swizzle.0 == 0
+            && desc.depth == 1
+            && desc.mips == 1
+            && desc.samples == 1
+            && self.footprints.len() == 1
+            && self.footprints[0].Offset == 0
+            && self.footprints[0].Footprint.Format == DXGI_FORMAT_R8_UNORM
+    }
+
     fn refresh_timed(&self) -> usize {
         let size = self.read;
         let start = self.memory as usize;
@@ -1372,7 +1451,10 @@ impl Staging {
         if alone && last.hash.is_some() {
             return 0;
         }
-        if !alone && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
+        if !alone
+            && self.guard_view
+            && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false))
+        {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             let look = unwritten && table_look(last, start, size);
             if unwritten && !look {
@@ -1795,6 +1877,73 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
             take(0, WINDOW);
             take((len / 2) & !0xfff, WINDOW);
             take(len - WINDOW, WINDOW);
+        }
+    });
+    let first = (print as u64 ^ (print >> 64) as u64).to_le_bytes();
+    u64::from_le_bytes(first) | 1
+}
+
+/// Copies a CPU-written linear video/movie plane straight into its per-list
+/// upload buffer at submission time (ported from ScarlettPort `fill_plane`).
+fn fill_plane(
+    layout: &victory_formats::texture::Layout,
+    at: usize,
+    len: usize,
+    dst: usize,
+    bytes: usize,
+    pitch: usize,
+) {
+    let _pin = crate::watch::title_memory_reading();
+    // SAFETY: the list owns this upload allocation until its GPU fence completes.
+    let out = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, bytes) };
+    let mip = &layout.mips[0];
+    if mip.offset == 0
+        && mip.pitch as usize * layout.desc.element_bytes as usize == pitch
+        && bytes <= len
+        && crate::host::read_into(at as *const _, out)
+    {
+        return;
+    }
+    with_read(len, |read| {
+        crate::host::copy_mapped(read.as_mut_ptr(), at as *const u8, len, false);
+        if let Err(error) = layout.detile(read, 0, 0, out, pitch, bytes) {
+            out.fill(0);
+            tracing::debug!(?error, "could not copy linear video plane into list upload buffer");
+        }
+    });
+}
+
+/// Largest texture [`fingerprint_for`] reads whole when its slot is live.
+const LIVE_WHOLE_BYTES: u64 = 4 << 20;
+
+/// [`fingerprint`], or for a live slot (one found changing after its upload,
+/// such as TV or phone-screen video planes) no larger than 4 MiB, a full
+/// digest of its memory (ported from `avatarmanz/VIctory-7900XTX #390`).
+pub(crate) fn fingerprint_for(at: u64, len: u64, live: bool) -> u64 {
+    if !live || len > LIVE_WHOLE_BYTES {
+        return fingerprint(at, len);
+    }
+    const CHUNK: usize = 64 << 10;
+    thread_local! {
+        static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let len = len as usize;
+    let mut print = 0u128;
+    READ.with(|read| {
+        let mut read = read.borrow_mut();
+        read.resize(CHUNK, 0);
+        let mut from = 0;
+        while from < len {
+            let bytes = CHUNK.min(len - from);
+            read[..bytes].fill(0);
+            crate::host::copy_mapped(
+                read.as_mut_ptr(),
+                (at as usize + from) as *const u8,
+                bytes,
+                false,
+            );
+            print = print.rotate_left(37) ^ digest(&read[..bytes]).0;
+            from += bytes;
         }
     });
     let first = (print as u64 ^ (print >> 64) as u64).to_le_bytes();

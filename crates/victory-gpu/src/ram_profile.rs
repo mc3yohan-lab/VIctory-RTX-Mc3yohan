@@ -1,16 +1,20 @@
-//! Retention limits for reusable CPU buffers on hosts with at most 16 GiB.
-//! Live render data is never evicted by these helpers.
+//! Retention limits for reusable CPU buffers on hosts with limited RAM
+//! (<= 24 GiB physical RAM, covering 16 GB desktops and 24 GB RTX 5050 laptops,
+//! or < 8 GiB free Windows commit). Live render data is never evicted.
 
 use std::sync::OnceLock;
 
 const MIB: usize = 1 << 20;
 const GIB: u64 = 1 << 30;
 
-fn selected(setting: Option<&str>, physical: Option<u64>) -> bool {
+fn selected(setting: Option<&str>, physical: Option<u64>, avail_commit: Option<u64>) -> bool {
     match setting.map(str::trim) {
         Some("0") => false,
         Some("1") => true,
-        _ => physical.is_some_and(|bytes| bytes > 0 && bytes <= 16 * GIB),
+        _ => {
+            physical.is_some_and(|bytes| bytes > 0 && bytes <= 24 * GIB)
+                || avail_commit.is_some_and(|bytes| bytes > 0 && bytes < 8 * GIB)
+        }
     }
 }
 
@@ -23,14 +27,16 @@ pub(crate) fn enabled() -> bool {
         let mut memory: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
         memory.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
         // SAFETY: the structure has the size the API expects.
-        let physical =
-            (unsafe { GlobalMemoryStatusEx(&mut memory) } != 0).then_some(memory.ullTotalPhys);
+        let ok = unsafe { GlobalMemoryStatusEx(&mut memory) } != 0;
+        let physical = ok.then_some(memory.ullTotalPhys);
+        let avail_commit = ok.then_some(memory.ullAvailPageFile);
         let setting = std::env::var("VICTORY_RAM_16GB").ok();
-        let on = selected(setting.as_deref(), physical);
+        let on = selected(setting.as_deref(), physical, avail_commit);
         tracing::info!(
             enabled = on,
             physical_mib = physical.map(|n| n >> 20),
-            "16 GiB host RAM retention profile"
+            avail_commit_mib = avail_commit.map(|n| n >> 20),
+            "low-RAM / low-commit host retention profile (<=24 GiB RAM or <8 GiB commit)"
         );
         on
     })
@@ -98,12 +104,14 @@ mod tests {
 
     #[test]
     fn detection_and_explicit_comparison_overrides() {
-        assert!(selected(None, Some(16 * GIB)));
-        assert!(!selected(None, Some(16 * GIB + 1)));
-        assert!(!selected(None, None));
-        assert!(!selected(None, Some(0)));
-        assert!(!selected(Some("0"), Some(8 * GIB)));
-        assert!(selected(Some("1"), Some(64 * GIB)));
+        assert!(selected(None, Some(16 * GIB), Some(32 * GIB)));
+        assert!(selected(None, Some(24 * GIB), Some(32 * GIB)));
+        assert!(!selected(None, Some(32 * GIB), Some(32 * GIB)));
+        assert!(selected(None, Some(32 * GIB), Some(4 * GIB)));
+        assert!(!selected(None, None, None));
+        assert!(!selected(None, Some(0), Some(0)));
+        assert!(!selected(Some("0"), Some(8 * GIB), Some(2 * GIB)));
+        assert!(selected(Some("1"), Some(64 * GIB), Some(64 * GIB)));
     }
 
     #[test]
