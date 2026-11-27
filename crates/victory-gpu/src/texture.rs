@@ -486,10 +486,12 @@ thread_local! {
 fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
     READ.with(|read| {
         let mut read = read.borrow_mut();
-        if read.len() < size {
-            read.resize(size, 0);
-        }
-        f(&mut read[..size])
+        crate::ram_profile::with_read_cache(
+            &mut read,
+            size,
+            crate::ram_profile::read_cache_budget(),
+            f,
+        )
     })
 }
 

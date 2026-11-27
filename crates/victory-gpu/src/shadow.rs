@@ -1409,8 +1409,19 @@ fn snapshots_kept() -> usize {
 /// bytes in all.
 fn give_back(v: Vec<u8>) {
     const KEPT: usize = 512 << 20;
+    let ram16 = crate::ram_profile::enabled();
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool_put(&mut pool, v);
+    if ram16 {
+        let gone = crate::ram_profile::trim_pool(
+            &mut pool,
+            snapshots_kept(),
+            crate::ram_profile::snapshot_budget(),
+        );
+        drop(pool);
+        drop(gone);
+        return;
+    }
     let (mut kept, mut total) = (0, 0usize);
     for v in pool.iter().take(snapshots_kept()) {
         total = total.saturating_add(v.capacity());
@@ -1423,6 +1434,34 @@ fn give_back(v: Vec<u8>) {
     let gone = pool.split_off(kept);
     drop(pool);
     drop(gone);
+}
+
+/// Only completed snapshots live in this pool. Reclaim them when RAM pressure
+/// changes, even if no new snapshot has been returned since the last sweep.
+pub(crate) fn trim_snapshot_pool() {
+    if !crate::ram_profile::enabled() {
+        return;
+    }
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if pool.is_empty() {
+        return;
+    }
+    let gone = crate::ram_profile::trim_pool(
+        &mut pool,
+        snapshots_kept(),
+        crate::ram_profile::snapshot_budget(),
+    );
+    drop(pool);
+    drop(gone);
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn snapshot_pool_bytes() -> u64 {
+    POOL.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|buffer| buffer.capacity() as u64)
+        .sum()
 }
 
 #[cfg(test)]

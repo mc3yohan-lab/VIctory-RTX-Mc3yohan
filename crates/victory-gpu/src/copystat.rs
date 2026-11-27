@@ -1051,6 +1051,7 @@ fn log_memory() {
             ("translations", kept[3]),
             ("pipeline library file", kept[4]),
             ("our rust heap", own[..4].iter().sum()),
+            ("completed snapshot cache", crate::shadow::snapshot_pool_bytes()),
             ("made upload buffers so far", made[1]),
             ("made shared buffers so far", made[3]),
             ("made card buffers so far", made[5]),

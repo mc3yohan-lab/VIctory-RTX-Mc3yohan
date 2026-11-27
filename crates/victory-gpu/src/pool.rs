@@ -39,7 +39,7 @@ fn staging_kept() -> usize {
     std::env::var("VICTORY_STAGING_KEPT")
         .ok()
         .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(8)
+        .unwrap_or_else(|| if crate::ram_profile::enabled() { 2 } else { 8 })
 }
 fn staging_kept_once() -> usize {
     static ON: OnceLock<usize> = OnceLock::new();
@@ -52,15 +52,21 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
+    // Idle GPU heaps also consume Windows residency/commit resources. A small
+    // host must not retain the large-GPU allowance of 64 empty 64 MiB blocks.
+    let limit_for = |keep| {
+        let limit = spares(memory, keep);
+        if crate::ram_profile::enabled() { limit.min(SPARE) } else { limit }
+    };
     if !crate::residency::on() {
-        SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
+        SPARES.store(limit_for(crate::host::keep_freed()), Ordering::Relaxed);
         return;
     }
     // (`VICTORY_RESIDENCY=1`, codec-d/cool_fox c64fc9b4/e94d277a: fewer
     // spares while the system is short of memory, and idle blocks let go now,
     // not at the pool's next allocation.)
     let pressure = crate::residency::pressured();
-    let limit = spares(memory, crate::host::keep_freed() && !pressure);
+    let limit = limit_for(crate::host::keep_freed() && !pressure);
     SPARES.store(limit, Ordering::Relaxed);
     let tick = now();
     if let Ok(mut pool) = TEXTURES.try_lock() {
@@ -69,7 +75,9 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     if let Ok(mut pool) = staging_pool().try_lock() {
         // Staging buffers are mapped PC commit memory, not VRAM: never let
         // them inherit VRAM's SPARE_KEPT (64 blocks = 4 GiB idle RAM).
-        let staging_limit = if crate::residency::critical_commit() {
+        let staging_limit = if crate::residency::critical_commit()
+            || (pressure && crate::ram_profile::enabled())
+        {
             0
         } else if pressure {
             1

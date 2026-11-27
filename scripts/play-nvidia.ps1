@@ -68,6 +68,8 @@ param(
     [switch]$XmaRefill,
     [switch]$SendBar,
     [switch]$Residency,
+    [switch]$Ram16,
+    [switch]$NoRam16,
     [switch]$GpuTiming,
     [switch]$Quality,
     [switch]$Safe,
@@ -153,9 +155,11 @@ if ($gpuTotalMb -gt 0) {
 # Check commit memory headroom before starting (world gameplay uses 40-46 GB private commit).
 try {
     $os = Get-CimInstance Win32_OperatingSystem
+    $totalPhysGb = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
     $freePhysGb = [math]::Round($os.FreePhysicalMemory / 1MB, 1)
     $freeCommitGb = [math]::Round($os.FreeVirtualMemory / 1MB, 1)
-    Write-Host ("Memory check: {0} GB free RAM, {1} GB free commit" -f $freePhysGb, $freeCommitGb)
+    $ram16Tag = if ($Ram16) { ', 16 GiB RAM profile: forced ON' } elseif ($NoRam16) { ', 16 GiB RAM profile: forced OFF' } elseif ($totalPhysGb -le 16.5) { ', 16 GiB RAM profile: auto ON' } else { '' }
+    Write-Host ("Memory check: {0} GB free / {1} GB total RAM, {2} GB free commit{3}" -f $freePhysGb, $totalPhysGb, $freeCommitGb, $ram16Tag)
     if ($freeCommitGb -lt 44) {
         Write-Warning "Free Windows commit ($freeCommitGb GB) is tight for open-world play (needs ~40-46 GB). Close heavy apps if crashes.log shows error 1455."
     }
@@ -276,6 +280,11 @@ if ($SendBar -and -not $Safe) {
 }
 if ($Residency) {
     $settings.VICTORY_RESIDENCY = '1'
+}
+if ($Ram16) {
+    $settings.VICTORY_RAM_16GB = '1'
+} elseif ($NoRam16) {
+    $settings.VICTORY_RAM_16GB = '0'
 }
 if ($GpuTiming) {
     $settings.VICTORY_GPU_TIMING        = '1'

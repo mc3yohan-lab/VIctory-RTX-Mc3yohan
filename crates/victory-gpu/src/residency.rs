@@ -1,7 +1,8 @@
 //! Host-memory admission for speculative texture work and reusable upload storage.
 //!
 //! From codec-d/cool_fox (641835a4, fabb872a, c64fc9b4, 08e4574d, e94d277a; the
-//! values of the last). Only with `VICTORY_RESIDENCY=1` ([`on`]): the memory
+//! values of the last). With `VICTORY_RESIDENCY=1` ([`on`]), or automatically
+//! on hosts covered by `ram_profile`, the memory
 //! of the system is then asked once a second; below 3 GiB of free RAM or 4 GiB
 //! of commit (out again above 5 / 6) texture prefetch is limited to 64 MiB a
 //! frame and idle scratch and staging blocks are let go; below 1.5 GiB of
@@ -16,10 +17,15 @@ use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORY
 
 const MIB: u64 = 1 << 20;
 
-/// `VICTORY_RESIDENCY=1`: the memory budgets of this module (off by default).
+/// Memory admission: explicit `VICTORY_RESIDENCY` wins; otherwise enable it
+/// automatically for the 16 GiB retention profile.
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RESIDENCY").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| match std::env::var("VICTORY_RESIDENCY").as_deref() {
+        Ok("1") => true,
+        Ok(_) => false,
+        Err(_) => crate::ram_profile::enabled(),
+    })
 }
 const GIB: u64 = 1 << 30;
 static PRESSURED: AtomicBool = AtomicBool::new(false);

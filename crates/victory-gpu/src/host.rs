@@ -563,6 +563,7 @@ fn sweep() {
     #[cfg(feature = "diagnostics")]
     crate::book::check();
     crate::residency::refresh();
+    crate::shadow::trim_snapshot_pool();
     if crate::residency::pressured() {
         trim_spare_chunks();
     }
@@ -2173,7 +2174,13 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                let limit = if keep_freed() && !crate::residency::limited_host_ram() { SPARE_KEPT } else { SPARE_MOST };
+                let limit = if crate::ram_profile::enabled() {
+                    64 << 20
+                } else if keep_freed() && !crate::residency::limited_host_ram() {
+                    SPARE_KEPT
+                } else {
+                    SPARE_MOST
+                };
                 spare.give(chunk, size, limit)
             } else {
                 Some(chunk)
