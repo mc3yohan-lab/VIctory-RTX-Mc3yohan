@@ -53,8 +53,10 @@ pub fn run(
             done.insert(key);
         }
     }
-    let bad = std::fs::read_to_string(&bad_file).unwrap_or_default();
-    let bad: HashSet<&str> = bad.lines().filter_map(|l| l.split(' ').next()).collect();
+    let (bad, stale) = known::bad_keys(&std::fs::read_to_string(&bad_file).unwrap_or_default(), &fingerprint);
+    if stale > 0 {
+        println!("{stale} crashes in warm-bad.txt were under another translation or driver: those pipelines are tried again");
+    }
     let early = std::fs::read_to_string(dir.join("early-pipelines.txt")).unwrap_or_default();
     let early: HashSet<&str> = early.lines().collect();
     // Those earlier runs drew with first, the others in no order (by key).
@@ -103,7 +105,7 @@ pub fn run(
         },
         |n, why| {
             println!("pipeline {n} {}: {why}", keys[n]);
-            let _ = writeln!(lock(&bad_out), "{} {why}", keys[n]);
+            let _ = writeln!(lock(&bad_out), "{}", known::bad_line(&keys[n], &fingerprint, &why));
             lock(&state).2 += 1;
         },
     )?;
@@ -122,8 +124,8 @@ pub fn run(
     );
     if save_library {
         let lib_began = Instant::now();
-        let bad_now = std::fs::read_to_string(&bad_file).unwrap_or_default();
-        let bad_now: HashSet<&str> = bad_now.lines().filter_map(|l| l.split(' ').next()).collect();
+        let bad_text = std::fs::read_to_string(&bad_file).unwrap_or_default();
+        let (bad_now, _) = known::bad_keys(&bad_text, &fingerprint);
         let mut targets: Vec<usize> = (0..keys.len())
             .filter(|&n| {
                 let key = keys[n].as_str();

@@ -268,6 +268,21 @@ fn fresh_list() -> Option<crate::host::HostList> {
     }
 }
 
+/// Returns a closed, unused host list back to [`IDLE`] if the pool has room.
+#[cfg(windows)]
+pub(super) fn return_idle(host: crate::host::HostList) {
+    if !pools() || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        return;
+    }
+    host.reset();
+    let bytes = host.scratch_kept();
+    let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+    if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+        idle.0.push(Idle(host, bytes));
+        idle.1 += bytes;
+    }
+}
+
 /// The host sides of lists whose submission has run (submissions are
 /// waited for; `ran` names the ones it ran, by their place in `lists`):
 /// what they held is let go, as before, and the host lists are reset and
@@ -608,13 +623,7 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().filter(|_| !thin).and_then(|h| match h.new_list() {
-            Ok(list) => Some(list),
-            Err(e) => {
-                tracing::warn!(error = %e, "no host command list");
-                None
-            }
-        }),
+        host: if thin { None } else { fresh_list() },
         #[cfg(windows)]
         state: {
             let mut state = crate::draw::State::default();

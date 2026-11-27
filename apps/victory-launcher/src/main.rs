@@ -56,17 +56,22 @@ struct VictoryLauncherApp {
     game: GameFilesStatus,
     cache: CacheStatus,
     cache_async: Arc<Mutex<Option<CacheStatus>>>,
+    cache_exact_started: bool,
     git: Arc<Mutex<GitInfo>>,
     git_checking: Arc<Mutex<bool>>,
     controllers: ControllerPoller,
     runner: ProcessRunner,
     banner_tex: Option<TextureHandle>,
+    banner_async: Arc<Mutex<Option<(u64, String, Option<egui::ColorImage>)>>>,
+    banner_gen: u64,
     banner_loaded_for: String,
     log_filter: String,
     log_files: Vec<LogFileEntry>,
+    logs_scanned: bool,
     viewing_file_name: Option<String>,
     viewing_file_lines: Vec<String>,
     last_finished_seq: u64,
+    frames_drawn: u32,
     toast: Option<(String, Color32, Instant)>,
 }
 
@@ -74,47 +79,57 @@ impl VictoryLauncherApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply_theme(&cc.egui_ctx);
         let engine = EnginePaths::discover();
-        // Arranque instantáneo (< 5 ms): RAM/CPU nativo + comprobación acotada de caché.
-        // `nvidia-smi`, conteo exacto de ~230k shaders y `git rev-parse` corren en segundo plano.
+        // Arranque instantáneo (< 5 ms CPU antes del primer cuadro):
+        // - RAM/CPU/elevación por Win32 nativo (0 subprocesos).
+        // - Portada PNG, `nvidia-smi` y `git rev-parse` en hilos separados.
+        // - Conteo exacto de caché (~230k shaders) y escaneo de logs diferidos
+        //   hasta que el usuario abra Ajustes o Logs.
         let hw = HardwareInfo::probe_fast();
         let cfg = config::load_config(engine.repo_root.as_deref());
         let game = GameFilesStatus::inspect(Path::new(&cfg.game_dir));
         let cache = CacheStatus::scan_fast();
         let git_local = GitInfo::placeholder(engine.repo_root.as_deref());
-        let log_files = runner::scan_data_logs();
-        let banner_tex = if !cfg.game_dir.is_empty() {
-            art::load_game_banner_texture(&cc.egui_ctx, Path::new(&cfg.game_dir))
-        } else {
-            None
-        };
-        let banner_loaded_for = cfg.game_dir.clone();
 
         let hw_async = Arc::new(Mutex::new(None));
         let cache_async = Arc::new(Mutex::new(None));
+        let banner_async = Arc::new(Mutex::new(None));
         let git = Arc::new(Mutex::new(git_local));
 
-        // 1. Sondeo real de GPU (nvidia-smi + elevación) + Git local en segundo plano.
+        // 1. Sondeo real de GPU (nvidia-smi) en su propio hilo.
         {
             let hw_slot = hw_async.clone();
-            let git_slot = git.clone();
-            let repo_root = engine.repo_root.clone();
             let ctx_bg = cc.egui_ctx.clone();
             std::thread::spawn(move || {
                 let probed = HardwareInfo::probe();
                 *hw_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(probed);
-                let git_info = GitInfo::probe_local(repo_root.as_deref());
+                ctx_bg.request_repaint();
+            });
+        }
+
+        // 2. Estado Git local en hilo independiente (nunca espera a nvidia-smi).
+        if let Some(repo_root) = engine.repo_root.clone() {
+            let git_slot = git.clone();
+            let ctx_bg = cc.egui_ctx.clone();
+            std::thread::spawn(move || {
+                let git_info = GitInfo::probe_local(Some(&repo_root));
                 *git_slot.lock().unwrap_or_else(|e| e.into_inner()) = git_info;
                 ctx_bg.request_repaint();
             });
         }
 
-        // 2. Conteo exacto de caché (~230k shaders) en segundo plano sin trabar jamás el arranque.
-        {
-            let cache_slot = cache_async.clone();
+        // 3. Decodificación PNG de portada en segundo plano (sin bloquear el primer cuadro).
+        let banner_loaded_for = cfg.game_dir.clone();
+        let banner_gen = 1u64;
+        if !cfg.game_dir.is_empty() {
+            let dir = cfg.game_dir.clone();
+            let slot = banner_async.clone();
             let ctx_bg = cc.egui_ctx.clone();
             std::thread::spawn(move || {
-                let exact = CacheStatus::scan_exact();
-                *cache_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(exact);
+                let img = art::load_game_banner_image(Path::new(&dir));
+                let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+                if guard.as_ref().is_none_or(|(g, _, _)| banner_gen >= *g) {
+                    *guard = Some((banner_gen, dir, img));
+                }
                 ctx_bg.request_repaint();
             });
         }
@@ -140,17 +155,22 @@ impl VictoryLauncherApp {
             game,
             cache,
             cache_async,
+            cache_exact_started: false,
             git,
             git_checking: Arc::new(Mutex::new(false)),
             controllers: ControllerPoller::default(),
             runner: ProcessRunner::default(),
-            banner_tex,
+            banner_tex: None,
+            banner_async,
+            banner_gen,
             banner_loaded_for,
             log_filter: String::new(),
-            log_files,
+            log_files: Vec::new(),
+            logs_scanned: false,
             viewing_file_name: None,
             viewing_file_lines: Vec::new(),
             last_finished_seq: 0,
+            frames_drawn: 0,
             toast: None,
         }
     }
@@ -159,10 +179,32 @@ impl VictoryLauncherApp {
         self.toast = Some((msg.into(), color, Instant::now()));
     }
 
-    fn refresh_status(&mut self, ctx: &egui::Context) {
-        self.engine = EnginePaths::discover();
-        self.game = GameFilesStatus::inspect(Path::new(&self.cfg.game_dir));
-        self.cache = CacheStatus::scan_fast();
+    fn spawn_banner_load(&mut self, ctx: &egui::Context) {
+        let dir = self.cfg.game_dir.clone();
+        self.banner_gen = self.banner_gen.saturating_add(1);
+        let epoch = self.banner_gen;
+        self.banner_loaded_for = dir.clone();
+        self.banner_tex = None;
+        if dir.is_empty() {
+            return;
+        }
+        let slot = self.banner_async.clone();
+        let ctx_bg = ctx.clone();
+        std::thread::spawn(move || {
+            let img = art::load_game_banner_image(Path::new(&dir));
+            let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.as_ref().is_none_or(|(g, _, _)| epoch >= *g) {
+                *guard = Some((epoch, dir, img));
+            }
+            ctx_bg.request_repaint();
+        });
+    }
+
+    fn ensure_cache_exact(&mut self, ctx: &egui::Context, force: bool) {
+        if self.cache_exact_started && !force {
+            return;
+        }
+        self.cache_exact_started = true;
         let cache_slot = self.cache_async.clone();
         let ctx_bg = ctx.clone();
         std::thread::spawn(move || {
@@ -170,14 +212,21 @@ impl VictoryLauncherApp {
             *cache_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(exact);
             ctx_bg.request_repaint();
         });
-        self.log_files = runner::scan_data_logs();
+    }
+
+    fn refresh_status(&mut self, ctx: &egui::Context) {
+        self.engine = EnginePaths::discover();
+        self.game = GameFilesStatus::inspect(Path::new(&self.cfg.game_dir));
+        self.cache = CacheStatus::scan_fast();
+        if self.tab == Tab::Ajustes || self.cache_exact_started {
+            self.ensure_cache_exact(ctx, true);
+        }
+        if self.tab == Tab::Logs || self.logs_scanned {
+            self.log_files = runner::scan_data_logs();
+            self.logs_scanned = true;
+        }
         if self.cfg.game_dir != self.banner_loaded_for {
-            self.banner_tex = if !self.cfg.game_dir.is_empty() {
-                art::load_game_banner_texture(ctx, Path::new(&self.cfg.game_dir))
-            } else {
-                None
-            };
-            self.banner_loaded_for = self.cfg.game_dir.clone();
+            self.spawn_banner_load(ctx);
         }
     }
 
@@ -592,7 +641,7 @@ impl VictoryLauncherApp {
                 let shader_txt = if self.cache.shader_count_exact {
                     format!("{} shaders listos ({} MB)", self.cache.shader_files, self.cache.shader_mb)
                 } else {
-                    "Shaders listos (calculando tamaño total...)".to_owned()
+                    "Shaders compilados y listos".to_owned()
                 };
                 ui.label(
                     RichText::new(format!(
@@ -833,8 +882,9 @@ impl VictoryLauncherApp {
 
         ui.add_space(16.0);
 
-        // Control rápido: mando o teclado/ratón.
-        let pad = self.controllers.poll().clone();
+        // Control rápido: mando o teclado/ratón (diferido al cuadro 2 para no retrasar apertura).
+        let pad = (self.frames_drawn >= 2).then(|| self.controllers.poll().clone());
+        let pad_any = pad.as_ref().is_some_and(|p| p.any());
         Frame::new()
             .fill(theme::BG_CARD_ALT)
             .stroke(Stroke::new(1.0_f32, theme::BORDER))
@@ -845,7 +895,7 @@ impl VictoryLauncherApp {
                     theme::paint_badge_icon(
                         ui,
                         theme::BadgeKind::Pad,
-                        if pad.any() || self.cfg.kbm_gta {
+                        if pad_any || self.cfg.kbm_gta {
                             theme::STATUS_OK
                         } else {
                             theme::TEXT_MUTED
@@ -853,8 +903,8 @@ impl VictoryLauncherApp {
                     );
                     ui.vertical(|ui| {
                         ui.label(
-                            RichText::new(if pad.any() {
-                                pad.summary_es()
+                            RichText::new(if let Some(p) = pad.as_ref().filter(|p| p.any()) {
+                                p.summary_es()
                             } else {
                                 "Conecta un mando Xbox/PlayStation o activa Teclado y Ratón.".to_owned()
                             })
@@ -955,15 +1005,18 @@ impl VictoryLauncherApp {
                         .min_size(vec2(82.0, 30.0));
                         if ui.add(btn).clicked() {
                             self.tab = tab;
-                            if tab == Tab::Logs {
+                            if tab == Tab::Ajustes {
+                                self.ensure_cache_exact(ui.ctx(), false);
+                            } else if tab == Tab::Logs {
                                 self.log_files = runner::scan_data_logs();
+                                self.logs_scanned = true;
                             }
                         }
                     }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
-                            RichText::new(format!("v0.7.2 · {}", env!("VICTORY_GIT_SHA")))
+                            RichText::new(format!("v{} · {}", env!("CARGO_PKG_VERSION"), env!("VICTORY_GIT_SHA")))
                                 .color(theme::TEXT_MUTED)
                                 .size(11.0),
                         );
@@ -1082,7 +1135,6 @@ impl VictoryLauncherApp {
                     }
                 } else {
                     let can_play = self.game.ready()
-                        && self.hw.probe_done
                         && self.engine.active_victory(self.cfg.use_diag_build).is_some();
                     let play = Button::new(
                         RichText::new("JUGAR")
@@ -1105,6 +1157,21 @@ impl VictoryLauncherApp {
                     ))
                     .corner_radius(CornerRadius::same(11));
                     if ui.add_enabled(can_play, play).clicked() {
+                        // Si el usuario pulsa JUGAR en los primeros ~200 ms antes de que
+                        // termine `nvidia-smi`, esperar brevemente el perfil real de GPU
+                        // para no lanzar RTX 50/8GB con el tier provisional.
+                        if !self.hw.probe_done {
+                            let deadline = Instant::now() + Duration::from_millis(2000);
+                            while Instant::now() < deadline {
+                                if let Ok(mut slot) = self.hw_async.try_lock()
+                                    && let Some(probed) = slot.take()
+                                {
+                                    self.hw = probed;
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(20));
+                            }
+                        }
                         match self.runner.start_play(&self.engine, &self.cfg, &self.hw) {
                             Ok(()) => {
                                 self.set_toast(
@@ -1122,7 +1189,7 @@ impl VictoryLauncherApp {
         ui.add_space(14.0);
 
         // --- UNA sola barra limpia de control rápido debajo del Hero ---
-        let pad = self.controllers.poll().clone();
+        let pad = (self.frames_drawn >= 2).then(|| self.controllers.poll().clone());
         Frame::new()
             .fill(theme::BG_CARD)
             .stroke(Stroke::new(1.0_f32, theme::BORDER))
@@ -1165,8 +1232,8 @@ impl VictoryLauncherApp {
                     ui.add_space(16.0);
 
                     // 2. Control simple: mando detectado o Teclado y Ratón.
-                    if pad.any() {
-                        theme::status_pill(ui, &pad.badge_es(), theme::STATUS_OK);
+                    if let Some(p) = pad.as_ref().filter(|p| p.any()) {
+                        theme::status_pill(ui, &p.badge_es(), theme::STATUS_OK);
                         ui.add_space(6.0);
                     }
                     if ui
@@ -2128,7 +2195,8 @@ impl VictoryLauncherApp {
 
 impl eframe::App for VictoryLauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Recoger resultados asíncronos de GPU y caché exacta sin bloquear jamás el hilo UI.
+        self.frames_drawn = self.frames_drawn.saturating_add(1);
+        // Recoger resultados asíncronos de GPU, caché exacta y portada sin bloquear el hilo UI.
         if let Ok(mut slot) = self.hw_async.try_lock()
             && let Some(probed) = slot.take()
         {
@@ -2138,6 +2206,14 @@ impl eframe::App for VictoryLauncherApp {
             && let Some(exact) = slot.take()
         {
             self.cache = exact;
+        }
+        if let Ok(mut slot) = self.banner_async.try_lock()
+            && let Some((epoch, dir, maybe_img)) = slot.take()
+            && epoch == self.banner_gen
+            && dir == self.cfg.game_dir
+        {
+            self.banner_tex = maybe_img.map(|img| art::upload_banner_texture(ctx, img));
+            self.banner_loaded_for = dir;
         }
 
         let snap = self.runner.snapshot();

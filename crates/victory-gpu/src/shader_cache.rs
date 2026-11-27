@@ -137,6 +137,15 @@ fn build() -> [u8; 32] {
         }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+        // Fast-math bitmask (`VICTORY_SHADER_FAST_BITS`, default 24 = nsz|arcp):
+        // mix into the key when non-default so existing warmed caches for 24 stay
+        // valid while custom bitmasks (e.g. 0 or 31) get their own cache entries
+        // and rotate `warm-bad.txt`.
+        let fast_bits = victory_shader::emit::fast_math_bits();
+        if victory_shader::emit::shader_opt() & 128 != 0 && fast_bits != 24 {
+            bytes.extend_from_slice(b"VICTORY_SHADER_FAST_BITS=");
+            bytes.extend_from_slice(&fast_bits.to_le_bytes());
+        }
         // Renderer port 5 (`VICTORY_PORT_CBV=1`): constant buffers read as raw
         // bytes. Only when on, so the translations cached without it keep
         // their key.

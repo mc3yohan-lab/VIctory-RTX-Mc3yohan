@@ -116,7 +116,7 @@ use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
-pub use bitcode::census;
+pub use bitcode::{census, fast_math_bits};
 pub use sampler::StaticSampler;
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_host_rdna_mask, set_thread_max_wave};
 pub use rect::rect_list_gs;
@@ -312,7 +312,9 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
             Some(hex) => u32::from_str_radix(hex, 16).ok(),
             None => v.parse().ok(),
         });
-    parsed.map_or(bitcode::opt::DEFAULT, |n| n & bitcode::opt::ALL)
+    parsed.map_or(bitcode::opt::DEFAULT, |n| {
+        n & (bitcode::opt::ALL | bitcode::opt::FAST)
+    })
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -413,7 +415,20 @@ pub struct UserData {
 /// numbers they compute (`lower::with_mask_ops_on_numbers`), and only such
 /// a program: with that on for every program, 69 compute programs that
 /// already translated came out changed (`CS_RaytracingResolve`, ...).
+/// A pixel program whose killed lanes, going on with their live quad
+/// ([`structure`]), reach a lane test of a constant mask the lowering cannot
+/// make is translated once more with them leaving at the kill, as before
+/// (`structure::without_live_quads`): 13 of the title's programs.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    match translate_retried(container) {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSTANT_MASK => {
+            structure::without_live_quads(|| translate_retried(container))
+        }
+        other => other,
+    }
+}
+
+fn translate_retried(container: &[u8]) -> Result<HostShader, ShaderError> {
     match translate_plain(container) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
             lower::with_first_half_pairs(|| translate_plain(container))
@@ -1208,13 +1223,16 @@ mod tests {
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
         let (all, usual) = (super::bitcode::opt::ALL, super::bitcode::opt::DEFAULT);
-        assert_eq!(usual, 63, "the passes of the builds before the wide loads");
+        let fast = super::bitcode::opt::FAST;
+        assert_eq!(usual, 63 | fast, "every pass except WIDE, plus safe fast-math bits");
         assert_eq!(parse_shader_opt(None), usual);
         assert_eq!(parse_shader_opt(Some("0")), 0);
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
         assert_eq!(parse_shader_opt(Some("127")), all);
-        assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
+        assert_eq!(parse_shader_opt(Some("0xffffffff")), all | fast);
+        assert_eq!(parse_shader_opt(Some("255")), all | fast);
+        assert_eq!(parse_shader_opt(Some("191")), (all & !super::bitcode::opt::WIDE) | fast);
         assert_eq!(parse_shader_opt(Some("on")), usual);
     }
 

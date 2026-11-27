@@ -357,8 +357,21 @@ pub(crate) fn land(back: &Back) {
     };
     match asynchronous().then(writer).flatten() {
         Some(writer) => writer.send(landing),
-        None => write(&landing),
+        None => {
+            thread_local! {
+                static SYNC_SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
+            }
+            SYNC_SCRATCH.with_borrow_mut(|scratch| write(&landing, scratch));
+        }
     }
+}
+
+/// Temporary pixels and tiling plans reused by one thread returning textures
+/// (`TaynanGT/Vice-Tay@f0019f2e`).
+#[derive(Default)]
+struct Scratch {
+    pixels: Vec<u8>,
+    tiling: victory_formats::texture::TilingCache,
 }
 
 fn stale() {
@@ -370,7 +383,7 @@ fn stale() {
 }
 
 /// Tiles a read-back's texels into its title allocation.
-fn write(landing: &Landing) {
+fn write(landing: &Landing, scratch: &mut Scratch) {
     use crate::land::{count, spent, stat};
     static COPIED: AtomicU64 = AtomicU64::new(0);
     let asked = std::time::Instant::now();
@@ -383,9 +396,13 @@ fn write(landing: &Landing) {
     }
     let (at, end) = (landing.ticket.at, landing.ticket.end);
     let size = end - at;
-    let mut tiled = vec![0u8; size];
+    if scratch.pixels.len() < size {
+        scratch.pixels.reserve_exact(size - scratch.pixels.len());
+        scratch.pixels.resize(size, 0);
+    }
+    let tiled = &mut scratch.pixels[..size];
     // Keep title bytes the subresources do not cover.
-    if !crate::host::read_into(at as *const u8, &mut tiled) {
+    if !crate::host::read_into(at as *const u8, tiled) {
         return;
     }
     for (i, (footprint, &rows)) in landing.footprints.iter().zip(&landing.rows).enumerate() {
@@ -394,7 +411,8 @@ fn write(landing: &Landing) {
         let pitch = f.RowPitch as usize;
         let from = footprint.Offset as usize;
         let linear = &landing.data[from..from + pitch * rows as usize * f.Depth as usize];
-        if let Err(e) = landing.layout.tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize) {
+        let pitches = (pitch, pitch * rows as usize);
+        if let Err(e) = scratch.tiling.tile(&landing.layout, tiled, (mip, slice), linear, pitches) {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
             return;
@@ -434,16 +452,19 @@ fn writer() -> Option<&'static Writer> {
     *WRITER.get_or_init(|| {
         let writer: &'static Writer =
             Box::leak(Box::new(Writer { waiting: Mutex::new(std::collections::HashMap::new()), more: std::sync::Condvar::new() }));
-        let started = std::thread::Builder::new().name("texture read-backs".into()).spawn(move || loop {
-            let batch: Vec<Landing> = {
-                let mut waiting = writer.waiting.lock().unwrap_or_else(|e| e.into_inner());
-                while waiting.is_empty() {
-                    waiting = writer.more.wait(waiting).unwrap_or_else(|e| e.into_inner());
+        let started = std::thread::Builder::new().name("texture read-backs".into()).spawn(move || {
+            let mut scratch = Scratch::default();
+            loop {
+                let batch: Vec<Landing> = {
+                    let mut waiting = writer.waiting.lock().unwrap_or_else(|e| e.into_inner());
+                    while waiting.is_empty() {
+                        waiting = writer.more.wait(waiting).unwrap_or_else(|e| e.into_inner());
+                    }
+                    waiting.drain().map(|(_, landing)| landing).collect()
+                };
+                for landing in &batch {
+                    write(landing, &mut scratch);
                 }
-                waiting.drain().map(|(_, landing)| landing).collect()
-            };
-            for landing in &batch {
-                write(landing);
             }
         });
         match started {

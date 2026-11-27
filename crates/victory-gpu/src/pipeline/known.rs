@@ -257,6 +257,28 @@ pub fn fingerprint() -> String {
     h.finalize().to_hex()[..16].to_owned()
 }
 
+/// A line of `warm-bad.txt`: the key, the [`fingerprint`] the compiler crashed under, then why.
+pub fn bad_line(key: &str, fingerprint: &str, why: &str) -> String {
+    format!("{key} {fingerprint} {why}")
+}
+
+/// Keys `warm-bad.txt` holds for `fingerprint`, and how many lines belong to another or none.
+/// (avatarmanz#430: translator/driver updates automatically retry previously crashing pipelines.)
+pub fn bad_keys(listed: &str, fingerprint: &str) -> (HashSet<String>, usize) {
+    let mut keys = HashSet::new();
+    let mut other = 0;
+    for line in listed.lines().filter(|l| !l.trim_start().starts_with('#')) {
+        let mut words = line.split_whitespace();
+        let Some(key) = words.next() else { continue };
+        if words.next() == Some(fingerprint) {
+            keys.insert(key.to_owned());
+        } else {
+            other += 1;
+        }
+    }
+    (keys, other)
+}
+
 /// The translations of earlier runs are in `dir` (the pipeline library is
 /// not used: what is made here is the driver's to keep).
 pub fn use_translations(dir: PathBuf) {

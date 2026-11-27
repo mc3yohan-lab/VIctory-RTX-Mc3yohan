@@ -270,6 +270,7 @@ pub extern "system" fn CreateFileW(
     template: Handle,
 ) -> Handle {
     let p = wide(path);
+    let flags = host_flags("CreateFileW", access, flags);
     host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
         p.ptr(),
         access,
@@ -281,6 +282,51 @@ pub extern "system" fn CreateFileW(
     )
 }
 
+/// Whether read-only non-overlapped opens lose `FILE_FLAG_NO_BUFFERING` so
+/// Windows caches game packs in standby RAM (`VICTORY_FILE_CACHE=0`: unbuffered;
+/// ported from Marvisak#2427 / avatarmanz#423).
+fn file_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_FILE_CACHE").is_none_or(|v| v != "0");
+        tracing::info!(on, "files: read-only opens go through the host file cache (VICTORY_FILE_CACHE)");
+        on
+    })
+}
+
+fn dropped_flags(access: u32, flags: u32) -> u32 {
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+    const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+    if access == GENERIC_READ && flags & FILE_FLAG_OVERLAPPED == 0 {
+        FILE_FLAG_NO_BUFFERING
+    } else {
+        0
+    }
+}
+
+fn host_flags(call: &str, access: u32, flags: u32) -> u32 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+    static UNBUFFERED: AtomicU64 = AtomicU64::new(0);
+    if flags & FILE_FLAG_NO_BUFFERING == 0 {
+        return flags;
+    }
+    let dropped = if file_cache() { dropped_flags(access, flags) } else { 0 };
+    let n = UNBUFFERED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 8 || n.is_multiple_of(256) {
+        tracing::info!(
+            call,
+            opens = n,
+            access = format_args!("{access:#x}"),
+            flags = format_args!("{flags:#x}"),
+            cached = dropped != 0,
+            "files: the title opened a file unbuffered (VICTORY_FILE_CACHE)"
+        );
+    }
+    flags & !dropped
+}
+
 pub extern "system" fn CreateFileA(
     path: *const c_char,
     access: u32,
@@ -290,6 +336,7 @@ pub extern "system" fn CreateFileA(
     flags: u32,
     template: Handle,
 ) -> Handle {
+    let flags = host_flags("CreateFileA", access, flags);
     match narrow(path) {
         Some(p) => {
             host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(

@@ -329,18 +329,21 @@ fn count_files_recursive(dir: &Path) -> (usize, u64) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return (0, 0);
     };
-    let mut stack: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-    while let Some(path) = stack.pop() {
-        if let Ok(meta) = std::fs::metadata(&path) {
-            if meta.is_file() {
+    let mut stack = vec![entries];
+    while let Some(mut rd) = stack.pop() {
+        for entry in rd.by_ref().flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_file() {
                 files += 1;
-                bytes += meta.len();
-            } else if meta.is_dir()
-                && let Ok(sub) = std::fs::read_dir(&path)
-            {
-                for e in sub.flatten() {
-                    stack.push(e.path());
+                if let Ok(meta) = entry.metadata() {
+                    bytes += meta.len();
                 }
+            } else if ft.is_dir()
+                && let Ok(sub) = std::fs::read_dir(entry.path())
+            {
+                stack.push(sub);
             }
         }
     }
@@ -663,12 +666,13 @@ impl ProcessRunner {
 
         // Encabezado limpio UTF-8 para que cualquier log compartido tenga toda la info del PC.
         let header = format!(
-            "=== VIctory-RTX-Mc3yohan (Launcher v0.7.2 @ {}) ===\n\
+            "=== VIctory-RTX-Mc3yohan (Launcher v{} @ {}) ===\n\
              GPU      : {} ({} MiB VRAM, Tier {})\n\
              RAM      : {:.1} GB total ({:.1} GB libre, {:.1} GB commit libre) | {} hilos\n\
              Perfil   : {} | Consola: {} | Salida: {} | Escala: {:?}\n\
              Build    : {} | PortRT={} | Thin={} | LiveTex={} | VideoPlanes={}\n\
              ==============================================================\n",
+            env!("CARGO_PKG_VERSION"),
             env!("VICTORY_GIT_SHA"),
             hw.gpu_name,
             hw.vram_total_mb,
@@ -1295,7 +1299,8 @@ pub fn build_diagnostic_report(
 ) -> String {
     let mut r = String::new();
     r.push_str(&format!(
-        "### Reporte de Diagnóstico · VIctory-RTX-Mc3yohan (v0.7.2 @ {})\n",
+        "### Reporte de Diagnóstico · VIctory-RTX-Mc3yohan (v{} @ {})\n",
+        env!("CARGO_PKG_VERSION"),
         env!("VICTORY_GIT_SHA")
     ));
     r.push_str(&format!(

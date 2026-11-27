@@ -225,6 +225,19 @@ impl Recording {
         }
     }
 
+    /// Waits until it is translated, or until `until`: whether it is.
+    pub(crate) fn wait_until(&self, until: std::time::Instant) -> bool {
+        let mut inner = held(&self.inner);
+        while !self.done() {
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            inner = self.moved.wait_timeout(inner, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        true
+    }
+
     /// The list of ours it went to (null: it was never begun).
     pub(crate) fn back(&self) -> This {
         held(&self.inner).back as This
@@ -278,13 +291,19 @@ impl Drop for Recording {
                 super::close(inner.back as This);
             }
             let mut backs = held(&BACKS);
-            if backs.len() < 64 {
+            // GTA VI translates ~200 thin lists per frame; cap at 512 (matching
+            // `list::IDLE_MOST.0`) so steady-state frames never destroy and
+            // recreate `HostList` allocators/buffers every frame.
+            if backs.len() < 512 {
                 backs.push(inner.back);
             } else {
                 drop(backs);
                 // SAFETY: `back_list` allocates this `List` with `Box::into_raw`
                 // and nothing else references it once its `Recording` drops.
-                unsafe { drop(Box::from_raw(inner.back as *mut List)) };
+                let mut list = unsafe { Box::from_raw(inner.back as *mut List) };
+                if let Some(host) = list.host.take() {
+                    super::return_idle(host);
+                }
             }
         }
     }

@@ -56,6 +56,7 @@ param(
     [switch]$SkipRtAggressive,
     [switch]$NoSkipRtResolve,
     [switch]$LaneCore,
+    [switch]$NoLaneCore,
     [switch]$Thin,
     [switch]$NoThin,
     [int]$ThinThreads = -1,
@@ -72,6 +73,8 @@ param(
     [switch]$SweepPerHeap,
     [switch]$XmaRefill,
     [switch]$SendBar,
+    [switch]$NoSendBar,
+    [switch]$OrderAlone,
     [switch]$WcNoBack,
     [switch]$WcBar,
     [switch]$Residency,
@@ -87,7 +90,7 @@ param(
     [int]$MipDrop = -1,
     [int]$WindowKb = 4096,
     [int]$CardBuffersMinKb = -1,
-    [int]$DynamicSlots = 393216,
+    [int]$DynamicSlots = 262144,
     [switch]$RecordPipelines,
     [switch]$Panel,
     [switch]$Kbm,
@@ -157,7 +160,7 @@ if ($gpuTotalMb -gt 0 -and $gpuTotalMb -lt 10000) {
     # (auto-guarded at 80% of DXGI local budget in shadow.rs).
     if ($WindowsBarMb -lt 0)     { $WindowsBarMb = 8192 }
     if ($MipDrop -lt 0)          { $MipDrop = 0 }
-    if ($CardBuffersMinKb -lt 0) { $CardBuffersMinKb = 64 }
+    if ($CardBuffersMinKb -lt 0) { $CardBuffersMinKb = 256 }
 }
 if ($gpuTotalMb -gt 0) {
     Write-Host ("GPU auto-tier: {0} ({1} MiB VRAM) -> {2} (WindowsBarMb={3}, MipDrop={4})" -f $gpuName, $gpuTotalMb, $vramTier, $WindowsBarMb, $MipDrop)
@@ -182,6 +185,8 @@ try {
 $logicalCpus = [Environment]::ProcessorCount
 $autoWideThreads = if ($WideThreads -gt 0) {
     $WideThreads
+} elseif ($logicalCpus -ge 20) {
+    10
 } elseif ($logicalCpus -ge 16) {
     8
 } elseif ($logicalCpus -ge 12) {
@@ -189,6 +194,7 @@ $autoWideThreads = if ($WideThreads -gt 0) {
 } else {
     0
 }
+$autoLandThreads = if ($logicalCpus -ge 16) { 8 } else { 6 }
 
 $settings = @{
     # --- Core fast path (avatarmanz latest + RTX 4090 ReBAR tuning) ---
@@ -213,19 +219,20 @@ $settings = @{
     VICTORY_CARD_REHASH_RUNS           = '1'
     VICTORY_JOIN_COPIES                = '1'
     VICTORY_JOIN_BARRIERS              = '1'
+    VICTORY_JOIN_PARTS                 = '8'
     VICTORY_INDIRECT_WINDOW            = '1'
     VICTORY_RELAY_COPY                 = '1'
     VICTORY_INDIRECT_BATCH             = '2'
     VICTORY_INDIRECT_REST              = '0'
     VICTORY_LAND_SKIP                  = '1'
-    VICTORY_LAND_THREADS               = '6'
+    VICTORY_LAND_THREADS               = "$autoLandThreads"
     VICTORY_MAP_THREADS                = '1'
     VICTORY_TITLE_PRIORITIES           = '0'
     VICTORY_CARD_AWAKE                 = 'idle'
     VICTORY_D3D12_DRED                 = 'light'
     VICTORY_D3D12_BACKGROUND           = '0'
     VICTORY_MEMORY_MAP                 = '0'
-    VICTORY_GUARD_HOT                  = '50'
+    VICTORY_GUARD_HOT                  = '0'
     VICTORY_WRITE_JOBS                 = '1'
     VICTORY_WATCH_TEXTURES_JOINED      = '1'
     VICTORY_READBACK_POOL              = '1'
@@ -240,16 +247,20 @@ $settings = @{
     VICTORY_PIPELINE_LOWEST            = '0'
     VICTORY_PIPELINE_WORKERS           = '8'
     VICTORY_PIPELINE_WAIT_ONCE         = '1'
+    VICTORY_PIPELINE_WAIT_AGAIN_MS     = '10'
     VICTORY_TARGET_VARIANTS            = '1'
     VICTORY_NO_WATCHDOG                = '1'
     VICTORY_XMA_REFILL                 = '1'
+    VICTORY_FILE_CACHE                 = '1'
+    VICTORY_MAP_SAME                   = '1'
+    VICTORY_HOLES_ONCE                 = '30'
 
     # --- Shader translator (MUST match `victory shaders` and `victory warm`) ---
-    # Default SHADER_OPT=63 (bit 64 grouped 4-dword scalar loads blackened water in fxceless run 277 with 0 ms gain).
-    VICTORY_SHADER_OPT                 = $(if ($WideShaderOpt) { '127' } else { '63' })
+    # Default SHADER_OPT=191 (63 + 128 safe FAST bits=24: nsz|arcp, preserving NaN/Inf checks; WIDE bit 64 stays opt-in).
+    VICTORY_SHADER_OPT                 = $(if ($WideShaderOpt) { '255' } else { '191' })
+    VICTORY_SHADER_FAST_BITS           = '24'
     VICTORY_WAVE_WIDE                  = 'last'
     VICTORY_NAN_SCRUB                  = '1'
-    VICTORY_SMALL_RECHECK              = '0'
 }
 if ($autoWideThreads -gt 0) {
     $settings.VICTORY_WIDE_THREADS = "$autoWideThreads"
@@ -258,6 +269,9 @@ if ($autoWideThreads -gt 0) {
 if (-not $NoPortConstants -and -not $Safe) {
     # Renderer Port 1: in-place 185 MB constants heap (verified 0 forgotten regions, saves ~10,800 fills/frame).
     $settings.VICTORY_PORT_CONSTANTS = '1'
+    # Batch indirect clamps instead of clamping every draw alone (1,661 -> 217 clamps/frame =
+    # -2,888 full-GPU UAV barriers/frame on RTX 4090, verified visually clean; use -OrderAlone to revert).
+    $settings.VICTORY_PORT_CONSTANTS_ORDER_ALONE = $(if ($OrderAlone) { '1' } else { '0' })
 }
 if ($PortDescriptors -and -not $NoPortDescriptors -and -not $Safe) {
     # Renderer Port 2: opt-in only (-PortDescriptors). Left off by default because
@@ -311,7 +325,16 @@ if ($WindowsBarMb -gt 0 -and -not $Safe) {
 if ($WindowKb -gt 0 -and -not $Safe) {
     $settings.VICTORY_WINDOW_KB = "$WindowKb"
 }
-if ($SendBar -and -not $Safe) {
+# Put submission upload memory in VRAM via ReBAR by default on >=12 GB cards (saves ~5.6 ms GPU
+# on RTX 4090, visually verified; stays OFF on 8 GB cards and -Safe, override with -NoSendBar / -SendBar).
+$useSendBar = if ($NoSendBar -or $Safe) {
+    $false
+} elseif ($SendBar) {
+    $true
+} else {
+    $vramTier -ne '8GB'
+}
+if ($useSendBar) {
     $settings.VICTORY_SEND_BAR = '1'
 }
 if ($WcNoBack -and -not $Safe) {
@@ -387,8 +410,10 @@ if ($Safe) {
     } else {
         $settings.VICTORY_THIN         = '0'
     }
-    $settings.VICTORY_JOIN_PARTS   = '8'
-    if ($LaneCore) {
+    # Pin the submitting lane (`victory-submit`) to its own fast P-core on >=12-thread CPUs
+    # (eliminated 630 ms yard stalls and lifted steady-state 720p median to 25 fps on Core i9).
+    $useLaneCore = if ($NoLaneCore) { $false } elseif ($LaneCore) { $true } else { $logicalCpus -ge 12 }
+    if ($useLaneCore) {
         $settings.VICTORY_LANE_CORE = '1'
     }
 }
@@ -402,13 +427,13 @@ if ($Quality) {
 if (-not $NoAmbient -and -not $RayTracing) {
     $settings.VICTORY_AMBIENT               = '1.0'
     $settings.VICTORY_AMBIENT_AIR           = '1.5'
-    # 3.0 keeps bright local emissive light (lit phone screens, lamps) vivid without indoor glare.
-    $settings.VICTORY_AMBIENT_MOST          = '3.0'
+    # 2.0 + CLEAN=1 keeps interiors natural without whiteout veil or camera-cut ghosts.
+    $settings.VICTORY_AMBIENT_MOST          = '2.0'
+    $settings.VICTORY_AMBIENT_CLEAN         = '1'
     $settings.VICTORY_AMBIENT_SHADE         = '0.7,0.5'
     $settings.VICTORY_AMBIENT_REFL          = '2.0'
-    # 1.0 / 0.35 preserves cutscene phone/glass specular reflections while scrubbing NaN bloom squares.
-    $settings.VICTORY_AMBIENT_REFLECT       = '1.0'
-    $settings.VICTORY_AMBIENT_REFLECT_LEAST = '0.35'
+    $settings.VICTORY_AMBIENT_REFLECT       = '0.6'
+    $settings.VICTORY_AMBIENT_REFLECT_LEAST = '0.20'
 }
 
 if ($RayTracing) {
@@ -418,9 +443,8 @@ if ($RayTracing) {
 } else {
     $settings.VICTORY_BVH_NO_HIT     = '1'
     if ($SkipRtAggressive) {
-        # Tier B RT skip (adds ray-binning + RaytracingResolve on top of auto Tier-A pure-BVH skips;
-        # ambient.rs hooks CS_ScreenProbes_TemporalResolve / CS_RayMiss remain immune in pipeline.rs).
-        $settings.VICTORY_SKIP_PREFIXES = 'CS_RaytracingResolve,CS_RayBudgeting_,CS_RaytraceVBuffer_,CS_ScreenProbes_TraceRays_,CS_GenerateRayCoords,CS_GenerateRayBins,CS_GenerateRayBinOffsets,CS_ClassifyRayTiles,CS_SortRayTiles,CS_ResetRayTileArgs,CS_ClearRayBins,CS_ClearRayCounts'
+        Write-Warning "-SkipRtAggressive prefixes (CS_ClassifyRayTiles/CS_ResetRayTileArgs/CS_ClearRayCounts) were verified to black out the 3D scene; using safe CS_RaytracingResolve only."
+        $settings.VICTORY_SKIP_PREFIXES = 'CS_RaytracingResolve'
     } elseif (-not $NoSkipRtResolve) {
         # Skip 328 CS_RaytracingResolve_* compute shaders that run ~18 ms/frame on RT-off runs
         # despite 0 BVH hits, while leaving mixed/screen-space shadows and ambient.rs hooks intact.
@@ -448,8 +472,8 @@ if ($Fsr4K) {
 } elseif ($SeriesS) {
     $settings.VICTORY_PLANES   = '1'
     $settings.VICTORY_UPSCALER = $(if ($FidelityFx) { '7' } else { '6' })
-    if ($vramTier -eq '8GB' -and -not $Full1440p -and -not $Full4K) {
-        # Prevent 3.7 GiB PCIe VRAM spill on 8 GB cards (RTX 3060 Ti / 4060 / 5050).
+    if ($Full720p -or ($vramTier -eq '8GB' -and -not $Full1440p -and -not $Full4K)) {
+        # Prevent 3.7 GiB PCIe VRAM spill on 8 GB cards and honor explicit -Full720p.
         $settings.VICTORY_OUTPUT = '1280x720'
     }
     # Series S at scale 1.0 hits a title breakpoint on start (trustno1-coder 033be27f); default to 720p internal (0.667).

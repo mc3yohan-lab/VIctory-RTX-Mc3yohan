@@ -67,7 +67,7 @@ impl VramTier {
     pub fn default_card_buffers_min_kb(self) -> u32 {
         match self {
             Self::Gb8 | Self::Gb12 | Self::Gb16 => 1024,
-            Self::Gb24Plus => 64,
+            Self::Gb24Plus => 256,
         }
     }
 
@@ -105,18 +105,19 @@ impl HardwareInfo {
         let logical_cpus = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(8);
+        let is_elevated_admin = is_process_elevated();
         Self {
             gpu_name: "Detectando tarjeta NVIDIA...".to_owned(),
             vram_total_mb: 0,
             vram_used_mb: 0,
             gpu_util_pct: 0,
-            vram_tier: VramTier::Gb24Plus,
+            vram_tier: VramTier::Gb12,
             is_blackwell: false,
             ram_total_gb,
             ram_free_gb,
             commit_free_gb,
             logical_cpus,
-            is_elevated_admin: false,
+            is_elevated_admin,
             probe_done: false,
         }
     }
@@ -233,14 +234,37 @@ fn probe_memory_gb() -> (f64, f64, f64) {
     )
 }
 
-/// Comprueba de forma ligera si el launcher fue abierto como Administrador
-/// (abrir como Administrador rompe la ruta normal de DXCache de NVIDIA).
+/// Comprueba al instante (< 0.05 ms, sin subprocesos) mediante el token Win32
+/// si el launcher fue abierto como Administrador (abrir como Administrador
+/// rompe la ruta normal de DXCache de NVIDIA).
 fn is_process_elevated() -> bool {
-    let out = Command::new("net")
-        .args(["session"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    out.is_ok_and(|o| o.status.success())
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: consultar el token de lectura del proceso actual y cerrarlo al terminar.
+    let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } != 0;
+    if !ok || token.is_null() {
+        return false;
+    }
+    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut returned: u32 = 0;
+    let queried = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            (&raw mut elevation).cast(),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        )
+    } != 0;
+    unsafe {
+        CloseHandle(token);
+    }
+    queried && elevation.TokenIsElevated != 0
 }
 
 #[derive(Clone, Debug, Default)]

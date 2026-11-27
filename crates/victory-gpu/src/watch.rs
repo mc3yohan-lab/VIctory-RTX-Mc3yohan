@@ -170,22 +170,17 @@ impl Notes {
         self.read(shard_of(page)).parts_since(page, taken)
     }
 
-    /// The notes of pages `[first, last)` in page order, `each` of them
-    /// until it says no: whether it never did. A part at a time.
+    /// The notes of pages `[first, last)`, one shard at a time, until the
+    /// predicate says no. Large ranges visit each shard once.
     fn each(&self, first: usize, last: usize, mut each: impl FnMut(usize, u64) -> bool) -> bool {
         match pieces(first, last) {
-            Some(pieces) => pieces.into_iter().all(|(from, to)| {
+            Some(mut pieces) => pieces.all(|(from, to)| {
                 let s = self.read(shard_of(from));
                 s.written.range(from..to).all(|(&p, &w)| each(p, w))
             }),
-            None => {
-                let mut all: Vec<(usize, u64)> = Vec::new();
-                for shard in 0..SHARDS {
-                    all.extend(self.read(shard).written.range(first..last).map(|(&p, &w)| (p, w)));
-                }
-                all.sort_unstable();
-                all.into_iter().all(|(p, w)| each(p, w))
-            }
+            None => (0..SHARDS).all(|shard| {
+                self.read(shard).written.range(first..last).all(|(&p, &w)| each(p, w))
+            }),
         }
     }
 
@@ -196,6 +191,9 @@ impl Notes {
             out.push((p, w));
             true
         });
+        if pieces(first, last).is_none() {
+            out.sort_unstable();
+        }
         out
     }
 
@@ -231,15 +229,19 @@ impl Notes {
 /// The pieces of pages `[first, last)` in page order, each in one part;
 /// `None` for a range of more pieces than is worth walking (then each part
 /// is looked at once).
-fn pieces(first: usize, last: usize) -> Option<Vec<(usize, usize)>> {
-    if first >= last {
-        return Some(Vec::new());
-    }
-    let (a, b) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
-    if b - a >= 4 * SHARDS {
+fn pieces(first: usize, last: usize) -> Option<impl Iterator<Item = (usize, usize)>> {
+    let (a, end) = if first < last {
+        (first >> SHARD_SHIFT, ((last - 1) >> SHARD_SHIFT) + 1)
+    } else {
+        (0, 0)
+    };
+    if end - a > 4 * SHARDS {
         return None;
     }
-    Some((a..=b).map(|piece| (first.max(piece << SHARD_SHIFT), last.min((piece + 1) << SHARD_SHIFT))).collect())
+    Some((a..end).map(move |piece| {
+        let step = 1 << SHARD_SHIFT;
+        (first.max(piece * step), last.min((piece + 1).saturating_mul(step)))
+    }))
 }
 
 /// Parts of [`Notes`] held ([`Notes::hold`]).
@@ -272,7 +274,6 @@ impl Held<'_> {
     fn range(&self, first: usize, last: usize) -> Vec<(usize, u64)> {
         match pieces(first, last) {
             Some(pieces) => pieces
-                .into_iter()
                 .flat_map(|(from, to)| self.shard(from).written.range(from..to).map(|(&p, &w)| (p, w)))
                 .collect(),
             None => {
@@ -2185,6 +2186,7 @@ fn placeholder(block: usize) -> bool {
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
 /// committed: what was known of holes there is asked again.
 pub fn title_memory_allocated(at: usize, len: usize) {
+    forget_holes(at, len);
     if len == 0 || !known_holes() {
         return;
     }
@@ -2844,7 +2846,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     for block in unsure {
         // One question for the blocks of a region.
         if block >= uncommitted_until {
-            uncommitted_until = uncommitted_end(block);
+            uncommitted_until = uncommitted_end_cached(block);
             #[cfg(feature = "diagnostics")]
             tally(9, 1);
         }
@@ -3213,7 +3215,7 @@ fn protect_here(g: &Guards, from: usize, to: usize) {
         }
         PROTECTED.clear(block);
         if block >= uncommitted_until {
-            uncommitted_until = uncommitted_end(block);
+            uncommitted_until = uncommitted_end_cached(block);
             #[cfg(feature = "diagnostics")]
             tally(9, 1);
         }
@@ -3223,6 +3225,80 @@ fn protect_here(g: &Guards, from: usize, to: usize) {
                 g.held.insert(block);
             }
         }
+    }
+}
+
+/// Cached uncommitted memory hole queries (`VICTORY_HOLES_ONCE=<frames>`,
+/// default 30; `0` disables; ported from avatarmanz#377 / Sr-0w#181).
+/// Cuts Windows `VirtualQuery` syscalls from ~6,800/frame to ~36/frame.
+static HOLES_ASKED: Mutex<BTreeMap<usize, (usize, u64)>> = Mutex::new(BTreeMap::new());
+
+fn holes_once() -> u64 {
+    if cfg!(test) {
+        return 0;
+    }
+    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        std::env::var("VICTORY_HOLES_ONCE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(30)
+    })
+}
+
+static HOLES_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn uncommitted_end_cached(block: usize) -> usize {
+    use std::sync::atomic::Ordering::Acquire;
+    let frames = holes_once();
+    if frames == 0 {
+        return uncommitted_end(block);
+    }
+    let frame = crate::frame::current();
+    if let Some((_, &(end, at))) = HOLES_ASKED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .range(..=block)
+        .next_back()
+        && block < end
+        && frame.saturating_sub(at) < frames
+    {
+        return end;
+    }
+    let epoch = HOLES_EPOCH.load(Acquire);
+    let end = uncommitted_end(block);
+    if end > block {
+        let mut holes = HOLES_ASKED.lock().unwrap_or_else(|e| e.into_inner());
+        if HOLES_EPOCH.load(Acquire) == epoch {
+            forget_holes_in(&mut holes, block, end);
+            holes.insert(block, (end, frame));
+        }
+    }
+    end
+}
+
+fn forget_holes(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let mut holes = HOLES_ASKED.lock().unwrap_or_else(|e| e.into_inner());
+    HOLES_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+    forget_holes_in(
+        &mut holes,
+        at / BLOCK,
+        at.saturating_add(len).div_ceil(BLOCK),
+    );
+}
+
+fn forget_holes_in(holes: &mut BTreeMap<usize, (usize, u64)>, first: usize, last: usize) {
+    let before = holes
+        .range(..first)
+        .next_back()
+        .filter(|(_, (end, _))| *end > first)
+        .map(|(&start, _)| start);
+    let inside: Vec<usize> = holes.range(first..last).map(|(&start, _)| start).collect();
+    for start in before.into_iter().chain(inside) {
+        holes.remove(&start);
     }
 }
 
@@ -3790,6 +3866,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// neither guarded nor writable) and a kernel read into it fail, so the
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    forget_holes(at, len);
     crate::texback::remapped(at, len);
     open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
 }
@@ -3800,6 +3877,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// before the unmapping would leave the address guarded, clean and known by
 /// its bits ([`PUBLISHED`]) with no view behind it.
 pub fn title_memory_unmapping(at: usize, len: usize) {
+    forget_holes(at, len);
     crate::texback::remapped(at, len);
     forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     let mut g = title_memory_changed(at, len);
@@ -5987,8 +6065,16 @@ mod port7_tests {
         assert_eq!(shards_of(P - 1, P + 1), 0b11);
         assert_eq!(shards_of(63 * P, 65 * P), 1 << 63 | 1);
         assert_eq!(shards_of(5, 5 + SHARDS * P), u64::MAX);
-        assert_eq!(pieces(P - 2, 2 * P + 3), Some(vec![(P - 2, P), (P, 2 * P), (2 * P, 2 * P + 3)]));
-        assert_eq!(pieces(0, 1 << 40), None);
+        assert_eq!(
+            pieces(P - 2, 2 * P + 3).unwrap().collect::<Vec<_>>(),
+            [(P - 2, P), (P, 2 * P), (2 * P, 2 * P + 3)]
+        );
+        assert_eq!(pieces(7, 4).unwrap().next(), None);
+        assert_eq!(
+            pieces(usize::MAX - 1, usize::MAX).unwrap().next(),
+            Some((usize::MAX - 1, usize::MAX))
+        );
+        assert!(pieces(0, 1 << 40).is_none());
         let notes = Notes::new();
         let mut want: BTreeMap<usize, u64> = BTreeMap::new();
         let mut seed = 7;

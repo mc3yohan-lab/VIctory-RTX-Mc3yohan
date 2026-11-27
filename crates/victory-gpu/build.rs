@@ -20,10 +20,11 @@ fn main() {
     let crates = here.join("..");
     let root = crates.join("..");
     // The translator, what it is built from, and the form entries are kept in.
+    // Deliberately excludes workspace Cargo.lock so launcher-only dependency/version
+    // edits do not alter VICTORY_TRANSLATOR metadata unnecessarily.
     let mut all = vec![
         crates.join("victory-shader/Cargo.toml"),
         here.join("src/shader_cache.rs"),
-        root.join("Cargo.lock"),
         root.join("rust-toolchain.toml"),
     ];
     let source = crates.join("victory-shader/src");

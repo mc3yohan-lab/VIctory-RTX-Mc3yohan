@@ -46,6 +46,9 @@ pub(crate) struct Pending {
     /// Total microseconds draws have waited for this pipeline so far
     /// ([`wait_once`]).
     waited_us: AtomicU64,
+    /// The frame a draw first waited for it, plus one; 0: never waited
+    /// ([`wait_again_budget`], Belobug#410).
+    first_wait: AtomicU64,
     /// Declared render-target/depth formats, plus chain of format variants
     /// created on demand when the title draws into different formats (`fxceless a35c5573`).
     pub(crate) formats: TargetFormats,
@@ -97,6 +100,7 @@ impl Pending {
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
             waited_us: AtomicU64::new(0),
+            first_wait: AtomicU64::new(0),
         }
     }
 
@@ -147,7 +151,10 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
                 .map(|s| format!("{} {}", s.stage, s.hash))
                 .collect();
             Some(if failed.is_empty() {
-                format!("refused {:?}", p.shaders)
+                match super::host::refusal(&p.shaders, p.graphics.as_deref()) {
+                    Some(why) => format!("refused {:?} ({why})", p.shaders),
+                    None => format!("refused {:?}", p.shaders),
+                }
             } else {
                 failed.join(" + ")
             })
@@ -220,18 +227,13 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     p.made.get()?.as_ref()
 }
 
-/// Whether a dispatch waits for its compute pipeline until it is made,
-/// whatever the frame's budget ([`wait_budget`]); a draw still waits within
-/// the budget and is dropped while its pipeline is not there.
-///
-/// A dropped draw is drawn again in the next frame. A dropped dispatch may
-/// not be: the title runs some compute passes once when a scene changes
-/// (buffer resets / clears / exposure or GI state), and what they leave is
-/// read for the entire scene. On by default; `VICTORY_PIPELINE_COMPUTE_WAIT=0`
-/// restores the per-frame wait budget (ported from `Exopus` / `fxceless` #1312).
+/// Whether a dispatch waits unconditionally for its compute pipeline
+/// (`VICTORY_PIPELINE_COMPUTE_WAIT=1`; OFF by default per fxceless#1420 because
+/// unconditional compute waits can stall the main thread >30 s on cutscene
+/// transitions and trigger the title's watchdog fault `+0x23cf683`).
 fn compute_waits() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT").is_some_and(|v| v == "1"))
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -332,6 +334,53 @@ impl FrameDeadline {
     }
 }
 
+fn parse_wait_again_ms(raw: Option<&str>) -> Option<Duration> {
+    let millis = raw?.trim().parse::<u64>().ok()?;
+    Some(Duration::from_millis(millis))
+}
+
+/// What a pipeline still being made may take of a frame's budget after the
+/// first frame that waited for it (`VICTORY_PIPELINE_WAIT_AGAIN_MS`; unset:
+/// [`wait_budget`] every frame, as before). Not for passes over the screen.
+fn wait_again_budget() -> Option<Duration> {
+    static BUDGET: OnceLock<Option<Duration>> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let raw = std::env::var("VICTORY_PIPELINE_WAIT_AGAIN_MS").ok();
+        let budget = parse_wait_again_ms(raw.as_deref())?;
+        tracing::info!(
+            millis = budget.as_millis() as u64,
+            "host pipeline wait budget after its first frame"
+        );
+        Some(budget)
+    })
+}
+
+fn budget_for(first_wait: u64, frame: u64, full: Duration, again: Option<Duration>) -> Duration {
+    if first_wait == 0 || first_wait == frame.wrapping_add(1) {
+        full
+    } else {
+        again.unwrap_or(full)
+    }
+}
+
+fn apply_again_budget(
+    first_wait: &AtomicU64,
+    frame: u64,
+    available: Duration,
+    full: Duration,
+    again: Option<Duration>,
+) -> Duration {
+    let Some(again) = again.filter(|_| !available.is_zero()) else {
+        return available;
+    };
+    let mine = frame.wrapping_add(1);
+    let first = match first_wait.compare_exchange(0, mine, Ordering::Relaxed, Ordering::Relaxed) {
+        Ok(_) => mine,
+        Err(first) => first,
+    };
+    available.min(budget_for(first, frame, full, Some(again)))
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
@@ -352,9 +401,10 @@ fn wait(p: &Pending, frame: u64) {
     static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
     static DEADLINES: [Mutex<FrameDeadline>; 2] = [const { Mutex::new(FrameDeadline(None)) }; 2];
     let spent_of = &SPENT[usize::from(screen)];
+    let again = if screen { None } else { wait_again_budget() };
     let shared = shared_budget();
     let started = Instant::now();
-    let left = if shared {
+    let available = if shared {
         DEADLINES[usize::from(screen)]
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -367,6 +417,7 @@ fn wait(p: &Pending, frame: u64) {
         }
         budget.saturating_sub(spent.1).min(own)
     };
+    let left = apply_again_budget(&p.first_wait, frame, available, budget, again);
     if left.is_zero() {
         return;
     }
@@ -671,7 +722,7 @@ mod tests {
 
         assert!(!super::super::library::wanted_early(&p.key));
         assert!(ready(&p).is_none());
-        assert!(matches!(p.made.get(), Some(None)));
+        assert!(p.made.get().is_none());
         assert!(super::super::library::wanted_early(&p.key));
     }
 

@@ -164,10 +164,12 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                let misses_before = crate::shader_cache::counts().1;
                 let done = {
                     let _translation = crate::timeline::span("pipeline: translate a shader");
                     translate(&self.container)
                 };
+                let translated_live = crate::shader_cache::counts().1 > misses_before;
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
@@ -184,12 +186,19 @@ impl Shader {
                     KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
                 match &done {
-                    Ok(t) => tracing::info!(
+                    Ok(t) if translated_live => tracing::info!(
                         stage = self.stage,
                         hash = %self.hash,
                         user_data = t.host.user_data.len(),
                         samplers = t.host.samplers.len(),
                         "shader translated"
+                    ),
+                    Ok(t) => tracing::debug!(
+                        stage = self.stage,
+                        hash = %self.hash,
+                        user_data = t.host.user_data.len(),
+                        samplers = t.host.samplers.len(),
+                        "shader loaded from cache"
                     ),
                     Err(e) => tracing::warn!(
                         stage = self.stage,
@@ -563,7 +572,32 @@ fn skip_raymarched_local_lights() -> bool {
         if builder {
             return std::env::var_os("VICTORY_RAYMARCHED_LOCAL_LIGHTS").is_some_and(|v| v == "0");
         }
-        std::env::var_os("VICTORY_RAYMARCHED_LOCAL_LIGHTS").is_none_or(|v| v == "0")
+        // Without a BVH, raymarched local lights march unoccluded through walls
+        // and cause blinding volumetric fog whiteout in sunlit interiors; opt in
+        // explicitly with `VICTORY_RAYMARCHED_LOCAL_LIGHTS=1`.
+        std::env::var_os("VICTORY_RAYMARCHED_LOCAL_LIGHTS").is_none_or(|v| v != "1")
+    })
+}
+
+/// Broken Wave32 water tiled lighting compute shaders (`CS_TransmissionVolumetrics_Tiled`
+/// and `_Tiled_LocalLights`): in Wave32 fallback mode they leave black rectangular tiles on
+/// open water and cost ~15 ms GPU/frame (trustno1-coder@35c15608 / fxceless README).
+/// Skipped by default on 32-lane hosts unless `VICTORY_WATER_LIGHT=1`.
+#[cfg(windows)]
+const WATER_LIGHT_HASHES: [&str; 2] = ["5dc3b25986622949", "6f225b641c5b0708"];
+
+#[cfg(windows)]
+fn skip_water_light() -> bool {
+    static SKIP: OnceLock<bool> = OnceLock::new();
+    *SKIP.get_or_init(|| {
+        let on = !std::env::var_os("VICTORY_WATER_LIGHT").is_some_and(|v| v == "1")
+            && victory_shader::emit::host_settings()[0] == 32;
+        if on {
+            tracing::info!(
+                "skipping broken Wave32 tiled water lighting shaders (VICTORY_WATER_LIGHT=1 enables them)"
+            );
+        }
+        on
     })
 }
 
@@ -587,6 +621,14 @@ fn matches_skip_prefix(container: &[u8]) -> bool {
 #[cfg(windows)]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
     if let Some(shader) = p.shaders.iter().find(|shader| shader.skip_name) {
+        return Some(shader.hash.as_str());
+    }
+    if skip_water_light()
+        && let Some(shader) = p
+            .shaders
+            .iter()
+            .find(|shader| WATER_LIGHT_HASHES.contains(&shader.hash.as_str()))
+    {
         return Some(shader.hash.as_str());
     }
     static HASHES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();

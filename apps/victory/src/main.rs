@@ -351,7 +351,8 @@ fn apply_nvidia_preset(run_console: Option<Console>) {
     };
     let rt_on = std::env::var("VICTORY_BVH_BUILDER").is_ok_and(|v| v == "1");
     // Shader-cache keys (shared by `shaders`, `warm`, and `run`).
-    set_default("VICTORY_SHADER_OPT", "63");
+    set_default("VICTORY_SHADER_OPT", "191");
+    set_default("VICTORY_SHADER_FAST_BITS", "24");
     set_default("VICTORY_WAVE_WIDE", "last");
     set_default("VICTORY_NAN_SCRUB", "1");
     set_default("VICTORY_PORT_CBV", "1");
@@ -382,6 +383,7 @@ fn apply_nvidia_preset(run_console: Option<Console>) {
         ("VICTORY_CARD_REHASH_RUNS", "1"),
         ("VICTORY_JOIN_COPIES", "1"),
         ("VICTORY_JOIN_BARRIERS", "1"),
+        ("VICTORY_JOIN_PARTS", "8"),
         ("VICTORY_INDIRECT_WINDOW", "1"),
         ("VICTORY_RELAY_COPY", "1"),
         ("VICTORY_INDIRECT_BATCH", "2"),
@@ -394,21 +396,28 @@ fn apply_nvidia_preset(run_console: Option<Console>) {
         ("VICTORY_D3D12_DRED", "light"),
         ("VICTORY_D3D12_BACKGROUND", "0"),
         ("VICTORY_MEMORY_MAP", "0"),
-        ("VICTORY_GUARD_HOT", "50"),
+        ("VICTORY_GUARD_HOT", "0"),
         ("VICTORY_WRITE_JOBS", "1"),
         ("VICTORY_WATCH_TEXTURES_JOINED", "1"),
         ("VICTORY_READBACK_POOL", "1"),
         ("VICTORY_BATCHED_SWEEP", "1"),
         ("VICTORY_PIPELINE_SAVE_ON_EXIT_ONLY", "1"),
         ("VICTORY_TABLES_EARLY", "1"),
-        ("VICTORY_DYNAMIC_SLOTS", "393216"),
+        ("VICTORY_DYNAMIC_SLOTS", "262144"),
         ("VICTORY_PIPELINE_LOWEST", "0"),
         ("VICTORY_PIPELINE_WORKERS", "8"),
         ("VICTORY_PIPELINE_WAIT_ONCE", "1"),
+        ("VICTORY_PIPELINE_WAIT_AGAIN_MS", "10"),
         ("VICTORY_TARGET_VARIANTS", "1"),
         ("VICTORY_NO_WATCHDOG", "1"),
         ("VICTORY_XMA_REFILL", "1"),
+        ("VICTORY_FILE_CACHE", "1"),
+        ("VICTORY_MAP_SAME", "1"),
+        ("VICTORY_HOLES_ONCE", "30"),
         ("VICTORY_PORT_CONSTANTS", "1"),
+        // Batch indirect clamps across Port 1 constants (cuts ~1,661 -> ~217 UAV
+        // barriers/frame on RTX 4090, verified visually clean).
+        ("VICTORY_PORT_CONSTANTS_ORDER_ALONE", "0"),
         // Renderer Port 2 (`VICTORY_PORT_DESCRIPTORS`) stays opt-in: 6 unpatched
         // writers (including external CRT/DLL memcpy) miss thousands of live view
         // records and corrupt one-shot NPC face bakes.
@@ -416,14 +425,14 @@ fn apply_nvidia_preset(run_console: Option<Console>) {
         ("VICTORY_PORT_JOURNAL", "1"),
         ("VICTORY_PORT_RT", "1"),
         ("VICTORY_FEED_ONE_CALL", "1"),
-        ("VICTORY_CARD_BUFFERS_MIN_KB", "64"),
+        ("VICTORY_CARD_BUFFERS_MIN_KB", "256"),
         ("VICTORY_WINDOWS_BAR_MB", "4096"),
         ("VICTORY_WINDOW_KB", "4096"),
-        ("VICTORY_SMALL_RECHECK", "0"),
+        ("VICTORY_SEND_BAR", "1"),
         ("VICTORY_ASYNC_SUBMIT", "1"),
+        ("VICTORY_LANE_CORE", "1"),
         ("VICTORY_THIN", "1"),
         ("VICTORY_THIN_THREADS", "8"),
-        ("VICTORY_JOIN_PARTS", "8"),
     ] {
         set_default(k, v);
     }
@@ -431,11 +440,12 @@ fn apply_nvidia_preset(run_console: Option<Console>) {
         set_default("VICTORY_SKIP_PREFIXES", "CS_RaytracingResolve");
         set_default("VICTORY_AMBIENT", "1.0");
         set_default("VICTORY_AMBIENT_AIR", "1.5");
-        set_default("VICTORY_AMBIENT_MOST", "3.0");
+        set_default("VICTORY_AMBIENT_MOST", "2.0");
+        set_default("VICTORY_AMBIENT_CLEAN", "1");
         set_default("VICTORY_AMBIENT_SHADE", "0.7,0.5");
         set_default("VICTORY_AMBIENT_REFL", "2.0");
-        set_default("VICTORY_AMBIENT_REFLECT", "1.0");
-        set_default("VICTORY_AMBIENT_REFLECT_LEAST", "0.35");
+        set_default("VICTORY_AMBIENT_REFLECT", "0.6");
+        set_default("VICTORY_AMBIENT_REFLECT_LEAST", "0.20");
     }
     let fsr_on = std::env::var("VICTORY_FSR_4K").is_ok_and(|v| !v.is_empty() && v != "0");
     if !fsr_on {

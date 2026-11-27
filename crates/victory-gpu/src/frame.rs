@@ -16,11 +16,16 @@
 //! would otherwise keep to its 30 with a limiter of its own.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::object::{HRESULT, S_FALSE, S_OK, This};
+
+/// What `GetFrameStatisticsX` answers for a frame not flipped yet.
+const E_FAIL: HRESULT = 0x8000_4005_u32 as HRESULT;
+const E_INVALIDARG: HRESULT = 0x8007_0057_u32 as HRESULT;
 
 /// What a wait returns when its time is up first.
 const TIMEOUT: HRESULT = S_FALSE;
@@ -204,6 +209,7 @@ pub(crate) extern "system" fn wait(
         // Tokens count frames (consecutive), not ticks.
         let frame = FRAME.fetch_add(1, Ordering::Relaxed) + 1;
         pace::begun();
+        issued(frame);
         if !token.is_null() {
             // SAFETY: checked non-null; the title passes its token.
             unsafe { token.write(frame) };
@@ -298,17 +304,95 @@ mod pace {
     }
 }
 
-/// Device method: no statistics are kept, so none are returned.
+/// The frames the title may ask about (`GetFrameStatisticsX`): a token's
+/// origin, taken when its origin wait handed it out, and its flip, taken
+/// at the `PresentX` that names it; both as the performance counter reads,
+/// like the title's own clock (avatarmanz#427 / fxceless#602).
+const KEPT: usize = 16;
+static ISSUED: Mutex<VecDeque<(u64, i64)>> = Mutex::new(VecDeque::new());
+static FLIPPED: Mutex<VecDeque<(u64, i64, i64)>> = Mutex::new(VecDeque::new());
+
+fn counter() -> i64 {
+    #[cfg(windows)]
+    {
+        let mut count = 0;
+        // SAFETY: a valid out pointer.
+        unsafe { windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut count) };
+        count
+    }
+    #[cfg(not(windows))]
+    {
+        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        START.get_or_init(Instant::now).elapsed().as_nanos() as i64
+    }
+}
+
+fn keep<T>(queue: &Mutex<VecDeque<T>>, item: T) {
+    let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+    q.push_back(item);
+    while q.len() > KEPT {
+        q.pop_front();
+    }
+}
+
+fn issued(token: u64) {
+    keep(&ISSUED, (token, counter()));
+}
+
+/// `PresentX` flipped the frame of `token` (0: a present without a frame).
+pub(crate) fn flipped(token: u64) {
+    if token == 0 {
+        return;
+    }
+    let origin = ISSUED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .rev()
+        .find(|&&(t, _)| t == token)
+        .map(|&(_, at)| at);
+    let now = counter();
+    keep(&FLIPPED, (token, origin.unwrap_or(now).min(now), now));
+}
+
+/// Device method: one record for a frame that was flipped (`{ u32 kind; ...;
+/// i64 origin @0x10; i64 flip @0x18 }`), `count` in/out. Enables Bink video
+/// buffers to recycle in strict presentation order instead of looping out of order.
 pub(crate) extern "system" fn statistics(
     _: This,
-    _token: u64,
-    _kinds: u32,
+    token: u64,
+    kind: u32,
     count: *mut u32,
-    _out: *mut u8,
+    out: *mut u8,
 ) -> HRESULT {
-    if !count.is_null() {
-        // SAFETY: checked non-null.
+    if count.is_null() || out.is_null() {
+        return E_INVALIDARG;
+    }
+    let flipped = FLIPPED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .rev()
+        .find(|&&(t, _, _)| t == token)
+        .map(|&(_, origin, flip)| (origin, flip));
+    // SAFETY: checked non-null; the title passes the room it has.
+    let room = unsafe { count.read() };
+    #[cfg(feature = "diagnostics")]
+    tracing::debug!(token, kind, room, answered = flipped.is_some(), "frame statistics");
+    let Some((origin, flip)) = flipped else {
+        // SAFETY: as above.
         unsafe { count.write(0) };
+        return E_FAIL;
+    };
+    if room < 1 {
+        return E_INVALIDARG;
+    }
+    // SAFETY: the title's record, at least 0x20 bytes for one.
+    unsafe {
+        count.write(1);
+        out.cast::<u32>().write_unaligned(kind);
+        out.add(0x10).cast::<i64>().write_unaligned(origin);
+        out.add(0x18).cast::<i64>().write_unaligned(flip);
     }
     S_OK
 }

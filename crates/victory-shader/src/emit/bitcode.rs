@@ -111,6 +111,26 @@ pub(crate) enum Cast {
     Bitcast = 11,
 }
 
+/// Fast-math flags written on 32-bit float binary operations when `opt::FAST`
+/// is set, as LLVM 3.7 bitcode encodes them: 1 unsafe algebra, 2 no NaNs,
+/// 4 no infinities, 8 no signed zeros, 16 allow reciprocal.
+/// Defaults to 24 (`nsz | arcp`) so NaN and infinity tests remain intact.
+pub fn fast_math_bits() -> u64 {
+    static BITS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BITS.get_or_init(|| {
+        std::env::var("VICTORY_SHADER_FAST_BITS")
+            .ok()
+            .and_then(|v| {
+                let v = v.trim();
+                match v.strip_prefix("0x") {
+                    Some(hex) => u64::from_str_radix(hex, 16).ok(),
+                    None => v.parse().ok(),
+                }
+            })
+            .map_or(24, |b| b & 0x1F)
+    })
+}
+
 /// Compare predicates: floats 0-15, integers 32-41.
 pub(crate) mod pred {
     pub const FALSE: u8 = 0;
@@ -825,6 +845,11 @@ impl Module {
         }
         w.exit();
 
+        let fast_bits = if super::shader_opt() & opt::FAST != 0 {
+            fast_math_bits()
+        } else {
+            0
+        };
         w.enter(FUNCTION_BLOCK, 4);
         w.record(1, &[layout.len() as u64]);
         let mut inst_id = base;
@@ -839,6 +864,11 @@ impl Module {
                     u64::from(inst_id - a)
                 };
                 match &inst.op {
+                    Op::Bin(op, a, b)
+                        if fast_bits != 0 && self.types[inst.ty.0 as usize] == TypeDef::Float =>
+                    {
+                        w.record(2, &[rel(*a), rel(*b), *op as u64, fast_bits])
+                    }
                     Op::Bin(op, a, b) => w.record(2, &[rel(*a), rel(*b), *op as u64]),
                     Op::Cast(op, v) => w.record(3, &[rel(*v), u64::from(inst.ty.0), *op as u64]),
                     Op::Cmp(p, a, b) => w.record(28, &[rel(*a), rel(*b), u64::from(*p)]),

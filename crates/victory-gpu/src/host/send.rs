@@ -116,6 +116,7 @@ pub(super) struct Memory {
     buffer: ID3D12Resource,
     data: usize,
     size: u64,
+    on_card: bool,
 }
 
 // SAFETY: a D3D12 object (free-threaded) and its mapping, with one owner.
@@ -136,7 +137,7 @@ fn kept() -> u64 {
 /// submitting thread 8-9 ms a frame instead of 3 (73-93 MB, run card-3 against
 /// card-1), so it is a loss while the card waits for that thread: off by
 /// default.
-fn on_card() -> bool {
+pub(super) fn on_card() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_BAR").is_some_and(|v| v == "1"))
 }
@@ -153,6 +154,7 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
     // submissions send differs from frame to frame.
     let size = size.max(8 << 20).next_power_of_two();
     let mapped = if on_card() { host.mapped_card_buffer(size, false) } else { None };
+    let placed_on_card = mapped.is_some();
     let (buffer, data) = match mapped {
         Some(made) => made,
         None => host.upload_buffer(size)?,
@@ -162,6 +164,7 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
         buffer,
         data: data as usize,
         size,
+        on_card: placed_on_card,
     })
 }
 
@@ -262,6 +265,11 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
 }
 
 impl Own {
+    /// Whether this submission's upload memory actually resides in VRAM (ReBAR).
+    pub(super) fn on_card(&self) -> bool {
+        self.memory.on_card
+    }
+
     /// Records the sends into `list`; the copies that `looked` says are in
     /// `COPY_DEST`, the others in the common state. Those with a "before" are
     /// left readable by compute shaders.

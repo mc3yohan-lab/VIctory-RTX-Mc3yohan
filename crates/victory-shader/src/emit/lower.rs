@@ -32,6 +32,11 @@ mod halves;
 
 type Why = &'static str;
 
+/// `DB_SHADER_CONTROL` bits: the program exports depth (`Z_EXPORT_ENABLE`);
+/// depth and stencil are tested before it runs (`DEPTH_BEFORE_SHADER`).
+const Z_EXPORT: u32 = 1;
+const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+
 /// How an interpolation evaluates an input channel.
 #[derive(Debug, Clone, Copy)]
 enum Eval {
@@ -446,6 +451,8 @@ enum MaskData {
 
 /// What a value holding a lane mask read as a number stops with.
 pub(super) const LANE_MASK: Why = "a lane mask read as data";
+/// A lane test of a constant mask where host lanes are not the console's.
+pub(super) const CONSTANT_MASK: Why = "a constant lane mask";
 pub(super) const DIVERGENT_MASK_EXCHANGE: Why = "a lane mask exchanged where not every lane runs";
 /// A mask with lanes outside EXEC where it is written, read as a number where the lanes that
 /// run that block are not all of the wave.
@@ -1973,6 +1980,27 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// Where a program's constant table starts in its code: where its
+/// instructions end, unless a load at a fixed offset reads below that (then
+/// at `lowest`, the lowest offset any load or descriptor names).
+fn code_table_start(p: &Program, addresses: &[&Address], lowest: u32) -> u32 {
+    let code_end = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .map(|i| i.machine.offset + 4 * i.machine.words.len())
+        .max()
+        .unwrap_or(0) as u32;
+    let fixed_below = addresses
+        .iter()
+        .any(|a| a.dynamic.is_none() && a.offset < code_end);
+    if fixed_below {
+        lowest
+    } else {
+        lowest.max(code_end & !3)
+    }
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -1985,6 +2013,18 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        // `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` (bit 12): the console tests
+        // depth and stencil before the program runs. Without `[earlydepthstencil]`,
+        // hosts test late when a pixel shader writes UAVs, letting glass pre-pass
+        // write velocity/depth behind foreground characters' heads.
+        if let StageIo::Ps {
+            db_shader_control, ..
+        } = x.native.io
+            && db_shader_control & DEPTH_BEFORE_SHADER != 0
+            && db_shader_control & Z_EXPORT == 0
+        {
+            s.flags |= flags::EARLY_DEPTH;
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -2340,22 +2380,26 @@ impl<'a> Lower<'a> {
         let (g, base, len) = match self.code_table {
             Some(t) => t,
             None => {
-                let first = self
+                let addresses: Vec<&Address> = self
                     .x
                     .res
                     .scalar
                     .iter()
-                    .map(|s| s.1)
+                    .map(|s| &s.1)
                     .chain(self.x.res.descriptors.iter().flat_map(|d| {
                         d.source.leaves().into_iter().filter_map(|l| match l {
-                            Source::Built { address, .. } => Some(*address),
+                            Source::Built { address, .. } => Some(address),
                             _ => None,
                         })
                     }))
                     .filter(|a| a.param == CODE)
+                    .collect();
+                let lowest = addresses
+                    .iter()
                     .map(|a| a.offset & !3)
                     .min()
                     .ok_or("a code table")?;
+                let first = code_table_start(self.x.p, &addresses, lowest);
                 let code = &self.x.native.code;
                 let words: Vec<u32> = code
                     .get(first as usize..)
@@ -4748,6 +4792,24 @@ impl<'a> Lower<'a> {
         let cur = self.cur;
         let fused = self.fmad(a, b, c);
         let zero = self.s.m.f32(0);
+        if host_rdna() & super::rdna::LEGACY != 0 {
+            let (fa, fb) = (self.s.m.bounded(a, 12).is_some(), self.s.m.bounded(b, 12).is_some());
+            let not_zero = |l: &Self, x: V| l.s.m.float_k(x).is_some_and(|k| k != 0.0 && k.is_finite());
+            if a == b || fa && fb || not_zero(self, a) || not_zero(self, b) {
+                return fused;
+            }
+            let asked = match (fa, fb) {
+                (true, _) => a,
+                (_, true) => b,
+                _ => {
+                    let (a, b) = (self.unary(6, a), self.unary(6, b));
+                    self.binary(36, a, b)
+                }
+            };
+            let z = self.s.m.cmp(cur, pred::OEQ, asked, zero);
+            let addend = self.s.m.bin(cur, Bin::Add, zero, c);
+            return self.s.m.select(cur, z, addend, fused);
+        }
         let az = self.s.m.cmp(cur, pred::OEQ, a, zero);
         let bz = self.s.m.cmp(cur, pred::OEQ, b, zero);
         let z = self.s.m.bin(cur, Bin::Or, az, bz);
@@ -4848,7 +4910,7 @@ impl<'a> Lower<'a> {
                 Ok(self.lane_bit(at, lo, Some(hi)))
             }
             Atom::Opaque(_) => Err("an opaque lane mask"),
-            Atom::Constant(_) => Err("a constant lane mask"),
+            Atom::Constant(_) => Err(CONSTANT_MASK),
         }
     }
 
@@ -6730,7 +6792,8 @@ impl<'a> Lower<'a> {
                     _ => pred::SGT,
                 };
                 let t = self.s.m.cmp(c, p, a, b);
-                (self.s.m.select(c, t, a, b), None)
+                // SCC is whether S0 was chosen (S0 < S1, S0 > S1), not D != 0.
+                (self.s.m.select(c, t, a, b), Some(t))
             }
             "s_abs_i32" => {
                 let a = src32(self, 0)?;
@@ -9703,7 +9766,16 @@ impl<'a> Lower<'a> {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
-                if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
+                let host_lane = self.mask_data == MaskData::Host && !matches!(lane, V::Const(_));
+                // The console reads lane S1[4:0] (wave32) or S1[5:0] (wave64): a select
+                // past the wave wraps.
+                let lane = if host_lane {
+                    lane
+                } else {
+                    let wm = self.s.m.i32(self.wave() - 1);
+                    self.s.m.bin(self.cur, Bin::And, lane, wm)
+                };
+                if host_lane {
                     self.s.flags |= flags::WAVE_OPS;
                 } else {
                     self.cross_lane(false)?;
@@ -9762,6 +9834,9 @@ impl<'a> Lower<'a> {
                     return Err("a lane write in a half-wave");
                 }
                 let me = self.console_lane();
+                // The lane is S1[4:0] (wave32) or S1[5:0] (wave64), as for `v_readlane_b32`.
+                let wm = self.s.m.i32(self.wave() - 1);
+                let lane = self.s.m.bin(c, Bin::And, lane, wm);
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
@@ -13171,7 +13246,16 @@ impl<'a> Lower<'a> {
         if let Some(g) = guard
             && !mesh
         {
-            if !(e.done && self.s.pixel) {
+            // A pixel's colour export before its last one, under the same EXEC: the lanes
+            // outside it are killed at the last one (a lane of a live quad that runs on as a
+            // helper gets here too, [`crate::structure`]).
+            let same_as_done = self.s.pixel
+                && !e.done
+                && (i + 1..self.x.p.blocks[b].insts.len()).any(|k| {
+                    self.exports.get(&(b, k)).is_some_and(|d| d.done)
+                        && self.x.st.guards[b][k] == self.x.st.guards[b][i]
+                });
+            if !(e.done && self.s.pixel || same_as_done) {
                 return Err("a conditional export");
             }
             let t = self.s.m.bool(true);
@@ -13814,13 +13898,31 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+    use super::{Lowered, Numeric, Parts, buffer_format, code_table_start, half_shift, lower};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn the_code_table_starts_after_the_instructions() {
+        let mut words = vec![0xBF80_0000, S_ENDPGM];
+        words.extend(0..1000u32);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 256).unwrap();
+        let at = |offset: u32, dynamic: bool| resource::Address {
+            param: resource::CODE,
+            offset,
+            dynamic: dynamic.then_some(ir::Value(0)),
+        };
+        let (computed, fixed_after, fixed_inside) = (at(0, true), at(12, false), at(4, false));
+        assert_eq!(code_table_start(&p, &[&computed], 0), 8);
+        assert_eq!(code_table_start(&p, &[&computed, &fixed_after], 0), 8);
+        assert_eq!(code_table_start(&p, &[&computed, &fixed_inside], 0), 0);
+        assert_eq!(code_table_start(&p, &[&fixed_after], 12), 12);
+    }
 
     #[test]
     fn shifted_thread_ids_are_uniform_only_when_every_lane_agrees() {

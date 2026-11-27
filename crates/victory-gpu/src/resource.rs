@@ -153,9 +153,9 @@ pub(crate) fn element(format: u32) -> Option<(u64, u64)> {
         1..=4 => (16, 1),
         5..=8 => (12, 1),
         9..=22 => (8, 1),
-        23..=47 | 67 | 87..=93 | 116 | 117 | 189 | 191 => (4, 1),
+        23..=47 | 67 | 87..=93 | 116 | 117 | 189 => (4, 1),
         118..=120 => (3, 1),
-        48..=59 | 68 | 69 | 85 | 86 | 115 => (2, 1),
+        48..=59 | 68 | 69 | 85 | 86 | 115 | 191 => (2, 1),
         60..=65 | 190 => (1, 1),
         70..=72 | 79..=81 => (8, 4),
         73..=78 | 82..=84 | 94..=99 => (16, 4),
@@ -1859,6 +1859,18 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     }
 }
 
+/// Whether `bytes` more stay within 95 % of the card's DXGI memory budget by
+/// actual usage alone (fxceless#1422): lets skin-bake source uploads succeed
+/// during world load even while `room()` reserves up to 4.3 GB for future copies.
+#[cfg(windows)]
+pub(crate) fn within_budget(bytes: u64) -> bool {
+    let memory = crate::host::host().and_then(|h| h.video_memory());
+    match memory {
+        Some([budget, used, ..]) => used.saturating_add(bytes) < budget / 100 * 95,
+        None => room(memory),
+    }
+}
+
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
 /// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072; 0: none, as
@@ -2896,6 +2908,7 @@ impl Drop for Resource {
         // in it, under its lock.
         if self.desc.dimension != BUFFER {
             let address = std::ptr::from_ref::<Resource>(self) as usize;
+            crate::ambient::released(address);
             crate::texback::released(address);
             crate::texlate::gone(address);
             textures().remove(&address);
@@ -3257,6 +3270,115 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     }
     map.insert((address, *desc), out as usize);
     crate::texture::placed_in_host_written(address, desc);
+    resource(out)
+        .host
+        .placed
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    Some(out)
+}
+
+/// The resource for an unordered access view of a texture placed at `address`
+/// with resource description `desc` and view format `view_format` (0: the
+/// resource's own): reuses an existing compatible unordered-access texture in
+/// `TARGETS_AT`, else creates a placed UAV texture starting in
+/// `UNORDERED_ACCESS` so paired placed SRVs find its texels via `alias_of`
+/// (`cool_fox#72` / `NetherySiloX`).
+#[cfg(windows)]
+pub(crate) fn uav_texture_at(address: u64, desc: &[u32; 14], view_format: u32) -> Option<This> {
+    const DEPTH: u32 = 0x2;
+    const UNORDERED: u32 = 0x4;
+    const UNORDERED_ACCESS: u32 = 0x8;
+    const DEFAULT: HeapProperties = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 1,
+        visible_nodes: 1,
+    };
+    if address == 0 {
+        return None;
+    }
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    if d.dimension == BUFFER {
+        return None;
+    }
+    let own = pc_format(d.format);
+    let wanted = if view_format == 0 {
+        own
+    } else {
+        pc_format(view_format)
+    };
+    let mut r = *desc;
+    r[1] = 0;
+    r[13] = 0;
+    r[12] = (r[12] & !DEPTH) | UNORDERED;
+    if view_format != 0 && target_format(own) != target_format(wanted) {
+        if family(own) == family(wanted) {
+            r[8] = family(wanted);
+        } else if element(own) == element(wanted) {
+            r[8] = wanted;
+        }
+    }
+    // Always lock `PLACED_TEXTURES` before `TARGETS_AT` to preserve lock order.
+    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&existing) = map.get(&(address, r)) {
+        TARGETS_AT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(address)
+            .or_insert(existing);
+        return Some(existing as This);
+    }
+    {
+        let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&other) = targets.get(&address)
+            && crate::object::add_ref_alive(other as This)
+        {
+            let o = resource(other as This);
+            let o_fmt = target_format(pc_format(o.desc.format));
+            let w_fmt = target_format(wanted);
+            let typeless = family(o_fmt) == o_fmt && family(o_fmt + 1) == o_fmt;
+            let srgb = SRGB.iter().any(|&(s, _)| s == o_fmt);
+            let compatible =
+                o_fmt == w_fmt || ((typeless || srgb) && family(w_fmt) == family(o_fmt));
+            let matches = o.desc.dimension == d.dimension
+                && o.desc.width == d.width
+                && o.desc.height == d.height
+                && o.desc.mip_levels == d.mip_levels
+                && o.desc.depth_or_array_size == d.depth_or_array_size
+                && o.desc.sample_count <= 1
+                && d.sample_count <= 1
+                && o.desc.flags & (DEPTH | UNORDERED) == UNORDERED
+                && compatible;
+            drop(targets);
+            if matches {
+                // Keep the pinned COM reference cached in `PLACED_TEXTURES` so
+                // returned `View::Unordered` handles never dangle if the title
+                // releases its own reference on another thread.
+                map.insert((address, r), other);
+                return Some(other as This);
+            }
+            resource_release(other as This);
+        }
+    }
+    // SAFETY: 56 bytes in the description's layout.
+    let uav_desc = unsafe { r.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    let mut out = std::ptr::null();
+    let made = hand_out_resource(
+        uav_desc,
+        DEFAULT,
+        0,
+        Backing::Address(address as *mut u8),
+        UNORDERED_ACCESS,
+        std::ptr::null(),
+        &RESOURCE_IIDS[0],
+        &mut out,
+    );
+    if made != S_OK {
+        return None;
+    }
+    map.insert((address, r), out as usize);
     resource(out)
         .host
         .placed

@@ -1419,7 +1419,7 @@ fn take_batch_buffer(size: u64) -> Option<ID3D12Resource> {
     if let Some(BatchBuf(buf)) = SPARE_BATCH.lock().unwrap_or_else(|e| e.into_inner()).pop() {
         return Some(buf);
     }
-    let made = host()?.uav_buffer(size)?;
+    let made = host()?.uav_buffer_internal(size)?;
     name(&made, || format!("indirect batches {size:#x}"));
     Some(made)
 }
@@ -1642,24 +1642,14 @@ float plane(float4 p : SV_Position) : SV_Depth {
 }
 "#;
 
-/// Views of twins the pass reads, in a heap of ours used as a ring.
-/// Sized at 8,192 (up from 256) so mid-list `planes_now` passes never wrap
-/// around while older lists are still in flight (ported from VIctory-RTX3090).
-const PLANE_VIEWS: u32 = 8192;
-
-/// Since the start: times the `PLANE_VIEWS` ring wrapped, and max views per pass.
+/// Since the start: times the `PLANE_VIEWS` ring wrapped (0 with per-list heaps), and max views per pass.
 pub(crate) static PLANE_WRAPS: [std::sync::atomic::AtomicU64; 2] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
-/// What the pass draws with: the heap of its views of twins, and per kind
-/// of twin (16-bit steps or floats) and depth format the root signature
-/// and pipeline, made when first needed (`None`: the host refused).
+/// Cached pipeline objects. Shader-visible descriptors belong to the individual
+/// recorded pass (`HostList::keep`) instead of a global ring so late or
+/// repeated list submissions never observe wrapped descriptors (`spk/Vice-Tay@14a714f5`).
 struct PlanePass {
-    views: ID3D12DescriptorHeap,
-    cpu: usize,
-    gpu: u64,
-    step: u32,
-    next: AtomicU32,
     made: Mutex<Vec<(bool, i32, Option<PlanePipeline>)>>,
 }
 
@@ -1673,32 +1663,11 @@ unsafe impl Send for PlanePass {}
 unsafe impl Sync for PlanePass {}
 
 fn plane_pass() -> Option<&'static PlanePass> {
-    static PASS: OnceLock<Option<PlanePass>> = OnceLock::new();
-    PASS.get_or_init(|| {
-        let host = host()?;
-        let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        // SAFETY: plain heap creation and queries.
-        unsafe {
-            let views: ID3D12DescriptorHeap = host
-                .device
-                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: kind,
-                    NumDescriptors: PLANE_VIEWS,
-                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                    NodeMask: 0,
-                })
-                .ok()?;
-            Some(PlanePass {
-                cpu: views.GetCPUDescriptorHandleForHeapStart().ptr,
-                gpu: views.GetGPUDescriptorHandleForHeapStart().ptr,
-                step: host.device.GetDescriptorHandleIncrementSize(kind),
-                views,
-                next: AtomicU32::new(0),
-                made: Mutex::default(),
-            })
-        }
-    })
-    .as_ref()
+    static PASS: OnceLock<PlanePass> = OnceLock::new();
+    host()?;
+    Some(PASS.get_or_init(|| PlanePass {
+        made: Mutex::default(),
+    }))
 }
 
 /// Compiles function `entry` of `source` for `target` with the system's
@@ -1826,10 +1795,11 @@ impl PlanePass {
 /// scissor and topology and puts none of them back: it is for a list that
 /// records nothing of the title's after it.
 fn record_plane_pass(
-    list: &ID3D12GraphicsCommandList,
+    owner: &HostList,
     depth: &ID3D12Resource,
     plane: &ID3D12Resource,
 ) -> bool {
+    let list = &owner.list;
     let (Some(host), Some(pass)) = (host(), plane_pass()) else {
         return false;
     };
@@ -1847,14 +1817,42 @@ fn record_plane_pass(
     let Some((root, pipeline)) = pass.pipeline(steps, format) else {
         return false;
     };
-    PLANE_WRAPS[1].fetch_max(u64::from(of.DepthOrArraySize) * u64::from(of.MipLevels), Ordering::Relaxed);
+    let count = u32::from(of.DepthOrArraySize) * u32::from(of.MipLevels);
+    if count == 0 {
+        return false;
+    }
+    PLANE_WRAPS[1].fetch_max(u64::from(count), Ordering::Relaxed);
+    let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    // SAFETY: plain heap creation; retained by `owner` through all submissions.
+    let views: ID3D12DescriptorHeap = match unsafe {
+        host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: kind,
+            NumDescriptors: count,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NodeMask: 0,
+        })
+    } {
+        Ok(heap) => heap,
+        Err(e) => {
+            tracing::error!(error = %e, count, "no descriptor heap for depth plane pass");
+            return false;
+        }
+    };
+    owner.keep(&views);
+    owner.keep(depth);
+    owner.keep(plane);
+    // SAFETY: live heap, open list.
+    let (base_cpu, base_gpu, step) = unsafe {
+        list.SetDescriptorHeaps(&[Some(views.clone())]);
+        (
+            views.GetCPUDescriptorHandleForHeapStart().ptr,
+            views.GetGPUDescriptorHandleForHeapStart().ptr,
+            host.device.GetDescriptorHandleIncrementSize(kind),
+        )
+    };
     for slice in 0..u32::from(of.DepthOrArraySize) {
         for mip in 0..u32::from(of.MipLevels) {
-            let taken = pass.next.fetch_add(1, Ordering::Relaxed);
-            if taken > 0 && taken.is_multiple_of(PLANE_VIEWS) {
-                PLANE_WRAPS[0].fetch_add(1, Ordering::Relaxed);
-            }
-            let slot = taken % PLANE_VIEWS;
+            let slot = slice * u32::from(of.MipLevels) + mip;
             let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: DXGI_FORMAT(if steps { 57 } else { 41 }),
                 ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
@@ -1884,17 +1882,15 @@ fn record_plane_pass(
             let target = host.dsv(depth, Some(&target));
             let (width, height) = ((of.Width >> mip).max(1) as u32, (of.Height >> mip).max(1));
             let cpu = D3D12_CPU_DESCRIPTOR_HANDLE {
-                ptr: pass.cpu + (slot * pass.step) as usize,
+                ptr: base_cpu + slot as usize * step as usize,
             };
             let gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
-                ptr: pass.gpu + u64::from(slot * pass.step),
+                ptr: base_gpu + u64::from(slot) * u64::from(step),
             };
-            // SAFETY: an open list; a slot of our heap; live resources and
-            // objects (the pass's own live as long as the process).
+            // SAFETY: an open list; a slot of our heap; live resources kept by `owner`.
             unsafe {
                 host.device
                     .CreateShaderResourceView(plane, Some(&view), cpu);
-                list.SetDescriptorHeaps(&[Some(pass.views.clone())]);
                 list.SetGraphicsRootSignature(&root);
                 list.SetPipelineState(&pipeline);
                 list.SetGraphicsRootDescriptorTable(0, gpu);
@@ -2204,8 +2200,9 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 /// lists put a few constants or a rectangle's corners there, and every
 /// list that did took 4 MiB of the PC's memory for it.
 const SCRATCH_FIRST: u64 = 256 << 10;
-/// The most bytes of chunks kept while no list holds them.
-const SPARE_MOST: u64 = 128 << 20;
+/// The most bytes of chunks kept while no list holds them (512 MiB avoids
+/// per-frame 4 MiB upload-buffer churn).
+const SPARE_MOST: u64 = 512 << 20;
 /// The same with [`keep_freed`].
 const SPARE_KEPT: u64 = 1 << 30;
 
@@ -3521,7 +3518,7 @@ pub(crate) fn joins() -> (usize, usize) {
 fn joins_asked() -> (usize, usize) {
     static MOST: OnceLock<(usize, usize)> = OnceLock::new();
     let of = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<usize>().ok());
-    let (parts, lists) = *MOST.get_or_init(|| (of("VICTORY_JOIN_PARTS").unwrap_or(1).max(1), of("VICTORY_JOIN_LISTS").unwrap_or(48).max(1)));
+    let (parts, lists) = *MOST.get_or_init(|| (of("VICTORY_JOIN_PARTS").unwrap_or(1).max(1), of("VICTORY_JOIN_LISTS").unwrap_or(128).max(1)));
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_JOIN_PARTS") {
         return (if on { 8 } else { 1 }, lists);
@@ -4286,7 +4283,7 @@ mod late_tests {
 /// only the copy that held it did.
 fn join_copies() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line: title buffer copies recorded, and those
@@ -4864,8 +4861,9 @@ impl Host {
                     if let Some(own) = &own {
                         // With `upq`: the submission's own memory (the PC's)
                         // comes whole into a buffer of ours in the card's on
-                        // the copy queue; the sends come from there.
-                        if looks.is_none() && upq::on() {
+                        // the copy queue; skip when `VICTORY_SEND_BAR=1`
+                        // already placed `own` directly in VRAM.
+                        if looks.is_none() && upq::on() && !own.on_card() {
                             let (memory, used) = own.source();
                             up = upq::send(self, &self.queue, &[(memory, 0, memory, used)], |_, _, _| {});
                         }
@@ -5336,7 +5334,7 @@ impl Host {
         };
         if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
             let size = total.next_multiple_of(16 << 20);
-            f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+            f.buffer = self.shared_buffer_internal(size).map(|(buffer, data)| (buffer, data as usize, size));
         }
         let Some((buffer, data, _)) = f.buffer.clone() else {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
@@ -5435,15 +5433,16 @@ impl Host {
                     }
                 }
                 let mut notes = land::Notes::default();
+                let mut merged = 0;
                 for run in pieces[jobs[j].clone()].chunk_by(|a, b| std::sync::Arc::ptr_eq(&a.0, &b.0)) {
-                    let addressed: Vec<(usize, usize, usize)> =
-                        run.iter().map(|(_, lo, hi, at)| (*lo, *hi, data + *at as usize)).collect();
+                    let addressed = run.iter().map(|(_, lo, hi, at)| (*lo, *hi, data + *at as usize));
                     // SAFETY: the mapping of the fetched bytes, `total` of
                     // them; the copy into it has run, and the next waits
                     // for this call.
-                    put.fetch_add(unsafe { run[0].0.land_card(&addressed, after, &mut notes) }, Ordering::Relaxed);
+                    merged += unsafe { run[0].0.land_card(addressed, after, &mut notes) };
                 }
                 notes.flush();
+                put.fetch_add(merged, Ordering::Relaxed);
                 land::spent(land::stat::CARD_ALL, working);
             });
             land::count(land::stat::JOBS, jobs.len() as u64);
@@ -5673,7 +5672,7 @@ impl Host {
         if !pieces.is_empty() {
             if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
                 let size = total.next_multiple_of(16 << 20);
-                work.fetched = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+                work.fetched = self.shared_buffer_internal(size).map(|(buffer, data)| (buffer, data as usize, size));
             }
             let Some((fetched, data, _)) = &work.fetched else {
                 fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes)"));
@@ -7265,7 +7264,7 @@ impl HostList {
         let Some(plane) = &twin.plane else { return false };
         self.settle(depth, DEPTH_WRITE);
         self.settle(plane, PIXEL_SHADER_RESOURCE);
-        let drawn = record_plane_pass(&self.list, &depth.texture, &plane.texture);
+        let drawn = record_plane_pass(self, &depth.texture, &plane.texture);
         self.settle(plane, UNORDERED_ACCESS);
         drawn
     }
@@ -7905,7 +7904,7 @@ impl HostList {
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
+                let (b, d) = host()?.shared_buffer_internal(256)?;
                 Some((b, d as usize))
             })
             .as_ref()?;
@@ -7949,7 +7948,7 @@ impl HostList {
             return None;
         }
         self.list.cast::<ID3D12GraphicsCommandList2>().ok()?;
-        let buffer = host()?.uav_buffer(256)?;
+        let buffer = host()?.uav_buffer_internal(256)?;
         name(&buffer, || "indirect budget".to_owned());
         Some(buffer)
     }
@@ -8030,7 +8029,7 @@ impl HostList {
             .saturating_mul(2)
             .max(needed)
             .next_multiple_of(64 << 10);
-        let buffer = host()?.uav_buffer(alloc)?;
+        let buffer = host()?.uav_buffer_internal(alloc)?;
         name(&buffer, || format!("indirect arguments {alloc:#x}"));
         let old = slot.replace((buffer.clone(), alloc));
         drop(slot);
@@ -9756,13 +9755,14 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// reads). What the runtime's record says is mapped is read in one go each,
 /// and by pieces where that fails; memory it has no record of by pieces.
 pub(crate) fn read_there(src: *const u8, dst: &mut [u8]) -> usize {
-    dst.fill(0);
     let (start, len) = (src as usize, dst.len());
     let mut got = 0;
     let mut runs = crate::inplace::shown_runs(start, len);
     if runs.is_empty() {
         runs.push((start, len));
     }
+    // Zero only gaps uncovered by mapped runs (cool_fox#47: saves full-buffer memset).
+    zero_between(dst, start, &runs);
     for (at, n) in runs {
         let piece = &mut dst[at - start..at - start + n];
         if read_into(at as *const u8, piece) {
@@ -9789,6 +9789,19 @@ pub(crate) fn read_there(src: *const u8, dst: &mut [u8]) -> usize {
         });
     }
     got
+}
+
+/// Zeros only bytes of `dst` uncovered by `runs` (cool_fox#47).
+fn zero_between(dst: &mut [u8], start: usize, runs: &[(usize, usize)]) {
+    let mut done = 0;
+    for &(at, n) in runs {
+        let from = at - start;
+        if from > done {
+            dst[done..from].fill(0);
+        }
+        done = done.max(from + n);
+    }
+    dst[done..].fill(0);
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
@@ -10105,11 +10118,12 @@ impl Meter {
     /// Record a frame once the swap chain has accepted it.
     fn record_present(&mut self, hwnd: HWND, status: windows::core::HRESULT) -> bool {
         use windows::Win32::Foundation::S_OK;
+        const DXGI_STATUS_OCCLUDED: windows::core::HRESULT = windows::core::HRESULT(0x087A_0001);
         if status != S_OK && status != self.last_present {
             tracing::warn!(?status, "swap chain did not present the frame");
         }
         self.last_present = status;
-        if status != S_OK {
+        if status != S_OK && status != DXGI_STATUS_OCCLUDED {
             return false;
         }
         self.frame(hwnd);
@@ -10323,11 +10337,6 @@ impl Meter {
                             t_bytes / 1e6
                         );
                     }
-                    let wraps = PLANE_WRAPS[0].load(Ordering::Relaxed);
-                    let most_views = PLANE_WRAPS[1].load(Ordering::Relaxed);
-                    if most_views > 0 {
-                        tracing::info!(wraps, most_views_a_pass = most_views, ring = PLANE_VIEWS, "depth planes ring stats");
-                    }
                 }
                 {
                     let mode = crate::watch::page_writes();
@@ -10463,11 +10472,13 @@ mod present_status_tests {
         let mut meter = Meter::new();
         let hwnd = HWND::default();
         assert!(meter.record_present(hwnd, S_OK));
-        assert!(!meter.record_present(hwnd, DXGI_STATUS_OCCLUDED));
+        // DXGI_STATUS_OCCLUDED (screen asleep/minimized) is a non-error status
+        // and still counts frames so `fps,` telemetry stays alive unattended.
+        assert!(meter.record_present(hwnd, DXGI_STATUS_OCCLUDED));
         assert!(!meter.record_present(hwnd, E_FAIL));
         assert!(!meter.record_present(hwnd, E_FAIL));
         assert!(meter.record_present(hwnd, S_OK));
-        assert_eq!(meter.frames, 2);
+        assert_eq!(meter.frames, 3);
         assert_eq!(meter.last_present, S_OK);
     }
 }
@@ -10988,12 +10999,13 @@ impl Host {
         };
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
+        let heap_flags = if wait { not_resident() } else { D3D12_HEAP_FLAG_NONE };
         // SAFETY: plain creation and mapping of a CPU-visible buffer.
         let made = unsafe {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    heap_flags,
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
@@ -11001,8 +11013,8 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
                     if wait {
+                        resident(&self.device, b)?;
                         mapped(&self.device)?;
                     }
                     b.Map(0, None, Some(&mut data))
@@ -11140,11 +11152,12 @@ impl Host {
             ..Default::default()
         };
         let mut buffer: Option<ID3D12Resource> = None;
+        let heap_flags = if wait { not_resident() } else { D3D12_HEAP_FLAG_NONE };
         // SAFETY: plain creation of a device-local buffer.
         let made = unsafe {
             self.device.CreateCommittedResource(
                 &heap,
-                not_resident(),
+                heap_flags,
                 &desc,
                 D3D12_RESOURCE_STATE_COMMON,
                 None,
@@ -11156,7 +11169,7 @@ impl Host {
             crate::book::made(b, || "an unordered access buffer".into());
         }
         let made = made
-            .and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b)))
+            .and_then(|()| if wait { buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b)) } else { Ok(()) })
             .and_then(|()| if wait { mapped(&self.device) } else { Ok(()) });
         match made {
             Ok(()) => buffer,
@@ -11785,7 +11798,7 @@ mod refresh_tests {
                         crate::land::each(parts.len(), &|i| {
                             let mut notes = crate::land::Notes::default();
                             // SAFETY: the bytes of `now`; each piece once.
-                            unsafe { c.shadow.land_card(parts[i], after, &mut notes) };
+                            unsafe { c.shadow.land_card(parts[i].iter().copied(), after, &mut notes) };
                             notes.flush();
                         });
                         for &(from, to) in &ranges {
@@ -12088,7 +12101,7 @@ mod refresh_tests {
                             pieces.iter().map(|p| (p * PAGE + 8, (p + 1) * PAGE - 8, now.as_ptr() as usize)).collect();
                         let mut notes = crate::land::Notes::default();
                         // SAFETY: the bytes of `now`; nothing else lands here.
-                        unsafe { lands.land_card(&pieces, 0, &mut notes) };
+                        unsafe { lands.land_card(pieces.iter().copied(), 0, &mut notes) };
                         notes.flush();
                     }
                     started.elapsed().as_secs_f64() * 1e3

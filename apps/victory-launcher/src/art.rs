@@ -29,12 +29,9 @@ pub fn cover_uv(tex_size: [usize; 2], target_rect: Rect) -> Rect {
     }
 }
 
-/// Carga `xbs_splash.png` o el mayor `xbs_logo_*.png` desde la carpeta local del
-/// juego (sin incluir jamás arte propietario en el repositorio).
-pub fn load_game_banner_texture(
-    ctx: &egui::Context,
-    game_dir: &Path,
-) -> Option<TextureHandle> {
+/// Decodifica y redimensiona `xbs_splash.png` (o el mayor `xbs_logo_*.png`) en
+/// CPU para ejecutarse en segundo plano sin bloquear jamás el arranque de la UI.
+pub fn load_game_banner_image(game_dir: &Path) -> Option<ColorImage> {
     let candidate = find_best_banner_image(game_dir)?;
     let img = image::open(&candidate).ok()?.to_rgba8();
     let (w, h) = img.dimensions();
@@ -50,8 +47,12 @@ pub fn load_game_banner_texture(
     } else {
         (w as usize, h as usize, img.into_raw())
     };
-    let color = ColorImage::from_rgba_unmultiplied([w, h], &raw);
-    Some(ctx.load_texture("victory_banner_art", color, TextureOptions::LINEAR))
+    Some(ColorImage::from_rgba_unmultiplied([w, h], &raw))
+}
+
+/// Sube a GPU una imagen ya decodificada por [`load_game_banner_image`].
+pub fn upload_banner_texture(ctx: &egui::Context, color: ColorImage) -> TextureHandle {
+    ctx.load_texture("victory_banner_art", color, TextureOptions::LINEAR)
 }
 
 fn find_best_banner_image(game_dir: &Path) -> Option<PathBuf> {

@@ -331,6 +331,9 @@ struct Flip {
     late: Option<u64>,
     /// When it was asked (`crate::host::now_ms`), for `crate::texlate`.
     asked: u64,
+    /// True when an ahead upload was skipped/failed so `apply_flips` re-queues
+    /// the slot instead of leaving it stuck on the 1x1 neutral gray placeholder.
+    requeue: bool,
 }
 
 /// Whether a title slot shows a texture that is new to it only once the
@@ -2694,10 +2697,24 @@ impl HostHeap {
             return;
         }
         let (heap, key) = (std::ptr::from_ref(self) as usize, record_key(handle));
+        let after = if show_new_later() {
+            job.begun_before().unwrap_or(0)
+        } else {
+            0
+        };
         let late = Some(crate::frame::current());
         let asked = crate::host::now_ms();
-        job.then(move || {
-            let flip = Flip { after: 0, heap, index, handle, key, late, asked };
+        job.then(move |ok| {
+            let flip = Flip {
+                after: if ok { after } else { 0 },
+                heap,
+                index,
+                handle,
+                key,
+                late,
+                asked,
+                requeue: !ok,
+            };
             FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
         });
     }
@@ -2725,7 +2742,7 @@ impl HostHeap {
         let asked = crate::host::now_ms();
         list.defer_host(move || {
             let after = crate::host::submissions().0;
-            let flip = Flip { after, heap, index, handle, key, late, asked };
+            let flip = Flip { after, heap, index, handle, key, late, asked, requeue: false };
             FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
         });
     }
@@ -2755,7 +2772,14 @@ impl HostHeap {
             }
         }
         let mut flipped = 0;
+        let mut failed_requeue = Vec::new();
         for f in ready {
+            if f.requeue {
+                if f.key != 0 && record_key(f.handle) == f.key {
+                    failed_requeue.push(f.index);
+                }
+                continue;
+            }
             let _made = self.made.lock(f.index);
             let Some(shown) = self.made.get(f.index) else {
                 continue;
@@ -2817,6 +2841,10 @@ impl HostHeap {
                     flipped += 1;
                 }
             }
+        }
+        if !failed_requeue.is_empty() {
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            textures.requeue(&failed_requeue, crate::frame::current());
         }
         FLIPPED[0].fetch_add(flipped as u64, Relaxed);
         flipped
@@ -3784,7 +3812,7 @@ impl HostHeap {
                     self.keep(index, kept);
                 }
                 let late = Some(crate::frame::current());
-                let flip = Flip { after, heap: std::ptr::from_ref(self) as usize, index, handle, key, late, asked: crate::host::now_ms() };
+                let flip = Flip { after, heap: std::ptr::from_ref(self) as usize, index, handle, key, late, asked: crate::host::now_ms(), requeue: false };
                 FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
                 NEW_LATER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 drop(held);
@@ -5021,6 +5049,11 @@ fn make_twinned(
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
+                if !*unordered {
+                    // Null/unallocated placed texture SRV (address=0 or not mapped yet):
+                    // silently write a typed null SRV instead of spamming UAV warnings.
+                    return None;
+                }
                 // shortcut: unordered access to a texture the title placed
                 // itself is not mirrored; give it a resource as shader
                 // views of such textures get when a dispatch writes one.
@@ -5435,20 +5468,31 @@ fn same_placed_texture(a: &View, b: &View) -> bool {
     }
 }
 
-/// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
+/// A shader or unordered access view of a texture the title placed in
+/// memory itself, as a view of the resource made for that memory (on first
+/// use).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
-    let View::Placed(false, resource, desc) = view else {
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    let &View::Placed(unordered, mut resource, ref desc) = view else {
         return None;
     };
     if resource[0] == BUFFER {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)?;
-    crate::resource::want_level(texture, crate::resource::first_mip(desc));
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    let words = desc[..10].try_into().ok();
+    if unordered {
+        let texture = crate::resource::uav_texture_at(address, &resource, desc[0])?;
+        Some(View::Unordered(texture as usize, 0, words))
+    } else {
+        // Clear target/depth/unordered flags left on the SRV's resource desc so
+        // this view never overwrites an existing target in `TARGETS_AT`.
+        resource[12] &= !TARGET_DEPTH_UNORDERED;
+        let texture = crate::resource::texture_at(address, &resource)?;
+        crate::resource::want_level(texture, crate::resource::first_mip(desc));
+        Some(View::Shader(texture as usize, words))
+    }
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host

@@ -241,15 +241,15 @@ impl Default for LauncherConfig {
             live_textures: true,
             video_planes: true,
             ambient_light: true,
-            ambient_most: 3.0,
-            ambient_reflect: 1.0,
+            ambient_most: 2.0,
+            ambient_reflect: 0.6,
             skip_rt_resolve: true,
             skip_raymarched_lights: true,
             port_rt: true,
             port_descriptors: false,
             thin_lists: TriState::Auto,
             ram_low_profile: TriState::Auto,
-            send_bar: false,
+            send_bar: true,
             wc_no_back: false,
             windows_bar_mb_override: 0,
             use_diag_build: false,
@@ -279,18 +279,20 @@ impl LauncherConfig {
                 self.live_textures = true;
                 self.video_planes = true;
                 self.ambient_light = true;
-                self.ambient_most = 3.0;
-                self.ambient_reflect = 1.0;
+                self.ambient_most = 2.0;
+                self.ambient_reflect = 0.6;
+                self.send_bar = true;
             }
             Preset::Fluid720p => {
-                self.console = ConsoleModel::SeriesS;
+                self.console = ConsoleModel::Auto;
                 self.output = OutputRes::P720;
-                self.render_scale = 0.667;
+                self.render_scale = 0.0;
                 self.fsr_4k = FsrQuality::Off;
                 self.skip_rt_resolve = true;
                 self.skip_raymarched_lights = true;
                 self.port_rt = true;
                 self.thin_lists = TriState::Auto;
+                self.send_bar = true;
             }
             Preset::Balanced1080p => {
                 self.console = ConsoleModel::Auto;
@@ -301,6 +303,7 @@ impl LauncherConfig {
                 self.skip_raymarched_lights = true;
                 self.port_rt = true;
                 self.thin_lists = TriState::Auto;
+                self.send_bar = true;
             }
             Preset::Native1080p => {
                 self.console = ConsoleModel::SeriesX;
@@ -311,6 +314,7 @@ impl LauncherConfig {
                 self.skip_raymarched_lights = true;
                 self.port_rt = true;
                 self.thin_lists = TriState::Auto;
+                self.send_bar = true;
             }
             Preset::High1440p => {
                 self.console = ConsoleModel::SeriesX;
@@ -321,6 +325,7 @@ impl LauncherConfig {
                 self.skip_raymarched_lights = true;
                 self.port_rt = true;
                 self.thin_lists = TriState::Auto;
+                self.send_bar = true;
             }
             Preset::Fsr4K => {
                 self.console = ConsoleModel::SeriesX;
@@ -331,6 +336,7 @@ impl LauncherConfig {
                 self.skip_raymarched_lights = true;
                 self.port_rt = true;
                 self.thin_lists = TriState::Auto;
+                self.send_bar = true;
             }
             Preset::Safe => {
                 self.console = ConsoleModel::SeriesS;
@@ -461,19 +467,20 @@ impl LauncherConfig {
         set("VICTORY_CARD_REHASH_RUNS", "1");
         set("VICTORY_JOIN_COPIES", "1");
         set("VICTORY_JOIN_BARRIERS", "1");
+        set("VICTORY_JOIN_PARTS", "8");
         set("VICTORY_INDIRECT_WINDOW", "1");
         set("VICTORY_RELAY_COPY", "1");
         set("VICTORY_INDIRECT_BATCH", "2");
         set("VICTORY_INDIRECT_REST", "0");
         set("VICTORY_LAND_SKIP", "1");
-        set("VICTORY_LAND_THREADS", "6");
+        set("VICTORY_LAND_THREADS", if hw.logical_cpus >= 16 { "8" } else { "6" });
         set("VICTORY_MAP_THREADS", "1");
         set("VICTORY_TITLE_PRIORITIES", "0");
         set("VICTORY_CARD_AWAKE", "idle");
         set("VICTORY_D3D12_DRED", "light");
         set("VICTORY_D3D12_BACKGROUND", "0");
         set("VICTORY_MEMORY_MAP", "0");
-        set("VICTORY_GUARD_HOT", "50");
+        set("VICTORY_GUARD_HOT", "0");
         set("VICTORY_WRITE_JOBS", "1");
         set("VICTORY_WATCH_TEXTURES_JOINED", "1");
         set("VICTORY_READBACK_POOL", "1");
@@ -482,24 +489,28 @@ impl LauncherConfig {
 
         // --- Heap de vistas NVIDIA 1M ---
         set("VICTORY_TABLES_EARLY", "1");
-        set("VICTORY_DYNAMIC_SLOTS", "393216");
+        set("VICTORY_DYNAMIC_SLOTS", "262144");
 
         // --- Pipelines y audio ---
         set("VICTORY_PIPELINE_LOWEST", "0");
         set("VICTORY_PIPELINE_WORKERS", "8");
         set("VICTORY_PIPELINE_WAIT_ONCE", "1");
+        set("VICTORY_PIPELINE_WAIT_AGAIN_MS", "10");
         set("VICTORY_TARGET_VARIANTS", "1");
         set("VICTORY_NO_WATCHDOG", "1");
         set("VICTORY_XMA_REFILL", "1");
+        set("VICTORY_FILE_CACHE", "1");
+        set("VICTORY_MAP_SAME", "1");
+        set("VICTORY_HOLES_ONCE", "30");
         if self.record_pipelines {
             set("VICTORY_PIPELINE_BOOK", "1");
         }
 
         // --- Claves del traductor Wave32 (deben coincidir con shaders/warm) ---
-        set("VICTORY_SHADER_OPT", "63");
+        set("VICTORY_SHADER_OPT", "191");
+        set("VICTORY_SHADER_FAST_BITS", "24");
         set("VICTORY_WAVE_WIDE", "last");
         set("VICTORY_NAN_SCRUB", "1");
-        set("VICTORY_SMALL_RECHECK", "0");
 
         let wide = hw.auto_wide_threads();
         if wide > 0 {
@@ -513,6 +524,8 @@ impl LauncherConfig {
             set("VICTORY_THIN", "0");
         } else {
             set("VICTORY_PORT_CONSTANTS", "1");
+            // Agrupar clamps indirectos en lote (-87% barreras UAV por cuadro en RTX 4090).
+            set("VICTORY_PORT_CONSTANTS_ORDER_ALONE", "0");
             if self.port_descriptors {
                 set("VICTORY_PORT_DESCRIPTORS", "1");
             }
@@ -538,7 +551,7 @@ impl LauncherConfig {
                 set("VICTORY_WINDOWS_BAR_MB", &bar_mb.to_string());
             }
             set("VICTORY_WINDOW_KB", "4096");
-            if self.send_bar {
+            if self.send_bar && hw.vram_tier != VramTier::Gb8 {
                 set("VICTORY_SEND_BAR", "1");
             }
             if self.wc_no_back {
@@ -547,13 +560,15 @@ impl LauncherConfig {
             }
 
             set("VICTORY_ASYNC_SUBMIT", "1");
+            if hw.logical_cpus >= 12 {
+                set("VICTORY_LANE_CORE", "1");
+            }
             if self.effective_thin(hw) {
                 set("VICTORY_THIN", "1");
                 set("VICTORY_THIN_THREADS", "8");
             } else {
                 set("VICTORY_THIN", "0");
             }
-            set("VICTORY_JOIN_PARTS", "8");
         }
 
         let mip_drop = self.effective_mip_drop(hw);
@@ -593,15 +608,16 @@ impl LauncherConfig {
             set("VICTORY_FRAME_INTERVAL_MS", &format!("{interval_ms:.3}"));
         }
 
-        // --- Iluminación ambiental / reflejos (calibrada para escenas con teléfono encendido) ---
+        // --- Iluminación ambiental / reflejos (calibrada sin velo blanco ni fantasmas) ---
         if self.ambient_light {
             set("VICTORY_AMBIENT", "1.0");
             set("VICTORY_AMBIENT_AIR", "1.5");
             set("VICTORY_AMBIENT_MOST", &format!("{:.2}", self.ambient_most.clamp(1.5, 4.5)));
+            set("VICTORY_AMBIENT_CLEAN", "1");
             set("VICTORY_AMBIENT_SHADE", "0.7,0.5");
             set("VICTORY_AMBIENT_REFL", "2.0");
             set("VICTORY_AMBIENT_REFLECT", &format!("{:.2}", self.ambient_reflect.clamp(0.0, 3.0)));
-            set("VICTORY_AMBIENT_REFLECT_LEAST", "0.35");
+            set("VICTORY_AMBIENT_REFLECT_LEAST", "0.20");
         }
 
         // --- RT off ---
@@ -671,7 +687,8 @@ impl LauncherConfig {
 
     pub fn build_prep_env(&self) -> BTreeMap<String, String> {
         let mut env = BTreeMap::new();
-        env.insert("VICTORY_SHADER_OPT".to_owned(), "63".to_owned());
+        env.insert("VICTORY_SHADER_OPT".to_owned(), "191".to_owned());
+        env.insert("VICTORY_SHADER_FAST_BITS".to_owned(), "24".to_owned());
         env.insert("VICTORY_WAVE_WIDE".to_owned(), "last".to_owned());
         env.insert("VICTORY_NAN_SCRUB".to_owned(), "1".to_owned());
         env.insert("VICTORY_PORT_CBV".to_owned(), "1".to_owned());
@@ -969,9 +986,16 @@ mod tests {
         assert_eq!(env.get("VICTORY_PORT_RT").map(String::as_str), Some("1"));
         assert_eq!(env.get("VICTORY_LIVE_TEXTURES").map(String::as_str), Some("1"));
         assert_eq!(env.get("VICTORY_VIDEO_PLANES").map(String::as_str), Some("1"));
-        assert_eq!(env.get("VICTORY_AMBIENT_MOST").map(String::as_str), Some("3.00"));
-        assert_eq!(env.get("VICTORY_AMBIENT_REFLECT").map(String::as_str), Some("1.00"));
+        assert_eq!(env.get("VICTORY_AMBIENT_MOST").map(String::as_str), Some("2.00"));
+        assert_eq!(env.get("VICTORY_AMBIENT_REFLECT").map(String::as_str), Some("0.60"));
         assert_eq!(env.get("VICTORY_RAYMARCHED_LOCAL_LIGHTS").map(String::as_str), Some("0"));
+        assert_eq!(env.get("VICTORY_PORT_CONSTANTS_ORDER_ALONE").map(String::as_str), Some("0"));
+        assert_eq!(env.get("VICTORY_SEND_BAR").map(String::as_str), Some("1"));
+        assert_eq!(env.get("VICTORY_LANE_CORE").map(String::as_str), Some("1"));
+        assert_eq!(env.get("VICTORY_GUARD_HOT").map(String::as_str), Some("0"));
+        assert_eq!(env.get("VICTORY_SHADER_OPT").map(String::as_str), Some("191"));
+        assert_eq!(env.get("VICTORY_SMALL_RECHECK"), None);
+        assert_eq!(env.get("VICTORY_DYNAMIC_SLOTS").map(String::as_str), Some("262144"));
         assert_eq!(env.get("VICTORY_THIN").map(String::as_str), Some("1"));
         assert_eq!(env.get("VICTORY_OUTPUT").map(String::as_str), Some("1920x1080"));
     }
@@ -983,6 +1007,7 @@ mod tests {
         let env = cfg.build_run_env(&hw);
         assert_eq!(cfg.effective_console(&hw), "series-s");
         assert_eq!(env.get("VICTORY_THIN").map(String::as_str), Some("0"));
+        assert_eq!(env.get("VICTORY_SEND_BAR"), None);
         assert_eq!(env.get("VICTORY_OUTPUT").map(String::as_str), Some("1280x720"));
         assert_eq!(env.get("VICTORY_CARD_BUFFERS_MB").map(String::as_str), Some("1280"));
         assert_eq!(env.get("VICTORY_CARD_BUFFERS_MIN_KB").map(String::as_str), Some("1024"));

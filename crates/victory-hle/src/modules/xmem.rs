@@ -1402,6 +1402,16 @@ fn scatter(wanted: &[(usize, usize)]) -> bool {
 /// Pages changed under the locks at once.
 const GROUP: usize = 64;
 
+/// Whether [`change`] passes over pages asked to show what they show
+/// already (`VICTORY_MAP_SAME=0`: no; Belobug#443).
+fn map_same_skip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MAP_SAME").is_none_or(|v| v != "0"))
+}
+
+/// Pages passed over by [`change`] since the start ([`map_same_skip`]).
+pub(crate) static MAP_SAME: AtomicU64 = AtomicU64::new(0);
+
 /// How many threads map a group of pages side by side (`VICTORY_MAP_THREADS`;
 /// 8 unless set; 1: the caller alone, a page after the other; `auto`: 1 while
 /// mapping takes little of the time, [`WIDE`] while the title streams as fast
@@ -1539,6 +1549,22 @@ impl Op {
 /// With [`PHYSICAL`] and the change of mapping (`title_memory_remapping`)
 /// held.
 fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
+    // Skip no-op remaps where the page already maps the exact same physical
+    // slice: avoids unmap+map kernel lock contention and preserves write guards.
+    if map_same_skip() {
+        let before = ops.len();
+        ops.retain(|op| {
+            let Some(want) = &op.slice else { return true };
+            !matches!(
+                physical.views.get(&op.at),
+                Some((PAGE, have)) if Arc::ptr_eq(&have.section, &want.section) && have.index == want.index
+            )
+        });
+        MAP_SAME.fetch_add((before - ops.len()) as u64, Ordering::Relaxed);
+        if ops.is_empty() {
+            return true;
+        }
+    }
     for op in &mut ops {
         let there = physical
             .views

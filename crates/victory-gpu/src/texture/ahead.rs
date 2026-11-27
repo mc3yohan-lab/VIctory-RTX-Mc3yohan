@@ -13,7 +13,10 @@
 //! it as any texture.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicU8, AtomicU64, AtomicUsize,
+    Ordering::{AcqRel, Acquire, Relaxed, Release},
+};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -46,26 +49,40 @@ pub(crate) fn on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_AHEAD").is_some_and(|v| v != "0"))
 }
 
+enum State {
+    Pending(Vec<Box<dyn FnOnce(bool) + Send>>),
+    Done,
+    Failed,
+}
+
 /// An upload on its way.
 pub(crate) struct Job {
     staging: Arc<Staging>,
     copy: Arc<HostTexture>,
     asked: std::time::Instant,
-    /// What to do when it has run; `None`: it has.
-    then: Mutex<Option<Vec<Box<dyn FnOnce() + Send>>>>,
+    /// What to do when it has run (`Belobug#454` + `avatarmanz#419`).
+    then: Mutex<State>,
 }
 
 impl Job {
-    /// Calls `f` when the copy has run: now if it has.
-    pub(crate) fn then(&self, f: impl FnOnce() + Send + 'static) {
-        let mut then = self.then.lock().unwrap_or_else(|e| e.into_inner());
-        match then.as_mut() {
-            Some(then) => then.push(Box::new(f)),
-            None => {
-                drop(then);
-                f();
+    /// Calls `f(true)` when the copy has run or `f(false)` if it was skipped/failed.
+    pub(crate) fn then(&self, f: impl FnOnce(bool) + Send + 'static) {
+        let mut state = self.then.lock().unwrap_or_else(|e| e.into_inner());
+        match &mut *state {
+            State::Pending(cbs) => cbs.push(Box::new(f)),
+            State::Done => {
+                drop(state);
+                f(true);
+            }
+            State::Failed => {
+                drop(state);
+                f(false);
             }
         }
+    }
+
+    pub(crate) fn begun_before(&self) -> Option<u64> {
+        crate::pool::begun_before(&self.copy.texture)
     }
 }
 
@@ -78,14 +95,42 @@ pub(crate) enum Taken {
 }
 
 static QUEUE: (Mutex<VecDeque<Arc<Job>>>, Condvar) = (Mutex::new(VecDeque::new()), Condvar::new());
-/// Those on their way, by host copy ([`HostTexture::serial`]).
-static ON_THEIR_WAY: Mutex<Vec<(u64, Arc<Job>)>> = Mutex::new(Vec::new());
+/// Those on their way, by host copy ([`HostTexture::serial`]); `None` while
+/// [`claim`] is still preparing its staging buffer.
+static ON_THEIR_WAY: Mutex<Vec<(u64, Option<Arc<Job>>)>> = Mutex::new(Vec::new());
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 static LANDED: Condvar = Condvar::new();
 static BYTES: AtomicU64 = AtomicU64::new(0);
 /// Since the start: uploads, bytes, microseconds from the asking until the
 /// copy had run, the longest; askings turned down; waits of lists.
 static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+struct Starting(Option<Arc<HostTexture>>);
+
+impl Drop for Starting {
+    fn drop(&mut self) {
+        if let Some(copy) = self.0.take() {
+            copy.ahead.store(LISTED, Release);
+            let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
+            way.retain(|(serial, _)| *serial != copy.serial);
+            IN_FLIGHT.store(way.len(), Release);
+            LANDED.notify_all();
+        }
+    }
+}
+
+fn wait_known(copy: &HostTexture) -> Option<Taken> {
+    let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        match way.iter().find(|(serial, _)| *serial == copy.serial) {
+            Some((_, Some(job))) => return Some(Taken::Known(job.clone())),
+            Some((_, None)) => {
+                way = LANDED.wait(way).unwrap_or_else(|e| e.into_inner());
+            }
+            None => return None,
+        }
+    }
+}
 
 /// Takes the first upload of `resource`'s levels from `first` on, `there` of
 /// whose bytes are mapped (`u64::MAX`: not known). `None`: the list's.
@@ -100,9 +145,8 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         None
     };
     let copy = crate::resource::host_copy(resource)?;
-    if copy.ahead.load(Relaxed) == PENDING {
-        let way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
-        return way.iter().find(|(serial, _)| *serial == copy.serial).map(|(_, job)| Taken::Known(job.clone()));
+    if copy.ahead.load(Acquire) == PENDING {
+        return wait_known(&copy).or_else(turned_down);
     }
     // (`VICTORY_RESIDENCY=1`: less on its way with 32 GiB of RAM or less,
     // none while commit is short.)
@@ -120,28 +164,51 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
     {
         return turned_down();
     }
-    if copy.ahead.compare_exchange(NONE, PENDING, Relaxed, Relaxed).is_err() {
-        return turned_down();
+    {
+        let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
+        if copy.ahead.compare_exchange(NONE, PENDING, AcqRel, Acquire).is_err() {
+            drop(way);
+            return if copy.ahead.load(Acquire) == PENDING {
+                wait_known(&copy).or_else(turned_down)
+            } else {
+                turned_down()
+            };
+        }
+        way.push((copy.serial, None));
+        IN_FLIGHT.store(way.len(), Release);
     }
-    super::PICKING.set(Some(there));
+    let mut starting = Starting(Some(copy.clone()));
+    let prev = super::PICKING.replace(Some(there));
     let staging = super::staging(resource, &copy, first);
-    super::PICKING.set(None);
+    super::PICKING.set(prev);
     let Some(staging) = staging.filter(|s| {
         !s.on_demand && s.first == s.level0 && !s.uploaded.load(Relaxed) && s.once.load(Relaxed)
     }) else {
-        copy.ahead.store(LISTED, Relaxed);
         return turned_down();
     };
     if super::no_wait() && super::fill_unlocked() {
-        staging.expected.store(if there == u64::MAX { super::mapped_bytes(staging.memory, staging.read) } else { there }, Relaxed);
+        let expected = if there == u64::MAX {
+            super::mapped_bytes(staging.memory, staging.read)
+        } else {
+            there
+        };
+        staging.expected.store(expected, Relaxed);
     }
-    let job = Arc::new(Job { staging, copy, asked: std::time::Instant::now(), then: Mutex::new(Some(Vec::new())) });
+    let job = Arc::new(Job {
+        staging,
+        copy,
+        asked: std::time::Instant::now(),
+        then: Mutex::new(State::Pending(Vec::new())),
+    });
     BYTES.fetch_add(job.staging.read as u64, Relaxed);
     {
         let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
-        way.push((job.copy.serial, job.clone()));
-        IN_FLIGHT.store(way.len(), std::sync::atomic::Ordering::Release);
+        if let Some(entry) = way.iter_mut().find(|(serial, _)| *serial == job.copy.serial) {
+            entry.1 = Some(job.clone());
+        }
+        LANDED.notify_all();
     }
+    starting.0 = None;
     Some(Taken::New(job))
 }
 
@@ -155,7 +222,7 @@ pub(crate) fn send(job: &Arc<Job>) {
 /// and run its completion callbacks (queuing slot flips into `FLIPS`).
 /// Returns how many jobs were waited for.
 pub(crate) fn drain() -> usize {
-    if IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire) == 0 {
+    if IN_FLIGHT.load(Acquire) == 0 {
         return 0;
     }
     let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
@@ -173,14 +240,21 @@ pub(crate) fn drain() -> usize {
 /// A list is about to record an upload into `copy`: one on its way here runs
 /// first, and no other is taken after it.
 pub(crate) fn listed(copy: &HostTexture) {
-    if copy.ahead.compare_exchange(NONE, LISTED, Relaxed, Relaxed) != Err(PENDING) {
+    if copy.ahead.compare_exchange(NONE, LISTED, AcqRel, Acquire) != Err(PENDING) {
         return;
     }
     STATS[5].fetch_add(1, Relaxed);
     let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
     let started = std::time::Instant::now();
-    while way.iter().any(|(serial, _)| *serial == copy.serial) && started.elapsed().as_millis() < 1000 {
-        way = LANDED.wait_timeout(way, std::time::Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
+    while way.iter().any(|(serial, _)| *serial == copy.serial) {
+        if started.elapsed().as_millis() >= 1000 {
+            tracing::warn!(serial = copy.serial, "timed out waiting for upload ahead");
+            break;
+        }
+        way = LANDED
+            .wait_timeout(way, std::time::Duration::from_millis(50))
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
     }
 }
 
@@ -254,18 +328,26 @@ impl Worker {
                     jobs.push(job);
                 }
             }
-            value += 1;
-            if let Err(e) = self.copy(&jobs, value) {
-                tracing::warn!(error = %e, "uploads ahead did not run");
-            }
-            finish(jobs);
+            process_batch(
+                jobs,
+                |job| {
+                    job.staging.refresh();
+                    job.staging.last.lock().unwrap_or_else(|e| e.into_inner()).ready_for_upload
+                },
+                |ready| {
+                    value += 1;
+                    let result = self.copy(ready, value);
+                    if let Err(e) = &result {
+                        tracing::warn!(error = %e, "uploads ahead did not run");
+                    }
+                    result.is_ok()
+                },
+                finish,
+            );
         }
     }
 
     fn copy(&self, jobs: &[Arc<Job>], value: u64) -> windows::core::Result<()> {
-        for job in jobs {
-            job.staging.refresh();
-        }
         // SAFETY: this worker's allocator and list, whose last submission has
         // run; the jobs hold what the list names until after the wait.
         unsafe {
@@ -281,6 +363,23 @@ impl Worker {
             self.fence.SetEventOnCompletion(value, windows::Win32::Foundation::HANDLE::default())?;
         }
         Ok(())
+    }
+}
+
+/// Release jobs without a completed staging image immediately; copy the rest.
+fn process_batch<J>(
+    mut jobs: Vec<J>,
+    mut ready: impl FnMut(&J) -> bool,
+    copy: impl FnOnce(&[J]) -> bool,
+    mut finish: impl FnMut(Vec<J>, bool),
+) {
+    let skipped: Vec<_> = jobs.extract_if(.., |job| !ready(job)).collect();
+    if !skipped.is_empty() {
+        finish(skipped, false);
+    }
+    if !jobs.is_empty() {
+        let copied = copy(&jobs);
+        finish(jobs, copied);
     }
 }
 
@@ -310,34 +409,45 @@ impl Job {
     }
 }
 
-/// The jobs' copies have run.
-fn finish(jobs: Vec<Arc<Job>>) {
+/// The jobs' copies have run (or failed/skipped without a completed staging image).
+fn finish(jobs: Vec<Arc<Job>>, ok: bool) {
     for job in &jobs {
-        job.staging.uploaded.store(true, Relaxed);
-        job.staging.dirty.store(false, Relaxed);
-        job.staging.note_held();
-        job.copy.ahead.store(DONE, Relaxed);
+        if ok {
+            job.staging.uploaded.store(true, Release);
+            job.staging.dirty.store(false, Release);
+            job.staging.note_held();
+            job.copy.ahead.store(DONE, Release);
+        } else {
+            job.copy.ahead.store(LISTED, Release);
+        }
         BYTES.fetch_sub(job.staging.read as u64, Relaxed);
     }
     for job in &jobs {
-        let us = job.asked.elapsed().as_micros() as u64;
-        let n = STATS[0].fetch_add(1, Relaxed) + 1;
-        let bytes = STATS[1].fetch_add(job.staging.read as u64, Relaxed) + job.staging.read as u64;
-        let all = STATS[2].fetch_add(us, Relaxed) + us;
-        let most = STATS[3].fetch_max(us, Relaxed).max(us);
-        if n == 1 || n.is_multiple_of(5000) {
-            tracing::info!(
-                "textures uploaded ahead of the lists (VICTORY_UPLOAD_AHEAD=1), since the start: {n}, {} MB, {:.1} ms from the asking until they were there, the longest {:.0}; {} turned down, {} waited for by lists",
-                bytes >> 20,
-                all as f64 / n as f64 / 1e3,
-                most as f64 / 1e3,
-                STATS[4].load(Relaxed),
-                STATS[5].load(Relaxed)
-            );
+        if ok {
+            let us = job.asked.elapsed().as_micros() as u64;
+            let n = STATS[0].fetch_add(1, Relaxed) + 1;
+            let bytes = STATS[1].fetch_add(job.staging.read as u64, Relaxed) + job.staging.read as u64;
+            let all = STATS[2].fetch_add(us, Relaxed) + us;
+            let most = STATS[3].fetch_max(us, Relaxed).max(us);
+            if n == 1 || n.is_multiple_of(5000) {
+                tracing::info!(
+                    "textures uploaded ahead of the lists (VICTORY_UPLOAD_AHEAD=1), since the start: {n}, {} MB, {:.1} ms from the asking until they were there, the longest {:.0}; {} turned down, {} waited for by lists",
+                    bytes >> 20,
+                    all as f64 / n as f64 / 1e3,
+                    most as f64 / 1e3,
+                    STATS[4].load(Relaxed),
+                    STATS[5].load(Relaxed)
+                );
+            }
         }
-        let then = job.then.lock().unwrap_or_else(|e| e.into_inner()).take();
-        for f in then.into_iter().flatten() {
-            f();
+        let then = std::mem::replace(
+            &mut *job.then.lock().unwrap_or_else(|e| e.into_inner()),
+            if ok { State::Done } else { State::Failed },
+        );
+        if let State::Pending(cbs) = then {
+            for f in cbs {
+                f(ok);
+            }
         }
     }
     // Remove from `ON_THEIR_WAY` only after `job.then` callbacks have queued
@@ -345,16 +455,18 @@ fn finish(jobs: Vec<Arc<Job>>) {
     {
         let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
         way.retain(|(serial, _)| !jobs.iter().any(|job| job.copy.serial == *serial));
-        IN_FLIGHT.store(way.len(), std::sync::atomic::Ordering::Release);
+        IN_FLIGHT.store(way.len(), Release);
         LANDED.notify_all();
     }
-    crate::descriptor::host::flip_now();
+    if ok {
+        crate::descriptor::host::flip_now();
+    }
 }
 
 /// Whether `resource`'s host copy was filled here: no list still brings what
 /// it shows.
 pub(crate) fn there(resource: This) -> bool {
-    crate::resource::made_copy(resource).is_some_and(|copy| copy.ahead.load(Relaxed) == DONE)
+    crate::resource::made_copy(resource).is_some_and(|copy| copy.ahead.load(Acquire) == DONE)
 }
 
 /// The state of [`HostTexture::ahead`] of a new host copy.
@@ -392,8 +504,14 @@ mod tests {
         let also = told.clone();
         let Some(Taken::Known(same)) = claim(texture, 0, u64::MAX) else { panic!("not known") };
         assert!(Arc::ptr_eq(&job, &same));
-        job.then(move || told.send(1).unwrap());
-        same.then(move || also.send(2).unwrap());
+        job.then(move |ok| {
+            assert!(ok);
+            told.send(1).unwrap();
+        });
+        same.then(move |ok| {
+            assert!(ok);
+            also.send(2).unwrap();
+        });
         send(&job);
         let wait = std::time::Duration::from_secs(20);
         assert_eq!((heard.recv_timeout(wait), heard.recv_timeout(wait)), (Ok(1), Ok(2)));

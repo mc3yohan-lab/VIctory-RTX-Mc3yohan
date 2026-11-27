@@ -2588,7 +2588,7 @@ impl State {
     /// (`BAKING` set so `VICTORY_TEXTURE_NO_WAIT` never bakes half-remapped
     /// BCn blocks).
     fn bake_sources_pass(&self, list: &HostList, p: &HostPipeline) {
-        let (mode, _) = bake_sources_mode();
+        let (mode, most) = bake_sources_mode();
         let Some(tables) = bake_tables(p) else {
             return;
         };
@@ -2614,8 +2614,7 @@ impl State {
             if crate::texture::ahead::drain() > 0 {
                 crate::descriptor::host::flip_now();
             }
-            let memory = crate::host::host().and_then(|h| h.video_memory());
-            if crate::resource::room(memory) {
+            if crate::resource::within_budget(most) {
                 host.texture_slots_requeue(&sources.unmade, crate::frame::current());
                 PASS_SOURCES.set(Some(sources.queued.iter().chain(&sources.unmade).copied().collect()));
                 PASS_SOURCED.set([0; 4]);
@@ -2910,9 +2909,13 @@ impl State {
         // makes room again: so the slots are still looked at (the pass
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
-        let mut room = crate::resource::room(memory);
         let sources = PASS_SOURCES.take();
         let only = sources.is_some();
+        let mut room = if only {
+            crate::resource::within_budget(bake_sources_mode().1)
+        } else {
+            crate::resource::room(memory)
+        };
         // Bytes uploaded by this pass since the card was last asked
         // whether it has room: asked again every 32 MiB (a pass may upload
         // 192 MB and more, and one asking a pass let the queue run some
@@ -3566,6 +3569,7 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        self.march(list, p);
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -3599,6 +3603,13 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
+        // Restore clean un-lifted diffuse light history before Resolve reads it
+        // (VICTORY_AMBIENT_CLEAN: prevents camera-cut / turn ghosting).
+        if p.stages.first().and_then(|s| s.shader.ambient) == Some(crate::ambient::Role::Resolve)
+            && crate::ambient::on()
+        {
+            crate::ambient::put_history_back(list);
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         self.buffers_written();
@@ -3615,6 +3626,41 @@ impl State {
         }
     }
 
+    /// Before a dispatch of `p` that reads the in-scatter marched along rays
+    /// (`crate::ambient::MARCH`), with `VICTORY_AMBIENT_MARCH` on: that image
+    /// held to the light of the room.
+    fn march(&mut self, list: &HostList, p: &HostPipeline) {
+        use crate::ambient::{MARCH, Role};
+        let Some(s) = p.stages.first().filter(|s| s.shader.ambient == Some(Role::March)) else {
+            return;
+        };
+        if crate::ambient::march() == 0.0 || !crate::ambient::on() {
+            return;
+        }
+        let mut any = false;
+        for (slot, offset) in MARCH {
+            let reads = s.translated().used.iter().any(|u| {
+                u.kind == ResourceType::Srv && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+            });
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                continue;
+            };
+            let view = crate::descriptor::view(table + u64::from(offset) * 4)
+                .map(|v| crate::descriptor::host::placed_texture(&v).unwrap_or(v));
+            if reads
+                && let Some(View::Shader(r, _)) = view
+                && r != 0
+            {
+                any |= crate::ambient::clear_march(list, r as This);
+            }
+        }
+        if any {
+            self.host_pipeline = 0;
+            self.host_roots = [0; 2];
+            self.host_heaps_set = false;
+        }
+    }
+
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
@@ -3623,20 +3669,67 @@ impl State {
             return false;
         };
         let entry = |kind: ResourceType, at: (u8, u32)| self.table_view(t, true, kind, at);
+        // Never bind a depth-stencil texture's stencil plane (formats 22/47 or
+        // 2D PlaneSlice == 1 at word 6) as depth (trustno1@d226814d + bda6e597).
+        let stencil_at = |(slot, offset): (u8, u32)| {
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                return false;
+            };
+            let view = crate::descriptor::view(table + u64::from(offset) * 4)
+                .map(|v| crate::descriptor::host::placed_texture(&v).unwrap_or(v));
+            match view {
+                Some(View::Shader(_, Some(d))) => {
+                    matches!(crate::resource::pc_format(d[0]), 22 | 47) || (d[1] == 4 && d[6] == 1)
+                }
+                _ => false,
+            }
+        };
+        let depth_like = |d: &D3D12_RESOURCE_DESC| {
+            use windows::Win32::Graphics::Dxgi::Common::{
+                DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT,
+                DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R24G8_TYPELESS,
+                DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS,
+            };
+            d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                && matches!(
+                    d.Format,
+                    DXGI_FORMAT_R32_TYPELESS
+                        | DXGI_FORMAT_D32_FLOAT
+                        | DXGI_FORMAT_R32G8X24_TYPELESS
+                        | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                        | DXGI_FORMAT_R24G8_TYPELESS
+                        | DXGI_FORMAT_D24_UNORM_S8_UINT
+                )
+        };
         let at = match role {
             Role::Resolve => LIGHT,
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
             Role::RayMiss => RAY_MISS,
             Role::Reflect => REFLECTIONS,
+            // Handled before dispatch via `State::march`.
+            Role::March => return false,
         };
-        let Some((of, image)) = entry(ResourceType::Uav, at) else {
+        let Some((of, image, light_res)) = entry(ResourceType::Uav, at) else {
             once!(?role, "no stand-in for the indirect light: missing image UAV");
             return false;
         };
         let depth = match role {
             Role::Resolve => {
-                let Some((seen, depth)) = entry(ResourceType::Srv, DEPTH) else {
+                let picked = if stencil_at(DEPTH) {
+                    None
+                } else {
+                    entry(ResourceType::Srv, DEPTH)
+                }
+                .or_else(|| {
+                    t.used
+                        .iter()
+                        .filter(|u| u.kind == ResourceType::Srv && u.root == RootType::Table)
+                        .filter(|u| !stencil_at((u.slot, u.table_offset_dwords)))
+                        .filter_map(|u| entry(ResourceType::Srv, (u.slot, u.table_offset_dwords)))
+                        .find(|(desc, _, _)| depth_like(desc) && (desc.Width, desc.Height) == (of.Width, of.Height))
+                });
+                let Some((seen, depth, _)) = picked else {
                     once!(?role, "no stand-in for the indirect light: missing depth SRV");
                     return false;
                 };
@@ -3646,18 +3739,22 @@ impl State {
                 }
                 Some(depth)
             }
-            Role::Radiance | Role::Air | Role::RayMiss | Role::Reflect => None,
+            Role::Radiance | Role::Air | Role::RayMiss | Role::Reflect | Role::March => None,
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT or R16G16B16A16_FLOAT for RayMiss.)
         let format_ok = match role {
             Role::Resolve | Role::Reflect => of.Format.0 == 42,
             Role::RayMiss => matches!(of.Format.0, 10 | 26),
             Role::Radiance | Role::Air => of.Format.0 == 26,
+            Role::March => false,
         };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         if !format_ok || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
             return false;
+        }
+        if role == Role::Resolve {
+            crate::ambient::keep_history(list, light_res as This);
         }
         crate::ambient::after(list, role, &Views {
             image,
@@ -3669,15 +3766,14 @@ impl State {
 
     /// The view a shader of the bound pipeline reads through a table, at
     /// (root parameter, dwords into the table): its texture's or buffer's
-    /// description and its place in the bound view heap. Tables made afresh
-    /// for the draw are found where they were made (`ambient_tables`).
+    /// description, its place in the bound view heap, and its title resource handle.
     fn table_view(
         &self,
         t: &crate::pipeline::Translated,
         compute: bool,
         kind: ResourceType,
         (slot, offset): (u8, u32),
-    ) -> Option<(D3D12_RESOURCE_DESC, D3D12_GPU_DESCRIPTOR_HANDLE)> {
+    ) -> Option<(D3D12_RESOURCE_DESC, D3D12_GPU_DESCRIPTOR_HANDLE, usize)> {
         let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This).host()).flatten()?;
         t.used.iter().find(|u| {
             u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
@@ -3685,7 +3781,9 @@ impl State {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
             return None;
         };
-        let resource = match (kind, crate::descriptor::view(table + u64::from(offset) * 4)?) {
+        let raw_view = crate::descriptor::view(table + u64::from(offset) * 4)?;
+        let view = crate::descriptor::host::placed_texture(&raw_view).unwrap_or(raw_view);
+        let resource = match (kind, view) {
             (ResourceType::Srv, View::Shader(r, _))
             | (ResourceType::Uav, View::Unordered(r, ..)) => r,
             _ => return None,
@@ -3697,7 +3795,7 @@ impl State {
         let host = crate::resource::host_resource(resource as This)?;
         // SAFETY: a live resource.
         let desc = unsafe { host.GetDesc() };
-        Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
+        Some((desc, heap.gpu_handle((start + offset * 4) / 32), resource))
     }
 
     /// The place in the bound view heap of the view a shader of the bound
@@ -4962,6 +5060,8 @@ impl State {
                 (bounded, 0)
             }
         };
+        // After the clamp of the arguments, which has its own pipeline.
+        self.march(list, p);
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),

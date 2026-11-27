@@ -948,6 +948,13 @@ extern "system" fn present(
         release_held(forces());
     }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    // The title's frame this flips, for GetFrameStatisticsX (Bink video order).
+    // SAFETY: the title passes `planes` plane descriptions.
+    if planes > 0
+        && let Some(plane) = unsafe { plane_parameters.as_ref() }
+    {
+        crate::frame::flipped(plane.token);
+    }
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
