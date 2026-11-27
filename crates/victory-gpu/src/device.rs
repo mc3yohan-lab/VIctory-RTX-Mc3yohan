@@ -346,16 +346,11 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
-/// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
-/// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
-/// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
-/// object `out` names and draws with it; on failure it goes without that
-/// pipeline, silently. What the descriptions hold is not known: the calls
-/// fail as they always did, with `out` null, and the first ones log the
-/// description's words and what its first word points at, so that the two
-/// methods can be written.
-/// shortcut: not implemented. Answering `S_OK` here without making the
-/// pipeline would hand the title whatever its stack held as an object.
+/// Cached-pipeline methods 0x1c8 and 0x218 (`SLOT`). The title continues if
+/// 0x1c8 cannot register a cached description. If 0x218 fails, the title
+/// creates the compute pipeline through 0x1f0 using its root signature and shader.
+/// Both return `E_NOTIMPL` and clear `out`. Each slot logs once at info level
+/// and samples the description at debug level.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
     _: This,
     desc: *const u8,
@@ -364,12 +359,15 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
 ) -> HRESULT {
     use std::sync::atomic::{AtomicU32, Ordering};
     static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
-    let calls = CALLS[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
+    let calls = CALLS[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     if !out.is_null() {
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
     }
-    if calls <= 4 || calls.is_power_of_two() {
+    if calls == 1 {
+        tracing::info!(slot = format_args!("{SLOT:#x}"), "cached-pipeline method uses the title fallback");
+    }
+    if (calls <= 4 || calls.is_power_of_two()) && tracing::enabled!(tracing::Level::DEBUG) {
         // Sixteen 64-bit words at `at`, read through the kernel: neither
         // pointer is known to be mapped.
         #[cfg(windows)]
@@ -388,12 +386,12 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         let first = description
             .as_ref()
             .and_then(|w| words(w[0] as usize));
-        tracing::warn!(
+        tracing::debug!(
             slot = format_args!("{:#x}", SLOT),
             calls,
             description = format_args!("{description:x?}"),
             first_points_at = format_args!("{first:x?}"),
-            "a pipeline creation method that is not implemented: the title goes without this pipeline"
+            "cached-pipeline method returned E_NOTIMPL"
         );
     }
     E_NOTIMPL

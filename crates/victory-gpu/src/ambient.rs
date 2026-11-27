@@ -294,6 +294,16 @@ fn refl() -> f32 {
     })
 }
 
+fn parse_refl_tone(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|value| value != "0")
+}
+
+/// Tone clipped sky reflections toward the room's radiance.
+fn refl_tone() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_refl_tone(std::env::var_os("VICTORY_AMBIENT_REFL_TONE").as_deref()))
+}
+
 /// Optional minimum pre-exposure HDR indoor indirect light floor
 /// (`VICTORY_AMBIENT_FLOOR`, default `0` / off).
 fn floor() -> f32 {
@@ -372,6 +382,7 @@ const SOURCE: &str = r#"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
+#define GEO (2 * CELLS + 1)
 #define PX 160
 #define PY 90
 cbuffer Set : register(b0) {
@@ -382,8 +393,8 @@ cbuffer Set : register(b0) {
     float floor_level; float least;
 };
 Texture2D<float> depth : register(t0);
-// Cells: the light they send out (then, at CELLS, the slow mean), from
-// CELLS + 1 on where they are.
+// Radiance, its slow arithmetic mean, cell positions, then the slow
+// geometric mean of lit-cell luminance at GEO.
 RWStructuredBuffer<float4> cells : register(u1);
 // Four float4s a point (64-byte aligned): red, green and blue (each a direction
 // and mean), then `(depth_z, 0, 0, 0)` so `raise` reuses coarse depth without
@@ -436,16 +447,32 @@ void keep(uint3 at : SV_DispatchThreadID) {
     cells[at.y * CX + at.x] = float4(sum / 25.0, 1.0);
 }
 groupshared float3 mean_acc[64];
+groupshared float log_acc[64], lit_acc[64];
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void mean(uint gi : SV_GroupIndex) {
     float3 sum = 0;
-    for (uint i = gi; i < CELLS; i += 64) sum += cells[i].rgb;
+    float logs = 0.0, lit = 0.0;
+    for (uint i = gi; i < CELLS; i += 64) {
+        float3 rgb = cells[i].rgb;
+        sum += rgb;
+        float l = dot(rgb, LUMA);
+        if (l > 1e-5) {
+            logs += log(l);
+            lit += 1.0;
+        }
+    }
     mean_acc[gi] = sum;
+    log_acc[gi] = logs;
+    lit_acc[gi] = lit;
     GroupMemoryBarrierWithGroupSync();
     [unroll]
     for (uint s = 32; s > 0; s >>= 1) {
-        if (gi < s) mean_acc[gi] += mean_acc[gi + s];
+        if (gi < s) {
+            mean_acc[gi] += mean_acc[gi + s];
+            log_acc[gi] += log_acc[gi + s];
+            lit_acc[gi] += lit_acc[gi + s];
+        }
         GroupMemoryBarrierWithGroupSync();
     }
     if (gi != 0) return;
@@ -461,7 +488,12 @@ void mean(uint gi : SV_GroupIndex) {
     // Its fourth part: seconds since the light around last jumped (from
     // 0.001; 0: nothing kept yet).
     float age = was.a > 0.0 && !jumped ? was.a + dt : 0.001;
-    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, jumped ? 1.0 : follow) : now, age);
+    float blend = was.a > 0.0 ? (jumped ? 1.0 : follow) : 1.0;
+    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, blend) : now, age);
+    float g = lit_acc[0] > 0.0 ? exp(log_acc[0] / lit_acc[0]) : 0.0;
+    g = max(g, dot(floor_rgb, LUMA));
+    float4 old_geo = cells[GEO];
+    cells[GEO] = float4(old_geo.a > 0.0 ? lerp(old_geo.r, g, blend) : g, 0.0, 0.0, age);
 }
 #endif
 
@@ -577,8 +609,10 @@ void clear_refl(uint3 at : SV_DispatchThreadID) {
     uint w, h;
     reflected.GetDimensions(w, h);
     if (at.x >= w || at.y >= h) return;
-    float3 seen_there = sample_points((float2(at.xy) + 0.5) / float2(w, h));
-    float cap = refl * max(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA));
+    float3 room = max(cells[CELLS].rgb, 0.0);
+    float4 geo = cells[GEO];
+    float around = geo.a > 0.0 ? geo.r : dot(room, LUMA);
+    float cap = refl * around;
     float4 c = reflected[at.xy];
     if (any(isnan(c.rgb)) || any(isinf(c.rgb))) {
         reflected[at.xy] = float4(0.0, 0.0, 0.0, (isnan(c.a) || isinf(c.a)) ? 0.0 : c.a);
@@ -587,7 +621,10 @@ void clear_refl(uint3 at : SV_DispatchThreadID) {
     c.rgb = max(c.rgb, 0.0);
     float has = dot(c.rgb, LUMA);
     if (cells[CELLS].a > 0.0 && has > cap && has > 1e-9) {
-        reflected[at.xy] = float4(c.rgb * (cap / has), c.a);
+        float kept = cap / has;
+        float3 toned = room * (cap / max(dot(room, LUMA), 1e-6));
+        float3 out_rgb = least > 0.5 ? lerp(toned, c.rgb * kept, kept) : c.rgb * kept;
+        reflected[at.xy] = float4(out_rgb, c.a);
     }
 }
 #endif
@@ -758,7 +795,8 @@ const RAISE_GROUP: u32 = 32;
 
 /// Bytes of the cells' buffer and of the points'.
 const CELLS: u64 = 64 * 36;
-const CELL_BYTES: u64 = (2 * CELLS + 1) * 16;
+const GEO: u64 = 2 * CELLS + 1;
+const CELL_BYTES: u64 = (GEO + 1) * 16;
 const POINT_BYTES: u64 = 160 * 90 * 64;
 /// Where the slow mean is among the cells (float4s).
 pub(crate) const CELLS_AT: u32 = CELLS as u32;
@@ -992,7 +1030,9 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     };
     words[16] = effective_floor.to_bits();
     words[17] = least.to_bits();
-    if role == Role::Reflect {
+    if role == Role::RayMiss {
+        words[17] = (if refl_tone() { 1.0_f32 } else { 0.0_f32 }).to_bits();
+    } else if role == Role::Reflect {
         let [most, low] = reflect();
         words[10] = most.to_bits();
         words[17] = low.to_bits();
@@ -1360,6 +1400,18 @@ mod tests {
         assert_eq!(multiple("-1"), 0.0);
         assert_eq!(multiple("nan"), 0.0);
         assert_eq!(multiple(" 1.5 "), 1.5);
+    }
+
+    #[test]
+    fn reflection_tone_and_geometric_cell_layout() {
+        let tone = |value: Option<&str>| parse_refl_tone(value.map(std::ffi::OsStr::new));
+        assert!(tone(None));
+        assert!(tone(Some("1")));
+        assert!(tone(Some("")));
+        assert!(!tone(Some("0")));
+        assert_eq!(GEO, CELLS + 1 + CELLS);
+        assert_eq!(CELL_BYTES, (2 * CELLS + 2) * 16);
+        assert!(SOURCE.contains("#define GEO (2 * CELLS + 1)"));
     }
 
     #[test]

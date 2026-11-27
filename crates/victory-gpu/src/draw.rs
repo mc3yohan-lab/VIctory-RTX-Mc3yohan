@@ -960,17 +960,12 @@ fn sweep_per_heap() -> bool {
 /// What the heap buffer pass keeps of a view heap, on the heap
 /// ([`crate::descriptor::host::HostHeap`]), so that a heap made where one was
 /// let go starts afresh (codec-d/cool_fox c64fc9b4).
+#[derive(Default)]
 pub(crate) struct BufferSweep {
     passes: u64,
     ranges: DenseRanges,
     // Last refresh frame and covered interval for throttled, unwatched copies.
     unwatched: std::collections::HashMap<u64, (u64, u64, u64)>,
-}
-
-impl Default for BufferSweep {
-    fn default() -> Self {
-        Self { passes: 0, ranges: DenseRanges::default(), unwatched: Default::default() }
-    }
 }
 
 #[cfg(test)]
@@ -3191,6 +3186,10 @@ impl State {
             )
         };
         let began = std::time::Instant::now();
+        let placed_movie_plane = |view: Option<&View>, len| {
+            matches!(view, Some(View::Placed(false, resource, desc))
+                if crate::texture::is_placed_movie_plane(resource, desc, len))
+        };
         for (index, write) in due {
             if only {
                 if sourced_bytes >= sourced_at_most {
@@ -3217,8 +3216,9 @@ impl State {
             // may fill the texture's memory itself only afterwards, with
             // no descriptor write and nothing from the runtime to tell of
             // it. The host copy then kept what the memory held at the
-            // first look for the rest of the run. The look reads 48 KiB;
-            // only a changed texture is uploaded again.
+            // first look for the rest of the run. The look samples 48 KiB
+            // or reads the whole surface for small movie planes and live slots.
+            // Only a changed texture is uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
             // One found changed by such a look is looked at in the next frame
             // again: the textures left that change unnoticed are ones the
@@ -3228,6 +3228,9 @@ impl State {
             let mut again_in = RECHECK_FRAMES[0];
             let mut live = false;
             if let Some((at, len, print, looks, uploaded, was_live)) = host.texture_slot_checked(index) {
+                let view = heap.handle(index).and_then(crate::descriptor::view);
+                let movie_plane = placed_movie_plane(view.as_ref(), len);
+                let whole = was_live || movie_plane;
                 let small = !was_live && crate::texture::small_recheck(len);
                 let late_look = small && usize::from(looks) + 1 >= RECHECK_FRAMES.len();
                 let spread = u64::from(index) % SMALL_RECHECK_FRAMES;
@@ -3249,7 +3252,7 @@ impl State {
                     SMALL_RECHECKS[0].fetch_add(1, Ordering::Relaxed);
                     SMALL_RECHECKS[2].fetch_add(len, Ordering::Relaxed);
                 }
-                if crate::texture::fingerprint_for(at, len, was_live) == print {
+                if crate::texture::fingerprint_for(at, len, whole) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     if was_live {
                         // Unchanged this frame (e.g. 30 fps phone/TV video between
@@ -3267,7 +3270,9 @@ impl State {
                                 true,
                             );
                         } else {
-                            let print = crate::texture::fingerprint(at, len);
+                            // Movie planes keep the same whole-surface digest
+                            // after the slot returns to finite rechecks.
+                            let print = if movie_plane { print } else { crate::texture::fingerprint(at, len) };
                             host.texture_slot_recheck(
                                 index,
                                 write,
@@ -3320,7 +3325,7 @@ impl State {
                     // Whether its pages are the title's at other addresses
                     // too: what is written there is told of there alone.
                     let elsewhere = crate::inplace::shown_elsewhere(at as usize & !0xffff, (at + len) as usize);
-                    let first = heap.handle(index).and_then(crate::descriptor::view).map_or(0, |view| match view {
+                    let first = view.map_or(0, |view| match view {
                         View::Placed(false, _, desc) => crate::resource::first_mip(&desc),
                         _ => 0,
                     });
@@ -3497,7 +3502,8 @@ impl State {
                 let memory = if again.is_none() && heap_recheck() { crate::texture::title_span(resource, first) } else { None };
                 match memory {
                     Some((at, len)) => {
-                        let print = crate::texture::fingerprint_for(at, len, live);
+                        let whole = live || placed_movie_plane(view.as_ref(), len);
+                        let print = crate::texture::fingerprint_for(at, len, whole);
                         host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame, live);
                     }
                     None => host.texture_slot_done(index, write, again),
@@ -3628,7 +3634,8 @@ impl State {
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
-                    let print = crate::texture::fingerprint_for(at, len, live);
+                    let whole = live || placed_movie_plane(view.as_ref(), len);
+                    let print = crate::texture::fingerprint_for(at, len, whole);
                     host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame, live);
                 }
                 None => host.texture_slot_done(index, write, again),

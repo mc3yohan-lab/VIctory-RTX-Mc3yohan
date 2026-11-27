@@ -1464,10 +1464,8 @@ impl Staging {
     /// ScarlettPort). `VICTORY_VIDEO_PLANES=0` turns it off.
     pub(crate) fn movie_plane(&self) -> bool {
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UNORM;
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let on = *ON.get_or_init(|| std::env::var_os("VICTORY_VIDEO_PLANES").is_none_or(|v| v != "0"));
         let desc = &self.layout.desc;
-        on && !self.on_demand
+        video_planes_on() && !self.on_demand
             && desc.dimension == victory_formats::texture::Dimension::Tex2d
             && desc.swizzle.0 == 0
             && desc.depth == 1
@@ -1946,14 +1944,35 @@ fn fill_plane(
     });
 }
 
-/// Largest texture [`fingerprint_for`] reads whole when its slot is live.
+/// Largest texture [`fingerprint_for`] reads whole for a live slot or movie plane.
 const LIVE_WHOLE_BYTES: u64 = 4 << 20;
 
-/// [`fingerprint`], or for a live slot (one found changing after its upload,
-/// such as TV or phone-screen video planes) no larger than 4 MiB, a full
-/// digest of its memory (ported from `avatarmanz/VIctory-7900XTX #390`).
-pub(crate) fn fingerprint_for(at: u64, len: u64, live: bool) -> u64 {
-    if !live || len > LIVE_WHOLE_BYTES {
+fn video_planes_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIDEO_PLANES").is_none_or(|v| v != "0"))
+}
+
+/// A placed 2D SRV of a linear R8 movie plane small enough to hash whole.
+pub(crate) fn is_placed_movie_plane(resource: &[u32; 14], desc: &[u32; 16], len: u64) -> bool {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UNORM;
+    // ResourceDesc packs array size and mip levels into word 7.
+    // Layout 1 and explicit swizzle 0 (0x100) both encode linear storage.
+    len != 0
+        && len <= LIVE_WHOLE_BYTES
+        && resource[0] == D3D12_RESOURCE_DIMENSION_TEXTURE2D.0 as u32
+        && resource[7] == 0x0001_0001
+        && resource[8] == DXGI_FORMAT_R8_UNORM.0 as u32
+        && resource[9] == 1
+        && matches!(resource[11], 1 | 0x100)
+        && desc[1] == D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32
+        && crate::resource::first_mip(desc) == 0
+        && video_planes_on()
+}
+
+/// [`fingerprint`], or a full digest for a texture no larger than 4 MiB
+/// when the caller requests a whole-surface check.
+pub(crate) fn fingerprint_for(at: u64, len: u64, whole: bool) -> u64 {
+    if !whole || len > LIVE_WHOLE_BYTES {
         return fingerprint(at, len);
     }
     const CHUNK: usize = 64 << 10;
@@ -2260,8 +2279,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     // planes are linear single-level R8 textures written through another view
     // of the same pages; bypass the 8-frame guard skip so frames never flicker
     // out of order even with `VICTORY_TEXTURE_NO_WAIT=1`.
-    static PLANES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let guard_view = !(*PLANES.get_or_init(|| std::env::var_os("VICTORY_VIDEO_PLANES").is_none_or(|v| v != "0"))
+    let guard_view = !(video_planes_on()
         && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
         && d.Format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UNORM
         && d.MipLevels == 1
@@ -2699,6 +2717,40 @@ mod allocation_costs {
             timed("texture placed in 64 MB heaps", N, 1, &place);
             timed("texture placed in 64 MB heaps", N, 8, &place);
         }
+    }
+}
+
+#[cfg(test)]
+mod movie_plane_tests {
+    use super::{LIVE_WHOLE_BYTES, fingerprint_for, is_placed_movie_plane, video_planes_on};
+
+    #[test]
+    fn recognizes_only_small_linear_single_level_r8_planes() {
+        let mut resource = [3, 0, 0, 0, 1280, 0, 720, 0x1_0001, 61, 1, 0, 1, 0, 0];
+        let mut desc = [0; 16];
+        (desc[0], desc[1], desc[5]) = (61, 4, 1);
+        assert_eq!(is_placed_movie_plane(&resource, &desc, LIVE_WHOLE_BYTES), video_planes_on());
+        resource[11] = 0x100;
+        assert_eq!(is_placed_movie_plane(&resource, &desc, LIVE_WHOLE_BYTES), video_planes_on());
+        assert!(!is_placed_movie_plane(&resource, &desc, LIVE_WHOLE_BYTES + 1));
+        assert!(!is_placed_movie_plane(&resource, &desc, 0));
+        for (word, value) in [(0, 2), (7, 0x2_0001), (7, 0x1_0002), (8, 28), (9, 4), (11, 0x105)] {
+            let mut invalid = resource;
+            invalid[word] = value;
+            assert!(!is_placed_movie_plane(&invalid, &desc, LIVE_WHOLE_BYTES));
+        }
+        desc[4] = 1;
+        assert!(!is_placed_movie_plane(&resource, &desc, LIVE_WHOLE_BYTES));
+    }
+
+    #[test]
+    fn full_digest_detects_an_update_between_sampled_strips() {
+        let mut pixels = vec![0u8; 256 << 10];
+        let at = pixels.as_ptr() as u64;
+        let len = pixels.len() as u64;
+        let before = fingerprint_for(at, len, true);
+        pixels[64 << 10] = 0x5a;
+        assert_ne!(fingerprint_for(at, len, true), before);
     }
 }
 

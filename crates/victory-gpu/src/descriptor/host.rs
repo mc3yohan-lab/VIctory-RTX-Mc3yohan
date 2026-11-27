@@ -5805,32 +5805,113 @@ mod tests {
         rr(size, offset, len).0
     }
 
+    /// A valid start keeps its position. A start beyond the buffer leaves the
+    /// view null, even when the buffer ends with an aligned dword.
     #[test]
-    fn the_raw_range_stays_inside_the_buffer() {
+    fn the_range_stays_inside_the_buffer() {
         assert_eq!(range(1024, 0, 256), Some((0, 64)));
         assert_eq!(range(1024, 768, 512), Some((192, 64)));
-        assert_eq!(range(1024, 1024, 16), None);
-        assert_eq!(range(1024, 1040, 16), None);
-        assert_eq!(range(100, 112, 16), None);
-        assert_eq!(range(100, 96, 16), Some((24, 1)));
+        assert_eq!(range(1024, 1024, 16), None, "a start at the end");
+        assert_eq!(range(1024, 1040, 16), None, "a start past the end");
+        assert_eq!(range(100, 112, 16), None, "no intersection: never the tail");
+        assert_eq!(range(100, 96, 16), Some((24, 1)), "the last dword");
         assert_eq!(range(100, 96, 4), Some((24, 1)));
-        assert_eq!(range(0, 0, 16), None);
-        assert_eq!(range(3, 0, 16), None);
-        assert_eq!(range(1024, 0, 0), Some((0, 1)));
-        assert_eq!(range(1024, 0, 1), Some((0, 1)));
-        assert_eq!(range(1024, 3, 16), None);
-        assert_eq!(range(1024, u64::MAX, 16), None);
-        assert_eq!(range(1024, 0, u64::MAX), Some((0, 256)));
+        assert_eq!(range(0, 0, 16), None, "an empty buffer");
+        assert_eq!(range(3, 0, 16), None, "no whole dword");
+        assert_eq!(range(1024, 0, 0), Some((0, 1)), "the floor of one element stands");
+        assert_eq!(range(1024, 0, 1), Some((0, 1)), "as does a length under a dword");
+        assert_eq!(range(1024, 3, 16), None, "not on 16 bytes");
+        assert_eq!(range(1024, u64::MAX, 16), None, "no wrap, no clamp back");
+        assert_eq!(range(1024, 0, u64::MAX), Some((0, 256)), "the length is cut");
+    }
+
+    /// Why a request was refused or cut, which is what the counters report.
+    #[test]
+    fn the_cause_is_the_one_the_counters_would_report() {
         assert_eq!(rr(100, 112, 16), (None, Some(Cut::Past)));
         assert_eq!(rr(1024, 3, 16), (None, Some(Cut::Unaligned)));
         assert_eq!(rr(1024, 0, 0), (Some((0, 1)), Some(Cut::Short)));
         assert_eq!(rr(1024, 768, 512), (Some((192, 64)), Some(Cut::Length)));
+        // Nothing cut, nothing refused: no counter is touched at all.
         assert_eq!(rr(1024, 0, 256), (Some((0, 64)), None));
+        assert_eq!(rr(1024, 0, 1020), (Some((0, 255)), None), "255 of 256 dwords");
+    }
+
+    /// `FirstElement` is 64-bit: a start past the 32-bit element index is kept
+    /// as it is, not narrowed to `u32::MAX`.
+    #[test]
+    fn a_start_past_32_bits_is_kept() {
         let size = 1u64 << 40;
         let offset = (u64::from(u32::MAX) + 10) * 16;
-        assert_eq!(range(size, offset, 64), Some((offset / 4, 16)));
+        let range = range(size, offset, 64).expect("inside the buffer");
+        assert_eq!(range.0, offset / 4);
+        assert!(range.0 > u64::from(u32::MAX));
+        assert_eq!(range.1, 16);
+    }
+
+    /// `NumElements` is 32-bit: the length alone is cut at `u32::MAX`.
+    #[test]
+    fn the_length_is_cut_at_32_bits() {
+        let size = 1u64 << 40;
         assert_eq!(range(size, 0, u64::MAX), Some((0, u32::MAX)));
+    }
+
+    /// An aligned start far past a buffer is still refused: alignment is not a
+    /// reason to accept a request, and the check is not reached by the
+    /// unaligned case first.
+    #[test]
+    fn an_aligned_start_past_the_buffer_is_refused() {
+        let size = 1u64 << 40;
         assert_eq!(rr(size, 1u64 << 60, 64), (None, Some(Cut::Past)));
+        assert_eq!(rr(size, size, 64), (None, Some(Cut::Past)));
+        assert_eq!(rr(size, size - 16, 64), (Some((size / 4 - 4, 4)), Some(Cut::Length)));
+    }
+
+    /// Accepted ranges preserve the start and fit within the buffer.
+    #[test]
+    fn accepted_ranges_hold_their_invariant() {
+        let sizes = [0u64, 1, 3, 4, 100, 1024, 4096, 1 << 30];
+        let offsets = [0u64, 4, 16, 48, 96, 112, 1024, 1040, 4096, u64::MAX];
+        let lens = [0u64, 1, 3, 4, 16, 512, 1 << 20, u64::MAX];
+        for size in sizes {
+            for offset in offsets {
+                for len in lens {
+                    let (range, _) = raw_range(size, offset, len);
+                    let aligned = offset.is_multiple_of(16);
+                    let inside = offset / 4 < size / 4;
+                    match range {
+                        Some(range) => {
+                            assert!(range.elements > 0, "{size} {offset} {len}");
+                            assert_eq!(
+                                range.first,
+                                offset / 4,
+                                "{size} {offset} {len}: the start moved"
+                            );
+                            assert_eq!(range.first % 4, 0, "a raw view starts on 16 bytes");
+                            assert!(
+                                range.first + u64::from(range.elements) <= size / 4,
+                                "{size} {offset} {len}: {} + {} past the buffer",
+                                range.first,
+                                range.elements
+                            );
+                        }
+                        None => assert!(
+                            !(aligned && inside),
+                            "{size} {offset} {len}: refused though the rules allow it"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_raw_range_stays_inside_the_buffer() {
+        the_range_stays_inside_the_buffer();
+        the_cause_is_the_one_the_counters_would_report();
+        a_start_past_32_bits_is_kept();
+        the_length_is_cut_at_32_bits();
+        an_aligned_start_past_the_buffer_is_refused();
     }
 
     /// Every host sampler heap backs all 2,048 hardware descriptors and

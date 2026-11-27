@@ -699,10 +699,8 @@ fn skip_raymarched_local_lights() -> bool {
     })
 }
 
-/// Broken Wave32 water tiled lighting compute shaders (`CS_TransmissionVolumetrics_Tiled`
-/// and `_Tiled_LocalLights`): in Wave32 fallback mode they leave black rectangular tiles on
-/// open water and cost ~15 ms GPU/frame (trustno1-coder@35c15608 / fxceless README).
-/// Skipped by default on 32-lane hosts unless `VICTORY_WATER_LIGHT=1`.
+/// Open-water tiled lighting shaders covered by the default Wave32 pairing list.
+/// `VICTORY_WATER_LIGHT=0` disables them for troubleshooting.
 #[cfg(windows)]
 const WATER_LIGHT_HASHES: [&str; 2] = ["5dc3b25986622949", "6f225b641c5b0708"];
 
@@ -710,14 +708,11 @@ const WATER_LIGHT_HASHES: [&str; 2] = ["5dc3b25986622949", "6f225b641c5b0708"];
 fn skip_water_light() -> bool {
     static SKIP: OnceLock<bool> = OnceLock::new();
     *SKIP.get_or_init(|| {
-        let on = !std::env::var_os("VICTORY_WATER_LIGHT").is_some_and(|v| v == "1")
-            && victory_shader::emit::host_settings()[0] == 32;
-        if on {
-            tracing::info!(
-                "skipping broken Wave32 tiled water lighting shaders (VICTORY_WATER_LIGHT=1 enables them)"
-            );
+        let skip = std::env::var_os("VICTORY_WATER_LIGHT").is_some_and(|v| v == "0");
+        if skip {
+            tracing::info!("skipping tiled water lighting shaders (VICTORY_WATER_LIGHT=0)");
         }
-        on
+        skip
     })
 }
 
