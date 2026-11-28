@@ -68,6 +68,8 @@ En el primer inicio, el asistente te guiará en **3 pasos simples**:
 
 En **Ajustes → Motor del perfil** puedes guardar el motor junto al nombre del perfil. El perfil local **Nítido 1080p** usa salida 1920×1080. Para repetir su preparación desde PowerShell, ejecuta `Start-Process .\target\release\VIctory-RTX.exe -ArgumentList --prepare-current-profile -Wait -PassThru` y comprueba `ExitCode`.
 
+Para jugar con el perfil guardado desde PowerShell, usa `--play-current-profile` en el mismo comando. Aplica los ajustes del botón **Jugar**, muestra el nombre del perfil coincidente en el registro y espera a que cierre el motor.
+
 Si desaparecen superficies u objetos en el motor local con Series X, abre **Ajustes → Pantalla y Calidad Gráfica** y activa **Recuperar terreno en mallas indirectas (Series X)**. Guarda el ajuste con otro nombre de perfil si quieres comparar la misma escena y vuelve a iniciar el juego. Los perfiles anteriores cargan con la casilla desactivada.
 
 También puedes elegir el ejecutable externo de VIctory-NVIDIA. Con Series X, su modo **1080p → 1440p** renderiza a 1920×1080 y presenta a 2560×1440. **DLSS Calidad + FG 2×** usa la resolución interna de DLSS y requiere las bibliotecas oficiales de NVIDIA Streamline. **F1** guarda ajustes de ese modo. **Jugar** abre el juego y **Precargar y jugar** recorre el catálogo del motor antes del arranque. Cada modo externo tiene su propia caché. Los dos comparten una carpeta de partidas independiente de la del motor local. [Publicaciones de VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA/releases).

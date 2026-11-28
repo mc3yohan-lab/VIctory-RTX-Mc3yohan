@@ -125,6 +125,8 @@ Double-click **`Launch-VIctory-RTX.cmd`** (or `target\release\VIctory-RTX.exe`) 
 
 Under **Ajustes → Motor del perfil**, each named profile can select a runtime. To prepare the saved local profile without starting the game, run `Start-Process .\target\release\VIctory-RTX.exe -ArgumentList --prepare-current-profile -Wait -PassThru` in PowerShell and check `ExitCode`.
 
+To play using your saved profile from PowerShell, use `--play-current-profile` in the same command. It applies the settings from the **Jugar** button, records the matching profile name in the log and waits for the runtime to exit.
+
 If surfaces or objects disappear on the local Series X runtime, open **Ajustes → Pantalla y Calidad Gráfica** and enable **Recuperar terreno en mallas indirectas (Series X)**. Save a second named profile to compare the same scene, then restart the game. Existing profiles load with this option turned off.
 
 The optional VIctory-NVIDIA executable offers **1080p → 1440p** (1920×1080 scene on Series X) and **DLSS Quality + FG 2×** (DLSS chooses the input size). The latter requires the official NVIDIA Streamline libraries. **F1** saves settings for the current mode. **Jugar** starts the game, while **Precargar y jugar** processes that engine’s catalog before starting it. Both external modes have independent caches and share their own save directory. [VIctory-NVIDIA releases](https://github.com/trustno1-coder/VIctory-NVIDIA/releases).

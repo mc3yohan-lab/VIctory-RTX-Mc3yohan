@@ -1357,7 +1357,7 @@ impl VictoryLauncherApp {
                                 std::thread::sleep(Duration::from_millis(20));
                             }
                         }
-                        match self.runner.start_play(&self.engine, &self.cfg, &self.hw) {
+                        match self.runner.start_play(&self.engine, &self.cfg, &self.hw).map(drop) {
                             Ok(()) => {
                                 self.set_toast(
                                     "Iniciando juego... Puedes ver los FPS en la pestaña Logs.",
@@ -2600,15 +2600,20 @@ impl eframe::App for VictoryLauncherApp {
     }
 }
 
-fn prepare_current_profile() -> Result<(), String> {
+fn run_current_profile(action: TaskKind) -> Result<(), String> {
     let engine = EnginePaths::discover();
     let (cfg, warning) = config::load_config(engine.repo_root.as_deref());
     if let Some(warning) = warning {
         return Err(warning);
     }
     let runner = ProcessRunner::default();
-    let task = runner.start_local_preparation(&engine, &cfg, HardwareInfo::probe(), TaskKind::PrepareAll)?;
-    let result = task.join().map_err(|_| "El hilo de preparación terminó inesperadamente.".to_owned())?;
+    let hw = HardwareInfo::probe();
+    let task = match action {
+        TaskKind::Play => runner.start_play(&engine, &cfg, &hw)?,
+        TaskKind::PrepareAll => runner.start_local_preparation(&engine, &cfg, hw, action)?,
+        _ => return Err("Acción no admitida para el perfil actual.".into()),
+    };
+    let result = task.join().map_err(|_| format!("{} terminó inesperadamente.", action.label_es()))?;
     let snapshot = runner.snapshot();
     for line in snapshot.logs {
         println!("{line}");
@@ -2620,8 +2625,14 @@ fn prepare_current_profile() -> Result<(), String> {
 }
 
 fn main() -> eframe::Result<()> {
-    if std::env::args_os().skip(1).eq(["--prepare-current-profile"]) {
-        if let Err(error) = prepare_current_profile() {
+    let mut args = std::env::args_os().skip(1);
+    let action = match (args.next().as_deref(), args.next()) {
+        (Some(flag), None) if flag == "--prepare-current-profile" => Some(TaskKind::PrepareAll),
+        (Some(flag), None) if flag == "--play-current-profile" => Some(TaskKind::Play),
+        _ => None,
+    };
+    if let Some(action) = action {
+        if let Err(error) = run_current_profile(action) {
             eprintln!("{error}");
             std::process::exit(1);
         }

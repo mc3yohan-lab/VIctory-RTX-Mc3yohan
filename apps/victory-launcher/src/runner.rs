@@ -696,7 +696,7 @@ impl ProcessRunner {
         engine: &EnginePaths,
         cfg: &LauncherConfig,
         hw: &HardwareInfo,
-    ) -> Result<(), String> {
+    ) -> Result<std::thread::JoinHandle<Result<(), String>>, String> {
         if cfg.engine != crate::nvidia::Engine::Local {
             return self.start_nvidia(cfg, false);
         }
@@ -751,6 +751,7 @@ impl ProcessRunner {
              GPU      : {} ({} MiB VRAM, Tier {})\n\
              RAM      : {:.1} GB total ({:.1} GB libre, {:.1} GB commit libre) | {} hilos\n\
              Perfil   : {} | Consola: {} | Salida: {} | Escala: {:?}\n\
+             Ajustes guardados: {:?}\n\
              Build    : {} | PortRT={} | Thin={} | LiveTex={} | VideoPlanes={}\n\
              ==============================================================\n",
             env!("CARGO_PKG_VERSION"),
@@ -766,6 +767,7 @@ impl ProcessRunner {
             console,
             cfg.effective_output(hw).label_es(),
             cfg.effective_scale(hw),
+            cfg.matching_profile().unwrap_or("Ajustes sin perfil coincidente"),
             if running_diag { "diag" } else { "release" },
             cfg.port_rt,
             cfg.effective_thin(hw),
@@ -796,7 +798,7 @@ impl ProcessRunner {
             .clone()
             .or_else(|| victory_exe.parent().map(Path::to_path_buf));
         let state = self.state.clone();
-        std::thread::spawn(move || {
+        Ok(std::thread::spawn(move || {
             let mut log_file = OpenOptions::new()
                 .create_new(true)
                 .write(true)
@@ -831,19 +833,23 @@ impl ProcessRunner {
                 TaskKind::Play,
             );
             let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+            let success = matches!(&code, Ok(0));
             let note = match code {
                 Ok(0) => "Partida cerrada correctamente.".to_owned(),
                 _ if st.cancel_requested => "Partida detenida. Consulta el registro para comprobar el cierre.".to_owned(),
                 Ok(c) => format!("El juego terminó con código {c}. Revisa 'Logs y Soporte' si hubo un error."),
                 Err(e) => format!("No se pudo iniciar el motor: {e}"),
             };
-            st.finish(note);
-        });
-
-        Ok(())
+            st.finish(note.clone());
+            if success { Ok(()) } else { Err(note) }
+        }))
     }
 
-    fn start_nvidia(&self, cfg: &LauncherConfig, preload: bool) -> Result<(), String> {
+    fn start_nvidia(
+        &self,
+        cfg: &LauncherConfig,
+        preload: bool,
+    ) -> Result<std::thread::JoinHandle<Result<(), String>>, String> {
         if is_victory_already_running() {
             return Err("Ya hay un motor en ejecución. Termina esa sesión antes de abrir VIctory-NVIDIA.".into());
         }
@@ -858,22 +864,25 @@ impl ProcessRunner {
         let mut log = File::create_new(&path).map_err(|e| e.to_string())?;
         writeln!(log, "{} | {} | F1 puede modificar los ajustes efectivos", cfg.engine.label(), command.get_program().to_string_lossy())
             .map_err(|e| e.to_string())?;
+        writeln!(log, "Ajustes guardados: {:?}", cfg.matching_profile().unwrap_or("Ajustes sin perfil coincidente"))
+            .map_err(|e| e.to_string())?;
         st.start(TaskKind::NvidiaPlay)?;
         st.metrics = RunMetrics { last_log_path: Some(path), ..Default::default() };
         push_log_locked(&mut st, if preload { "Precargando gráficos antes de jugar con VIctory-NVIDIA." } else { "Iniciando VIctory-NVIDIA." }.to_owned());
         drop(st);
         let state = self.state.clone();
-        std::thread::spawn(move || {
+        Ok(std::thread::spawn(move || {
             let code = run_command(&state, command, Some(log), TaskKind::NvidiaPlay, true);
             let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+            let success = matches!(&code, Ok(0));
             let note = match code {
                 Ok(0) => "Partida de VIctory-NVIDIA cerrada.".to_owned(),
                 Ok(code) => format!("VIctory-NVIDIA terminó con código {code}. Consulta el registro."),
                 Err(e) => e,
             };
-            st.finish(note);
-        });
-        Ok(())
+            st.finish(note.clone());
+            if success { Ok(()) } else { Err(note) }
+        }))
     }
 
     pub fn start_prep(
@@ -884,7 +893,7 @@ impl ProcessRunner {
         kind: TaskKind,
     ) -> Result<(), String> {
         if cfg.engine != crate::nvidia::Engine::Local {
-            return self.start_nvidia(cfg, true);
+            return self.start_nvidia(cfg, true).map(drop);
         }
         self.start_local_preparation(engine, cfg, hw, kind).map(drop)
     }
