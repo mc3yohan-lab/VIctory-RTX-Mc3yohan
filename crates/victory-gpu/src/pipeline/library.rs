@@ -449,7 +449,7 @@ fn library() -> Option<&'static Library> {
         .get_or_init(|| {
             let _opening = crate::timeline::span("pipeline: open the host pipeline library");
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
+            let blob = native_blob(DIR.get().map(PathBuf::as_path), gpu_capturer())?;
             let library = open(&device, blob);
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
@@ -457,6 +457,28 @@ fn library() -> Option<&'static Library> {
             library
         })
         .as_ref()
+}
+
+fn native_blob(dir: Option<&std::path::Path>, capture: Option<&str>) -> Option<Blob> {
+    // A wrapped device can serialize a different format. PIX returned 848
+    // bytes after rejecting a valid native library. Direct PSO creation also
+    // leaves the native blob's pending replacement and usage lists alone.
+    if let Some(tool) = capture {
+        tracing::info!(tool, "GPU capture uses direct PSO creation; native pipeline library preserved");
+        return None;
+    }
+    Some(dir.map_or(Blob::None, Blob::of))
+}
+
+/// Check after device creation, when both externally launched and
+/// programmatically armed capturers have loaded their D3D12 layer.
+fn gpu_capturer() -> Option<&'static str> {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::core::w;
+    [("PIX", w!("WinPixGpuCapturer.dll")), ("RenderDoc", w!("renderdoc.dll"))]
+        .into_iter()
+        // SAFETY: static NUL-terminated names; borrowed handles are only tested for presence.
+        .find_map(|(name, dll)| (!unsafe { GetModuleHandleW(dll) }.is_null()).then_some(name))
 }
 
 /// The library in `blob`, or an empty one if the host rejects the blob (an
@@ -933,6 +955,21 @@ mod tests {
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(matches!(library._blob, Blob::None));
+    }
+
+    #[test]
+    fn gpu_captures_preserve_the_native_library_and_its_pending_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join(LIBRARY_FILE);
+        let pending = dir.path().join(NEXT_FILE);
+        std::fs::write(&current, b"native").unwrap();
+        std::fs::write(&pending, b"pending native save").unwrap();
+        for tool in ["PIX", "RenderDoc"] {
+            assert!(native_blob(Some(dir.path()), Some(tool)).is_none());
+            assert_eq!(std::fs::read(&current).unwrap(), b"native");
+            assert_eq!(std::fs::read(&pending).unwrap(), b"pending native save");
+        }
+        assert_eq!(native_blob(Some(dir.path()), None).unwrap().bytes(), b"pending native save");
     }
 
     /// A mapped file reads as the file's bytes, a file written through a
