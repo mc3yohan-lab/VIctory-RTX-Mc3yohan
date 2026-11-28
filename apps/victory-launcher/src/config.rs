@@ -228,6 +228,8 @@ pub struct LauncherSettings {
     pub mouse_sens: f32,
     pub mouse_invert_y: bool,
     pub smooth_motion: bool,
+    #[serde(default)]
+    pub mesh_indirect_x_only: bool,
     pub wait_textures: bool,
     pub tex_store: bool,
     pub live_textures: bool,
@@ -296,6 +298,7 @@ impl Default for LauncherSettings {
             mouse_sens: 1.0,
             mouse_invert_y: false,
             smooth_motion: false,
+            mesh_indirect_x_only: false,
             wait_textures: false,
             tex_store: false,
             live_textures: true,
@@ -870,8 +873,18 @@ impl LauncherConfig {
                 == Some(1.0)
             && setting("VICTORY_UPSCALER").and_then(|value| value.parse::<u32>().ok()) == Some(6)
             && matches!(setting("VICTORY_FSR_4K"), None | Some("0"));
+        // A named profile's terrain switch is local to Series X. A manual override
+        // wins even when its spelling differs in case on Windows.
+        const MESH_MODE: &str = "VICTORY_MESH_INDIRECT_X_ONLY";
+        let apply_mesh_mode = self.mesh_indirect_x_only
+            && self.engine == crate::nvidia::Engine::Local
+            && !is_series_s
+            && setting(MESH_MODE).is_none();
         if native_1080p && setting("VICTORY_DISPLAY_MODE").is_none() {
             env.insert("VICTORY_DISPLAY_MODE".into(), "1920x1080".into());
+        }
+        if apply_mesh_mode {
+            env.insert(MESH_MODE.into(), "1".into());
         }
 
         env
@@ -1476,6 +1489,45 @@ mod tests {
         assert!(!env.contains_key("VICTORY_DYNAMIC_SLOTS"));
         cfg.apply_preset(Preset::Fluid720p);
         assert_eq!(cfg.build_run_env(&hw)["VICTORY_TEXTURE_NO_WAIT"], "1");
+    }
+
+    #[test]
+    fn mesh_terrain_round_trips_per_profile_and_matches_the_series_x_run_env() {
+        let hw = mock_hw("NVIDIA GeForce RTX 4090", 24564, 64.0);
+        let old = r#"{"game_dir":"D:/Game","profiles":{"d:\\game":{"Control":{}}}}"#;
+        let mut cfg: LauncherConfig = serde_json::from_str(old).unwrap();
+        cfg.load_profile("Control").unwrap();
+        assert!(!cfg.mesh_indirect_x_only);
+        let control = cfg.build_run_env(&hw);
+        let variable = "VICTORY_MESH_INDIRECT_X_ONLY";
+        assert!(!control.contains_key(variable));
+
+        let mut expected = control.clone();
+        expected.insert(variable.into(), "1".into());
+        cfg.mesh_indirect_x_only = true;
+        cfg.create_profile("Terreno").unwrap();
+        let saved = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(saved["mesh_indirect_x_only"], true);
+        let mut cfg: LauncherConfig = serde_json::from_value(saved).unwrap();
+        cfg.load_profile("Terreno").unwrap();
+        assert_eq!(cfg.build_run_env(&hw), expected);
+
+        for key in [variable, "victory_mesh_indirect_x_only"] {
+            cfg.extra_env = format!("{key}=0");
+            let mut manual = control.clone();
+            manual.insert(key.into(), "0".into());
+            assert_eq!(cfg.build_run_env(&hw), manual);
+        }
+        cfg.extra_env.clear();
+        cfg.console = ConsoleModel::SeriesS;
+        assert!(!cfg.build_run_env(&hw).contains_key(variable));
+        cfg.console = ConsoleModel::SeriesX;
+        for engine in [crate::nvidia::Engine::Nvidia1080, crate::nvidia::Engine::NvidiaDlss2x] {
+            cfg.engine = engine;
+            assert!(!cfg.build_run_env(&hw).contains_key(variable));
+        }
+        cfg.load_profile("Control").unwrap();
+        assert_eq!(cfg.build_run_env(&hw), control);
     }
 
     #[test]

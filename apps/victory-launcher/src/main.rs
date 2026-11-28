@@ -1808,6 +1808,20 @@ impl VictoryLauncherApp {
                     }
 
                     ui.add_space(8.0);
+                    if self.cfg.effective_console(&self.hw) == "series-x"
+                        && ui
+                            .add_enabled(
+                                !is_running,
+                                egui::Checkbox::new(
+                                    &mut self.cfg.mesh_indirect_x_only,
+                                    "Recuperar terreno en mallas indirectas (Series X)",
+                                ),
+                            )
+                            .on_hover_text("Recupera suelo y objetos que desaparecen en algunas escenas. Se aplica al iniciar el juego.")
+                            .changed()
+                    {
+                        changed = true;
+                    }
                     if ui
                         .checkbox(
                             &mut self.cfg.smooth_motion,
