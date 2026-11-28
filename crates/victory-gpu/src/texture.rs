@@ -101,6 +101,9 @@ pub(crate) struct Staging {
 #[derive(Default)]
 struct Last {
     hash: Option<Digest>,
+    /// Eight bytes of the last successful direct snapshot, used only to
+    /// detect a change early; a match always requires the full digest.
+    direct_sample: Option<u64>,
     asked: u64,
     /// A conversion finished and its staging bytes can be copied (`avatarmanz#419`).
     ready_for_upload: bool,
@@ -128,6 +131,7 @@ impl Last {
         if hash.is_some() && self.hash == hash {
             return false;
         }
+        self.direct_sample = None;
         self.ready_for_upload = convert();
         if !self.ready_for_upload {
             self.hash = None;
@@ -560,6 +564,67 @@ fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
 fn through_copy() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_COPY").is_some_and(|v| v == "1"))
+}
+
+/// Opt in to hashing and detiling an owned copy after releasing the title's
+/// mapping lock (alexis27yt, fxceless/victory-fork #1078).
+fn short_hold() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SHORT_HOLD").is_some_and(|v| v == "1"))
+}
+
+fn with_locked_snapshot<R>(
+    mapped: crate::watch::Reading,
+    size: usize,
+    copy: impl FnOnce(&mut [u8]),
+    convert: impl FnOnce(&[u8]) -> R,
+) -> R {
+    with_read(size, |bytes| {
+        copy(bytes);
+        drop(mapped);
+        convert(bytes)
+    })
+}
+
+fn sample_snapshot(bytes: &[u8]) -> u64 {
+    u64::from_le_bytes(std::array::from_fn(|i| bytes[i * (bytes.len() - 1) / 7]))
+}
+
+/// The whole span must have been checked readable under `mapped`.
+unsafe fn refresh_direct_snapshot(
+    mapped: crate::watch::Reading,
+    memory: *const u8,
+    size: usize,
+    previous: Option<Digest>,
+    sample: Option<u64>,
+    convert: impl FnOnce(&[u8], Option<Digest>) -> usize,
+) -> usize {
+    if let Some(previous) = previous {
+        // SAFETY: the caller checked the span, and its mapping is still held.
+        let tiled = unsafe { std::slice::from_raw_parts(memory, size) };
+        if sample.is_none_or(|sample| sample == sample_snapshot(tiled)) {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+            let current = digest(tiled);
+            if previous == current {
+                return size;
+            }
+            // A change between the sample positions is commonly a sparse
+            // edit. The digest is already paid for: finish the original
+            // in-place refresh instead of copying and hashing it all again.
+            let size = convert(tiled, Some(current));
+            drop(mapped);
+            return size;
+        }
+    }
+    // The mapping guard stabilizes addresses, not title writes. The digest
+    // used for the upload must always describe these same copied bytes.
+    with_locked_snapshot(mapped, size, |bytes| {
+        // SAFETY: `mapped` is held while copying the span into disjoint scratch.
+        unsafe { std::ptr::copy_nonoverlapping(memory, bytes.as_mut_ptr(), size) };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::TexDirectSnapshotBytes, size as u64);
+    }, |snapshot| convert(snapshot, None))
 }
 
 /// Calls `f` with the `size` bytes of title memory at `memory`, read
@@ -1579,7 +1644,7 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
+        let mapped = if no_wait() {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
@@ -1603,6 +1668,12 @@ impl Staging {
         } else {
             waited(2, crate::watch::title_memory_reading)
         };
+        // On-demand detiling also queries the residency of individual mips.
+        // Keep its mapping stable until it has finished those queries.
+        let short = !self.on_demand && short_hold();
+        let copy_pages = |bytes: &mut [u8]| {
+            crate::host::copy_mapped(bytes.as_mut_ptr(), self.memory, size, false);
+        };
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
             // there, the usual state while it streams in. Read through the
@@ -1618,10 +1689,12 @@ impl Staging {
             last.partial = Some(frame);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-            let changed = with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                last.convert_partial(read, || self.detile(read))
-            });
+            let convert = |read: &[u8]| last.convert_partial(read, || self.detile(read));
+            let changed = if short {
+                with_locked_snapshot(mapped, size, copy_pages, convert)
+            } else {
+                with_title(self.memory, size, convert)
+            };
             #[cfg(feature = "diagnostics")]
             if changed {
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -1631,11 +1704,20 @@ impl Staging {
             }
             return size;
         }
-        let mut refresh_whole = |tiled: &[u8]| {
-            let hash = digest(tiled);
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+        let copy = through_copy();
+        let direct = short && !copy && ((64 << 10)..=(32 << 20)).contains(&size)
+            && crate::ram_profile::read_cache_budget().is_none_or(|budget| size <= budget);
+        let (previous, sample) = (last.hash, last.direct_sample);
+        let mut refresh_whole = |tiled: &[u8], checked: Option<Digest>| {
+            let hash = checked.unwrap_or_else(|| {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+                digest(tiled)
+            });
             if last.convert(Some(hash), || self.detile(tiled)) {
+                if direct {
+                    last.direct_sample = Some(sample_snapshot(tiled));
+                }
                 found_blind(last);
                 self.keep_whole(tiled, hash.0);
                 #[cfg(feature = "diagnostics")]
@@ -1643,13 +1725,23 @@ impl Staging {
             }
             size
         };
-        if through_copy() {
-            return with_title(self.memory, size, refresh_whole);
+        if copy {
+            let convert = |tiled: &[u8]| refresh_whole(tiled, None);
+            if short {
+                return with_locked_snapshot(mapped, size, copy_pages, convert);
+            }
+            return with_title(self.memory, size, convert);
+        }
+        // A direct refresh normally needs no scratch space. Copy only a
+        // changed, substantial texture, with a per-thread upper bound.
+        if direct {
+            // SAFETY: the whole span was checked as committed under `mapped`.
+            return unsafe { refresh_direct_snapshot(mapped, self.memory, size, previous, sample, refresh_whole) };
         }
         // SAFETY: committed memory of the texture's layout size, and it
-        // stays committed while `_mapped` is held.
+        // stays committed while `mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        refresh_whole(tiled)
+        refresh_whole(tiled, None)
     }
 
     fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
@@ -2423,8 +2515,89 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
 }
 
 #[cfg(test)]
+#[path = "texture_snapshot_bench.rs"]
+mod snapshot_bench;
+
+#[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    #[test]
+    fn matching_sample_still_checks_the_whole_direct_texture() {
+        let mut bytes = vec![0; 64 << 10];
+        let previous = super::digest(&bytes);
+        let sample = super::sample_snapshot(&bytes);
+        for change in [None, Some(73), Some(0)] {
+            if let Some(i) = change {
+                bytes[i] ^= 0x80;
+            }
+            let mut converted = false;
+            // SAFETY: the synthetic source stays allocated through the call.
+            unsafe {
+                super::refresh_direct_snapshot(
+                    crate::watch::title_memory_reading(), bytes.as_ptr(), bytes.len(),
+                    Some(previous), Some(sample), |tiled, checked| {
+                        converted = true;
+                        assert_eq!(tiled, bytes);
+                        let in_place = change == Some(73);
+                        assert_eq!(std::ptr::eq(tiled.as_ptr(), bytes.as_ptr()), in_place);
+                        assert_eq!(checked, in_place.then(|| super::digest(tiled)));
+                        bytes.len()
+                    },
+                );
+            }
+            assert_eq!(converted, change.is_some());
+        }
+    }
+
+    #[test]
+    fn a_remap_can_finish_while_the_snapshot_is_detiled() {
+        use std::sync::{Mutex, mpsc};
+        use std::time::Duration;
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d, width: 128, height: 128, depth: 2, mips: 3,
+            element_bytes: 4, block: 1, samples: 1, swizzle: Swizzle::SW_64KB_S,
+        }).unwrap();
+        let detile = |bytes: &[u8]| {
+            let mut output = Vec::new();
+            for slice in 0..layout.slices {
+                for mip in 0..3 {
+                    let pitch = (128 >> mip) * 4;
+                    let size = pitch * (128 >> mip);
+                    let begin = output.len();
+                    output.resize(begin + size, 0);
+                    layout.detile(bytes, mip, slice, &mut output[begin..], pitch, size).unwrap();
+                }
+            }
+            output
+        };
+        let original: Vec<u8> = (0..layout.size).map(|i| i.wrapping_mul(137) as u8).collect();
+        let expected = detile(&original);
+        let source = Mutex::new(original);
+        std::thread::scope(|scope| {
+            let mapped = crate::watch::title_memory_reading();
+            let (waiting, writer_started) = mpsc::channel();
+            let (replaced, writer_done) = mpsc::channel();
+            let source = &source;
+            scope.spawn(move || {
+                waiting.send(()).unwrap();
+                let _changing = crate::watch::title_memory_remapping();
+                source.lock().unwrap().fill(0x2d);
+                replaced.send(()).unwrap();
+            });
+            writer_started.recv().unwrap();
+            super::with_locked_snapshot(mapped, layout.size as usize, |scratch| {
+                scratch.copy_from_slice(&source.lock().unwrap());
+                assert!(matches!(writer_done.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            }, |snapshot| {
+                writer_done.recv_timeout(Duration::from_secs(10)).expect("remap blocked during conversion");
+                assert_eq!(detile(snapshot), expected);
+                assert!(source.lock().unwrap().iter().all(|&byte| byte == 0x2d));
+            });
+        });
+    }
 
     #[test]
     fn streamed_texture_counts_readable_mips_between_holes() {
