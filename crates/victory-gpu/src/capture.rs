@@ -10,6 +10,8 @@ use std::path::PathBuf;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+pub(crate) mod pix;
+
 /// A frame armed from the capture folder while the title is running.
 static REQUESTED_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -132,6 +134,7 @@ static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u
 
 /// At the present of `frame`: the draws run on the host so far.
 pub(crate) fn frame_drew(frame: u64, drawn: u64) {
+    pix::on_present(frame);
     use std::sync::atomic::Ordering::Relaxed;
     static MARKER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     let marker = MARKER.get_or_init(|| {
