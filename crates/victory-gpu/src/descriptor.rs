@@ -2099,6 +2099,9 @@ mod tests {
         );
     }
 
+    #[cfg(all(windows, feature = "diagnostics"))]
+    include!("descriptor/split_cbv_test.rs");
+
     #[test]
     fn heaps_hold_count_descriptors_from_their_start() {
         let null = std::ptr::null();

@@ -1703,13 +1703,16 @@ impl State {
     /// The pipeline, the root signatures and the heaps are set by the next
     /// draw or dispatch (`bind`, which is told here that the host list has
     /// none); root arguments, vertex and index buffers are set by every
-    /// draw anyway. The dynamic descriptor slots and the tables made in
-    /// them stay: the parts before the cut have not run yet, and they are
-    /// given back when the title's list is reset.
+    /// draw anyway. Earlier parts still own their slots until submission
+    /// finishes. A table with copied constants needs a new slot and fill
+    /// in this part; a table of in-place views stays valid across the cut.
     /// shortcut: the render target views are made again from the handles'
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
     pub(crate) fn replay(&mut self, list: &HostList) {
+        // OP-lite noticed stale CBV scratch after a cut. Invalidate only
+        // tables backed by a fill in the earlier part, keeping its slots live.
+        self.fresh_tables.retain(|_, table| !table.copied_constants);
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
@@ -4695,7 +4698,7 @@ impl State {
                 made.push((slot, u32::MAX));
                 continue;
             };
-            self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
+            let mut copied_constants = false;
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
@@ -4782,6 +4785,7 @@ impl State {
                         };
                         let slot = (std::ptr::from_ref(heap) as usize, index);
                         list.defer_constants(to, address as *const u8, size as usize, slot);
+                        copied_constants = true;
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {
@@ -4817,6 +4821,7 @@ impl State {
                     }
                 }
             }
+            self.fresh_tables.insert(key, FreshTable { first, copied_constants, epoch: 0, ready: Vec::new() });
             made.push((slot, first * 32));
         }
         made
@@ -5560,6 +5565,7 @@ impl<T, const N: usize> std::ops::DerefMut for Few<T, N> {
 /// A table made afresh in dynamic slots, in a list ([`State::tables`]).
 struct FreshTable {
     first: u32,
+    copied_constants: bool,
     /// The list's epoch ([`HostList::epoch`]) at which all its entries that
     /// these readers (a stage's list of what it reads, whether it stores, the
     /// tested depth target) read were brought up to date, and whether that read the
