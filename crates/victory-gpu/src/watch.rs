@@ -4267,6 +4267,13 @@ mod parts_tests {
     }
 }
 
+/// A simulated submission owns the process-wide standing query until it ends.
+#[cfg(test)]
+pub(crate) fn one_asking_test() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4678,12 +4685,6 @@ mod tests {
                 VirtualFree((p + block * BLOCK) as *mut _, 0, MEM_RELEASE);
             }
         }
-    }
-
-    /// Serializes tests that toggle the global `ask_once` standing query.
-    fn one_asking_test() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// A write between another thread's asking about a range and the second
@@ -6260,6 +6261,7 @@ mod port7_tests {
     /// before asking is told of that write.
     #[test]
     fn no_write_is_lost_with_port_7() {
+        let _one = one_asking_test();
         askers_and_a_submission(1);
         askers_and_a_submission(2);
     }
