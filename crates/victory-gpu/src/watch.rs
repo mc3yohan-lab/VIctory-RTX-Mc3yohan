@@ -3923,6 +3923,9 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// neither guarded nor writable) and a kernel read into it fail, so the
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
     forget_holes(at, len);
     crate::texback::remapped(at, len);
     open(&title_memory_changed(at, len), at, at.saturating_add(len));
@@ -3934,11 +3937,14 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// before the unmapping would leave the address guarded, clean and known by
 /// its bits ([`PUBLISHED`]) with no view behind it.
 pub fn title_memory_unmapping(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
     forget_holes(at, len);
     crate::texback::remapped(at, len);
     forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     let mut g = title_memory_changed(at, len);
-    if CHANGING.get().0 && len != 0 {
+    if CHANGING.get().0 {
         CHANGING.set((true, true));
         let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
         match g.changing.last_mut() {

@@ -358,6 +358,9 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
 /// the views that touch it are forgotten (the runtime tells again those it
 /// maps anew).
 pub(crate) fn views_gone(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
     let mut v = views_mut();
     if v.views.is_empty() {
         return;
@@ -1392,6 +1395,11 @@ pub(crate) mod tests {
         title_memory_view(at, 4 * K64, 77, 0);
         title_memory_view(at + 4 * K64, K64, 77, 4 * K64 as u64);
         assert_eq!(cover(at, 5 * K64), Cover::Run(77, 0));
+        for empty_notification in [crate::title_memory_unmapping, crate::title_memory_remapped, views_gone] {
+            empty_notification(at, 0);
+            empty_notification(at + K64 + 1, 0);
+            assert_eq!(cover(at, 5 * K64), Cover::Run(77, 0));
+        }
         // One page inside the first view goes: the whole view is forgotten
         // (the runtime maps and tells again what stays of it).
         views_gone(at + K64, K64);
