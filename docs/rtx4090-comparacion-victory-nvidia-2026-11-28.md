@@ -124,6 +124,22 @@ Los primeros 900 s acumulados de juego confirmado incluyeron navegación, aproxi
 
 También se verificaron **15 minutos consecutivos** desde el estacionamiento hasta el muelle, con caminata y natación. Las 61 observaciones visuales y los 823 sondeos de control cubrieron el intervalo continuo de 1499,736 a 2399,736 s desde el arranque. En 172 muestras completas, los FPS nativos fueron **6,0 de mínimo, 14,65 de mediana y 22,3 de máximo**. Hubo 161 muestras por debajo de 20 y ninguna llegó a 30. De 13.398 intervalos entre presentaciones, el 79,39 % superó 50 ms. Los percentiles 95 y 99 fueron 117,70 y 161,05 ms. La partida cerró normalmente y los 14 archivos personales comprobados conservaron sus huellas.
 
+### Dos minutos con el bloqueo corto de texturas
+
+Se comparó el perfil de terreno con una segunda copia que activó únicamente `VICTORY_TEXTURE_SHORT_HOLD=1`. Las dos partidas comenzaron con el mismo guardado y cachés de 25.803 archivos de contenido idéntico. Se repitieron 120 s de timón y acelerador en la misma misión bajo el puente. Ambas empezaron con la lancha en agua abierta, con la boya a distinta distancia. A los 30 s una trayectoria estaba más cerca de un islote y a los 90 s el estado del objetivo también difería. Windows compartió su caché de controlador entre las dos pasadas.
+
+| Medida | Perfil de terreno | Con bloqueo corto |
+|---|---:|---:|
+| FPS nativos de mediana | 12,90 | 12,05 |
+| Muestras por debajo de 20 FPS | 19 de 21 | 22 de 22 |
+| Espera acumulada de mapeo de texturas por cuadro, mediana | 37,10 ms | 45,55 ms |
+| P95 / P99 entre presentaciones | 213,25 / 366,27 ms | 184,27 / 273,18 ms |
+| Intervalos por encima de 50 ms | 67,33 % | 90 % |
+
+Las dos rutas dieron resultados mixtos y atendieron a geometría distinta. Una observación de la segunda pasada mostró un rectángulo oscuro que cubría parte de la izquierda. La siguiente, 0,24 s después, mostró la zona despejada. Su origen queda sin determinar.
+
+En la cinemática de la piscina se identificó el mismo plano por los dos sombreros y las parejas a ambos lados. Con el perfil habitual aparecieron la cubierta y las tumbonas. En la pasada con bloqueo corto faltaban ambas, los personajes tenían caras planas y los 2.432 píxeles de una zona de suelo de 76×32 estaban casi negros, frente a cero en el control. Ambos arranques confirmaron el ajuste de malla activo y la misma biblioteca. La pose y los trabajos de compilación pendientes diferían, y sólo hubo un arranque por variante. La imagen empeoró en esa pasada. Hace falta aislar su causa. El ajuste quedó desactivado en el perfil de juego. Se verificó el cierre y la integridad de los 14 archivos personales y del launcher en la segunda pasada.
+
 ## Verificación del launcher publicado
 
 La rama con el ajuste de terreno por perfil pasó Clippy y ambas suites de GitHub Actions para Windows. Pasaron 1.227 pruebas en configuración normal y 1.281 con diagnóstico. Las pruebas incluyen perfiles anteriores, nombres personalizados y que la casilla afecte únicamente al motor local Series X. Se compiló el launcher en release y se conservó la misma compilación del motor para las comparaciones. [CI de la revisión 43b24d1](https://github.com/mc3yohan-lab/VIctory-RTX-Mc3yohan/actions/runs/46146751601)
@@ -137,6 +153,8 @@ Una de las fuentes públicas de Neptune es el port de zm0kie de la edición de T
 El árbol público de PossiblyPix, presentado como Project Neptune 1.0, incluye launcher y generación de cuadros. Su README reporta una mediana de 8,9 FPS y 6,1 en el décimo inferior durante pasadas de siete minutos con Ryzen 5 5600 y RTX 5070. La medición carece de resolución y estado de generación de cuadros. Ninguno de estos dos repositorios tenía una release publicada en GitHub al consultarlos. Tampoco se pudo vincular una afirmación pública de 24 FPS con un ejecutable identificable y una medición equivalente a nuestra ruta. [Árbol de código y resultados de Project Neptune](https://github.com/PossiblyPix/ProjectNeptune/blob/3f5b4d5abf3205e581c5ff47bd660ec9ee2df124/README.md)
 
 El port de Neptune propone mantener la textura anterior mientras sube su sustituta para evitar destellos de cielo negro. El motor local ya hace esto para determinadas sustituciones con `VICTORY_KEEP_SHOWN`, cuyo valor predeterminado es 1. El candidato concreto para comparar es la validación de comandos indirectos después de la escritura en GPU. En nuestra rama hay que medir tanto los dibujos recuperados como los omitidos y el tiempo de cuadro antes de cambiar el comportamiento del perfil. [Descriptores en la rama probada](https://github.com/mc3yohan-lab/VIctory-RTX-Mc3yohan/blob/43b24d1272d181305750c621f9ae38fea3e5a579/crates/victory-gpu/src/descriptor/host.rs#L5382)
+
+Hay un conflicto concreto en los comandos de malla. El filtro de Neptune lee X, Y y Z como dimensiones y pone a cero las tres si alguna supera 65.535. En los registros de Series X que sólo especifican X, el relleno de Y o Z puede superar ese límite. Aplicar ese filtro a estos registros descartaría trabajo válido que nuestra corrección de la piscina recupera. La parte que se puede probar por separado es la de `Draw` y `DrawIndexed` de un solo registro, manteniendo la invalidación si otra escritura modifica ese rango antes del siguiente dibujo. [Filtro de mallas de Neptune](https://github.com/zm0kiemedia/Neptune_VI/blob/b900c6467c17b488dc448cf7f81ecb248f6b0573/crates/victory-gpu/src/indirect.rs#L378-L386) · [Ruta de dibujos indirectos de Neptune](https://github.com/zm0kiemedia/Neptune_VI/blob/b900c6467c17b488dc448cf7f81ecb248f6b0573/crates/victory-gpu/src/draw.rs#L3640-L3670)
 
 ## Diagnóstico de un cuadro D3D12
 
