@@ -2228,14 +2228,15 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
     true
 }
 
-/// How many bytes of `[at, at + len)` are committed memory: all of a
-/// texture that is there, some of one streaming in (its smaller mips lie
-/// at the start of its memory, and their pages are mapped first), none of
-/// one not there. With neither the first nor the last page committed the
-/// answer is none without a look at the pages between (two queries for the
-/// slots whose texture is away, which are asked again and again).
+/// How many bytes of a streamed texture are resident. The first resident mip
+/// can lie between two holes (TaynanGT/Vice-Tay #365).
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+        PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+    };
+    const READ: u32 = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY
+        | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
     if len == 0 {
         return 0;
     }
@@ -2251,10 +2252,9 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     {
         return there;
     }
-    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
-        return 0;
-    }
-    if !by_query() {
+    // For title mappings with a readable first page, keep sampling at the
+    // console's block granularity. A leading hole can end inside a block.
+    if !by_query() && committed(at, 1) {
         static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *BY_PAGE.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
             // By page, without the walk: whole pages, cut to the range.
@@ -2291,7 +2291,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         if n == 0 || next <= p {
             break;
         }
-        if info.State == MEM_COMMIT {
+        if info.State == MEM_COMMIT && info.Protect & READ != 0 && info.Protect & PAGE_GUARD == 0 {
             there += (next - p) as u64;
         }
         p = next;
@@ -2425,6 +2425,41 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    #[test]
+    fn streamed_texture_counts_readable_mips_between_holes() {
+        use windows_sys::Win32::System::Memory::*;
+
+        const PAGE: usize = 4096;
+        const HOLE: usize = 64 << 20;
+        // SAFETY: all queried addresses belong to this private reservation.
+        // Only VirtualQuery inspects the guard page, so its guard must survive.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), HOLE + 10 * PAGE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            for (index, pages, protection) in [
+                (2, 2, PAGE_READWRITE),
+                (4, 1, PAGE_READWRITE | PAGE_GUARD),
+                (5, 1, PAGE_NOACCESS),
+                (6, 1, PAGE_EXECUTE),
+                (7, 1, PAGE_EXECUTE_READ),
+            ] {
+                let at = base.add(HOLE + index * PAGE).cast();
+                assert_eq!(VirtualAlloc(at, pages * PAGE, MEM_COMMIT, protection), at);
+            }
+
+            let middle = super::mapped_bytes(base.add(17), HOLE + 9 * PAGE);
+            let clipped = super::mapped_bytes(base.add(HOLE + PAGE + 17), PAGE);
+            let empty = super::mapped_bytes(base, HOLE + 2 * PAGE);
+            let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            assert_ne!(VirtualQuery(base.add(HOLE + 4 * PAGE).cast(), &mut info, size_of_val(&info)), 0);
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+            assert_eq!(middle, (3 * PAGE) as u64);
+            assert_eq!(clipped, 17);
+            assert_eq!(empty, 0);
+            assert_ne!(info.Protect & PAGE_GUARD, 0);
+        }
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does
