@@ -44,12 +44,15 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
     if sgd5::is_sgd5(data) {
         out.extend(sgd5::records(data).map(Source::Packed));
     }
-    let raw = memchr::memmem::find_iter(data, b"DXBC")
-        .filter(|&offset| Container::parse(&data[offset..]).is_ok())
-        .map(|offset| Source::Raw {
+    let raw = memchr::memmem::find_iter(data, b"DXBC").filter_map(|offset| {
+        // The runtime keys a shader by its bytecode. An embedded container
+        // may be followed by more shaders or unrelated executable data.
+        let container = Container::parse(&data[offset..]).ok()?;
+        Some(Source::Raw {
             offset,
-            data: &data[offset..],
-        });
+            data: container.input,
+        })
+    });
     out.extend(raw);
     out
 }
@@ -218,4 +221,25 @@ fn format_instruction(i: &Instruction, wave64: bool) -> String {
         None => format!("<{:?} {:#x}>", i.encoding, i.opcode),
     };
     format!("    {:06x}: {:<44} {text}", i.offset, words.join(" "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_shader_keys_match_standalone_bytecode() {
+        // Minimum valid DXBC header with no parts.
+        let mut shader = [0u8; 32];
+        shader[..4].copy_from_slice(b"DXBC");
+        shader[20] = 1;
+        shader[24] = 32;
+        let file = [b"prefix".as_slice(), &shader, b"padding", &shader, b"DXBC"].concat();
+        let records = sources(&file);
+        assert_eq!(records.len(), 2);
+        for (record, offset) in records.iter().zip([6, 45]) {
+            assert!(matches!(record, Source::Raw { offset: found, .. } if *found == offset));
+            assert_eq!(record.bytes().unwrap().as_ref(), shader);
+        }
+    }
 }
