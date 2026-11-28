@@ -17,7 +17,7 @@ impl Engine {
     pub fn label(self) -> &'static str {
         match self {
             Self::Local => "VIctory-RTX local",
-            Self::Nvidia1080 => "VIctory-NVIDIA · 1080p → 1440p",
+            Self::Nvidia1080 => "VIctory-NVIDIA · 1080p a 1440p",
             Self::NvidiaDlss2x => "VIctory-NVIDIA · DLSS Calidad + FG 2×",
         }
     }
