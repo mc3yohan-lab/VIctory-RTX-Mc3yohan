@@ -41,7 +41,9 @@ pub fn run(
     let began = Instant::now();
     victory_hle::known_pipelines::use_translations(dir.with_file_name("shaders"));
     let fingerprint = known::fingerprint();
-    let done_file = dir.join("warm-done.txt");
+    // Legacy warm-done.txt also recorded attempts without a host pipeline.
+    // Recheck those entries once, keeping the driver's cache and crash list.
+    let done_file = dir.join("warm-host-ready.txt");
     let bad_file = dir.join("warm-bad.txt");
     let keys = known::keys(&dir);
     let listed = std::fs::read_to_string(&done_file).unwrap_or_default();
@@ -50,7 +52,11 @@ pub fn run(
         if let Some((of, key)) = line.split_once(' ')
             && of == fingerprint
         {
-            done.insert(key);
+            if let Some(revoked) = key.strip_prefix('-') {
+                done.remove(revoked);
+            } else {
+                done.insert(key);
+            }
         }
     }
     let (bad, stale) = known::bad_keys(&std::fs::read_to_string(&bad_file).unwrap_or_default(), &fingerprint);
@@ -84,6 +90,20 @@ pub fn run(
     // (Read back by the runs: these are made beside the others, not before.)
     let slow_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(dir.join("slow-pipelines.txt"))?);
     let bad_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(&bad_file)?);
+    let verified = Mutex::new(done);
+    let write_error = OnceLock::new();
+    let record = |n: usize, ready: bool| {
+        let key = keys[n].as_str();
+        let mut confirmed = lock(&verified);
+        let changed = if ready { confirmed.insert(key) } else { confirmed.remove(key) };
+        if changed {
+            // A forced recheck can revoke an older success for this fingerprint.
+            let mark = if ready { "" } else { "-" };
+            if let Err(error) = writeln!(lock(&done_out), "{fingerprint} {mark}{key}") {
+                let _ = write_error.set(error);
+            }
+        }
+    };
     run_batches(
         &all,
         jobs,
@@ -101,9 +121,12 @@ pub fn run(
                 let _ = std::io::stdout().flush();
             }
             drop(state);
-            let _ = writeln!(lock(&done_out), "{fingerprint} {}", keys[n]);
+            // Yorivel (VIctory-NVIDIA 5ed66db): a refused or disabled pipeline
+            // can succeed on a later warm with different settings.
+            record(n, there);
         },
         |n, why| {
+            record(n, false);
             println!("pipeline {n} {}: {why}", keys[n]);
             let _ = writeln!(lock(&bad_out), "{}", known::bad_line(&keys[n], &fingerprint, &why));
             lock(&state).2 += 1;
@@ -113,8 +136,8 @@ pub fn run(
     times.sort_by(f64::total_cmp);
     let at = |q: f64| times.get((times.len() as f64 * q) as usize).copied().unwrap_or(0.0);
     println!(
-        "{} made in {:.0} s ({refused} have no host pipeline, {crashed} ended their process); ms each: median {:.1}, p90 {:.1}, p99 {:.1}, most {:.0}, sum {:.0} s",
-        times.len(),
+        "{} host pipelines ready in {:.0} s ({refused} have no host pipeline, {crashed} ended their process); ms per attempt: median {:.1}, p90 {:.1}, p99 {:.1}, most {:.0}, sum {:.0} s",
+        times.len() - refused,
         began.elapsed().as_secs_f64(),
         at(0.5),
         at(0.9),
@@ -122,14 +145,18 @@ pub fn run(
         times.last().copied().unwrap_or(0.0),
         times.iter().sum::<f64>() / 1e3
     );
+    if let Some(error) = write_error.into_inner() {
+        return Err(error).context("could not update the verified host pipeline list");
+    }
     if save_library {
+        let verified = verified.into_inner().unwrap_or_else(|e| e.into_inner());
         let lib_began = Instant::now();
         let bad_text = std::fs::read_to_string(&bad_file).unwrap_or_default();
         let (bad_now, _) = known::bad_keys(&bad_text, &fingerprint);
         let mut targets: Vec<usize> = (0..keys.len())
             .filter(|&n| {
                 let key = keys[n].as_str();
-                !bad_now.contains(key) && (!used || early.contains(key))
+                verified.contains(key) && !bad_now.contains(key) && (!used || early.contains(key))
             })
             .collect();
         targets.sort_by_key(|&n| (!early.contains(keys[n].as_str()), &keys[n]));
