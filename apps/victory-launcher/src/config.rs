@@ -203,6 +203,8 @@ pub struct LauncherConfig {
     pub config_version: u32,
     pub wizard_completed: bool,
     pub game_dir: String,
+    pub nvidia_executable: Option<PathBuf>,
+    pub nvidia_streamline: Option<PathBuf>,
     #[serde(flatten)]
     pub settings: LauncherSettings,
     profiles: BTreeMap<String, BTreeMap<String, LauncherSettings>>,
@@ -212,6 +214,7 @@ pub struct LauncherConfig {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LauncherSettings {
+    pub engine: crate::nvidia::Engine,
     pub preset: Preset,
     pub console: ConsoleModel,
     pub output: OutputRes,
@@ -255,6 +258,8 @@ impl Default for LauncherConfig {
             config_version: CURRENT_CONFIG_VERSION,
             wizard_completed: false,
             game_dir: String::new(),
+            nvidia_executable: None,
+            nvidia_streamline: None,
             settings: LauncherSettings::default(),
             profiles: BTreeMap::new(),
             active_profile: None,
@@ -279,6 +284,7 @@ impl DerefMut for LauncherConfig {
 impl Default for LauncherSettings {
     fn default() -> Self {
         Self {
+            engine: crate::nvidia::Engine::Local,
             preset: Preset::Auto,
             console: ConsoleModel::Auto,
             output: OutputRes::Auto,

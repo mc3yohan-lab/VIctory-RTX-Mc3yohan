@@ -7,6 +7,8 @@
 mod art;
 mod config;
 mod hardware;
+mod nvidia;
+mod nvidia_session;
 mod runner;
 mod theme;
 
@@ -738,6 +740,13 @@ impl VictoryLauncherApp {
         snap: &runner::RunnerSnapshot,
         is_running: bool,
     ) {
+        if self.cfg.engine != nvidia::Engine::Local {
+            ui.label("La precarga de VIctory-NVIDIA se inicia desde Jugar y abre la partida al terminar.");
+            if ui.button("Abrir launcher").clicked() {
+                self.finish_wizard();
+            }
+            return;
+        }
         let verified = self.preparation_verified();
         ui.horizontal(|ui| {
             theme::paint_badge_icon(
@@ -1228,7 +1237,7 @@ impl VictoryLauncherApp {
         // --- HERO CINEMATOGRÁFICO (ocupa el protagonismo, 0 textos cortados ni centrados) ---
         let avail_w = ui.available_width();
         let avail_h = ui.available_height();
-        let reserve_bottom = if is_running && snap.running != Some(TaskKind::Play) {
+        let reserve_bottom = if is_running && !snap.running.is_some_and(TaskKind::is_play) {
             165.0_f32
         } else {
             92.0_f32
@@ -1270,7 +1279,7 @@ impl VictoryLauncherApp {
                 );
                 ui.add_space(2.0);
                 ui.label(
-                    RichText::new("VIctory-RTX-Mc3yohan")
+                    RichText::new(if self.cfg.engine == nvidia::Engine::Local { "VIctory-RTX-Mc3yohan" } else { "VIctory-NVIDIA" })
                         .color(Color32::WHITE)
                         .strong()
                         .size(title_size),
@@ -1308,8 +1317,10 @@ impl VictoryLauncherApp {
                         self.runner.stop();
                     }
                 } else {
-                    let can_play = self.game.ready()
-                        && self.engine.active_victory(self.cfg.use_diag_build).is_some();
+                    let can_play = self.game.ready() && match self.cfg.engine {
+                        nvidia::Engine::Local => self.engine.active_victory(self.cfg.use_diag_build).is_some(),
+                        _ => nvidia::executable(&self.cfg).is_file(),
+                    };
                     let play = Button::new(
                         RichText::new("JUGAR")
                             .strong()
@@ -1363,6 +1374,22 @@ impl VictoryLauncherApp {
         ui.add_space(14.0);
 
         // --- UNA sola barra limpia de control rápido debajo del Hero ---
+        if self.cfg.engine != nvidia::Engine::Local {
+            theme::bento_card().show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(self.cfg.engine.label());
+                    if ui.add_enabled(!is_running && self.game.ready(), Button::new("Precargar y jugar")).clicked()
+                        && let Err(err) = self.runner.start_prep(&self.engine, &self.cfg, self.hw.clone(), TaskKind::PrepareAll)
+                    {
+                        self.set_toast(err, theme::STATUS_ERR);
+                    }
+                    if ui.button("Ajustes del motor").clicked() {
+                        self.tab = Tab::Ajustes;
+                    }
+                });
+            });
+            return;
+        }
         let pad = (self.frames_drawn >= 2).then(|| self.controllers.poll().clone());
         Frame::new()
             .fill(theme::BG_CARD)
@@ -1488,7 +1515,7 @@ impl VictoryLauncherApp {
 
         // Progreso en vivo solo cuando corre una tarea de preparación/importación/actualización.
         if let Some(task) = snap.running
-            && task != TaskKind::Play
+            && !task.is_play()
         {
             ui.add_space(10.0);
             theme::bento_card().show(ui, |ui| {
@@ -1563,6 +1590,18 @@ impl VictoryLauncherApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 // Carpeta del juego y caché de gráficos.
+                self.ui_engine_choice(ui, is_running, &mut changed);
+                ui.add_space(8.0);
+                if self.cfg.engine != nvidia::Engine::Local {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(&self.cfg.game_dir);
+                        if ui.add_enabled(!is_running, Button::new("Elegir carpeta del juego")).clicked() {
+                            self.pick_game_folder(ctx);
+                        }
+                    });
+                    self.ui_game_profiles(ui, is_running);
+                    return;
+                }
                 theme::bento_card().show(ui, |ui| {
                     ui.label(
                         RichText::new("Carpeta del juego y gráficos")
@@ -1929,6 +1968,54 @@ impl VictoryLauncherApp {
         if changed {
             self.persist();
         }
+    }
+
+    fn ui_engine_choice(&mut self, ui: &mut egui::Ui, running: bool, changed: &mut bool) {
+        use nvidia::Engine::{Local, Nvidia1080, NvidiaDlss2x};
+        theme::bento_card().show(ui, |ui| {
+            ui.add_enabled_ui(!running, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Motor del perfil");
+                    egui::ComboBox::from_id_salt("profile-engine").selected_text(self.cfg.engine.label()).show_ui(ui, |ui| {
+                        for opt in [Local, Nvidia1080, NvidiaDlss2x] {
+                            *changed |= ui.selectable_value(&mut self.cfg.engine, opt, opt.label()).changed();
+                        }
+                    });
+                });
+                if self.cfg.engine == Local { return; }
+                ui.label(if self.cfg.engine == Nvidia1080 {
+                    "Series X · Escena 1920×1080, salida 2560×1440, DLSS y generación apagados."
+                } else {
+                    "Series X · Salida 2560×1440. DLSS Calidad determina la resolución interna. FG 2× muestra un cuadro generado por cuadro renderizado."
+                });
+                ui.label("F1 guarda cambios en este modo y tiene prioridad al reiniciar. Ambos modos comparten partidas propias, separadas del motor local.");
+                let exe = nvidia::executable(&self.cfg);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(exe.display().to_string());
+                    if ui.button("Elegir victory.exe").clicked()
+                        && let Some(path) = rfd::FileDialog::new().add_filter("Motor oficial", &["exe"]).pick_file()
+                    {
+                        self.cfg.nvidia_executable = Some(path);
+                        *changed = true;
+                    }
+                });
+                if !exe.is_file() {
+                    ui.colored_label(theme::STATUS_WARN, "Falta el ejecutable de VIctory-NVIDIA.");
+                    ui.hyperlink_to("Versiones oficiales", "https://github.com/trustno1-coder/VIctory-NVIDIA/releases");
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(dir) = &self.cfg.nvidia_streamline {
+                        ui.label(dir.display().to_string());
+                    }
+                    if ui.button("Elegir carpeta de NVIDIA Streamline").clicked()
+                        && let Some(path) = rfd::FileDialog::new().pick_folder()
+                    {
+                        self.cfg.nvidia_streamline = Some(path);
+                        *changed = true;
+                    }
+                });
+            });
+        });
     }
 
     fn ui_logs(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, snap: &runner::RunnerSnapshot) {
@@ -2499,7 +2586,33 @@ impl eframe::App for VictoryLauncherApp {
     }
 }
 
+fn prepare_current_profile() -> Result<(), String> {
+    let engine = EnginePaths::discover();
+    let (cfg, warning) = config::load_config(engine.repo_root.as_deref());
+    if let Some(warning) = warning {
+        return Err(warning);
+    }
+    let runner = ProcessRunner::default();
+    let task = runner.start_local_preparation(&engine, &cfg, HardwareInfo::probe(), TaskKind::PrepareAll)?;
+    let result = task.join().map_err(|_| "El hilo de preparación terminó inesperadamente.".to_owned())?;
+    let snapshot = runner.snapshot();
+    for line in snapshot.logs {
+        println!("{line}");
+    }
+    if let Some(note) = snapshot.last_exit_note {
+        println!("{note}");
+    }
+    result
+}
+
 fn main() -> eframe::Result<()> {
+    if std::env::args_os().skip(1).eq(["--prepare-current-profile"]) {
+        if let Err(error) = prepare_current_profile() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("VIctory-RTX-Mc3yohan")

@@ -66,6 +66,10 @@ En el primer inicio, el asistente te guiará en **3 pasos simples**:
 2. **Preparar gráficos (1 clic):** Traduce los shaders a DXIL Wave32 **v6** (`~975 MB`) y precalienta la biblioteca de pipelines (`host-pipelines.bin`, `~255 MB`) dejando 2 núcleos libres para tu PC. Solo necesitas hacerlo una vez (o tras actualizar el traductor) para evitar congelamientos y tirones al jugar.
 3. **Elegir perfil y jugar:** Selecciona el perfil acorde a tu tarjeta gráfica y pulsa **JUGAR**.
 
+En **Ajustes → Motor del perfil** puedes guardar el motor junto al nombre del perfil. El perfil local **Nítido 1080p** usa salida 1920×1080. Para repetir su preparación desde PowerShell, ejecuta `Start-Process .\target\release\VIctory-RTX.exe -ArgumentList --prepare-current-profile -Wait -PassThru` y comprueba `ExitCode`.
+
+También puedes elegir el ejecutable externo de VIctory-NVIDIA. Con Series X, su modo **1080p → 1440p** renderiza a 1920×1080 y presenta a 2560×1440. **DLSS Calidad + FG 2×** usa la resolución interna de DLSS y requiere las bibliotecas oficiales de NVIDIA Streamline. **F1** guarda ajustes de ese modo. **Jugar** abre el juego y **Precargar y jugar** recorre el catálogo del motor antes del arranque. Cada modo externo tiene su propia caché. Los dos comparten una carpeta de partidas independiente de la del motor local. [Publicaciones de VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA/releases).
+
 ### Paso 3 — ¿Qué perfil gráfico elegir?
 
 | Perfil en el Launcher | Resolución de salida | Escala interna | Ideal para |

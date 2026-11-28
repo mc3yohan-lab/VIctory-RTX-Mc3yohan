@@ -38,6 +38,7 @@ const GAME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskKind {
     Play,
+    NvidiaPlay,
     Warm,
     PrepareAll,
     ImportCache,
@@ -45,9 +46,14 @@ pub enum TaskKind {
 }
 
 impl TaskKind {
+    pub fn is_play(self) -> bool {
+        matches!(self, Self::Play | Self::NvidiaPlay)
+    }
+
     pub fn label_es(self) -> &'static str {
         match self {
             Self::Play => "Juego en ejecución",
+            Self::NvidiaPlay => "VIctory-NVIDIA en ejecución",
             Self::Warm => "Acelerando escenas (pipelines)",
             Self::PrepareAll => "Preparando gráficos y escenas",
             Self::ImportCache => "Importando caché existente",
@@ -673,7 +679,7 @@ impl ProcessRunner {
     pub fn stop(&self) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if st.request_stop() {
-            let message = if st.running == Some(TaskKind::Play) {
+            let message = if st.running.is_some_and(TaskKind::is_play) {
                 "[launcher] Solicitando el cierre del juego para guardar la caché..."
             } else {
                 "[launcher] Cancelando la tarea..."
@@ -691,6 +697,9 @@ impl ProcessRunner {
         cfg: &LauncherConfig,
         hw: &HardwareInfo,
     ) -> Result<(), String> {
+        if cfg.engine != crate::nvidia::Engine::Local {
+            return self.start_nvidia(cfg, false);
+        }
         if is_victory_already_running() {
             return Err("Ya hay una instancia de victory.exe abierta. Ciérrala antes de iniciar otra partida.".to_owned());
         }
@@ -834,6 +843,39 @@ impl ProcessRunner {
         Ok(())
     }
 
+    fn start_nvidia(&self, cfg: &LauncherConfig, preload: bool) -> Result<(), String> {
+        if is_victory_already_running() {
+            return Err("Ya hay un motor en ejecución. Termina esa sesión antes de abrir VIctory-NVIDIA.".into());
+        }
+        let game = GameFilesStatus::inspect(Path::new(&cfg.game_dir));
+        let title = game.exe_path.ok_or("Selecciona una carpeta de juego válida.")?;
+        let mut command = crate::nvidia::command(cfg, &title, preload)?;
+        command.creation_flags(CREATE_NO_WINDOW);
+        std::fs::create_dir_all(data_dir()).map_err(|e| e.to_string())?;
+        let time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis();
+        let path = data_dir().join(format!("nvidia-run-{time}.log"));
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut log = File::create_new(&path).map_err(|e| e.to_string())?;
+        writeln!(log, "{} | {} | F1 puede modificar los ajustes efectivos", cfg.engine.label(), command.get_program().to_string_lossy())
+            .map_err(|e| e.to_string())?;
+        st.start(TaskKind::NvidiaPlay)?;
+        st.metrics = RunMetrics { last_log_path: Some(path), ..Default::default() };
+        push_log_locked(&mut st, if preload { "Precargando gráficos antes de jugar con VIctory-NVIDIA." } else { "Iniciando VIctory-NVIDIA." }.to_owned());
+        drop(st);
+        let state = self.state.clone();
+        std::thread::spawn(move || {
+            let code = run_command(&state, command, Some(log), TaskKind::NvidiaPlay, true);
+            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+            let note = match code {
+                Ok(0) => "Partida de VIctory-NVIDIA cerrada.".to_owned(),
+                Ok(code) => format!("VIctory-NVIDIA terminó con código {code}. Consulta el registro."),
+                Err(e) => e,
+            };
+            st.finish(note);
+        });
+        Ok(())
+    }
+
     pub fn start_prep(
         &self,
         engine: &EnginePaths,
@@ -841,6 +883,22 @@ impl ProcessRunner {
         hw: HardwareInfo,
         kind: TaskKind,
     ) -> Result<(), String> {
+        if cfg.engine != crate::nvidia::Engine::Local {
+            return self.start_nvidia(cfg, true);
+        }
+        self.start_local_preparation(engine, cfg, hw, kind).map(drop)
+    }
+
+    pub fn start_local_preparation(
+        &self,
+        engine: &EnginePaths,
+        cfg: &LauncherConfig,
+        hw: HardwareInfo,
+        kind: TaskKind,
+    ) -> Result<std::thread::JoinHandle<Result<(), String>>, String> {
+        if cfg.engine != crate::nvidia::Engine::Local {
+            return Err("Selecciona un perfil del motor local para preparar sin iniciar el juego.".into());
+        }
         let victory_exe = engine
             .active_victory(cfg.use_diag_build || cfg.gpu_timing)
             .ok_or_else(|| "No se encontró victory.exe.".to_owned())?
@@ -866,18 +924,25 @@ impl ProcessRunner {
             None
         };
 
-        {
-            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            st.start(kind)?;
-            st.progress = PrepProgress {
-                step_label: kind.label_es().to_owned(),
-                ..Default::default()
-            };
-            push_log_locked(&mut st, format!("[launcher] Iniciando: {}...", kind.label_es()));
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.running.is_some() {
+            return Err("Ya hay otra tarea ejecutándose.".into());
         }
-
+        let dir = data_dir();
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis();
+        let log_path = dir.join(format!("nvidia-prep-{time}-{}.log", std::process::id()));
+        let log = File::create_new(&log_path).map_err(|e| e.to_string())?;
+        let library_log = log.try_clone().map_err(|e| e.to_string())?;
+        st.start(kind)?;
+        st.progress = PrepProgress {
+            step_label: kind.label_es().to_owned(),
+            ..Default::default()
+        };
+        push_log_locked(&mut st, format!("[launcher] Iniciando {}. Registro: {}", kind.label_es(), log_path.display()));
+        drop(st);
         let state = self.state.clone();
-        std::thread::spawn(move || {
+        Ok(std::thread::spawn(move || {
             let result = match kind {
                 TaskKind::Warm => {
                     let args = vec![
@@ -892,7 +957,7 @@ impl ProcessRunner {
                         &env,
                         Some(&work_dir),
                         true,
-                        None,
+                        Some(log),
                         kind,
                     )
                 }
@@ -909,7 +974,7 @@ impl ProcessRunner {
                         &env,
                         Some(&work_dir),
                         true,
-                        None,
+                        Some(log),
                         kind,
                     ) {
                         Ok(0) => {
@@ -938,7 +1003,7 @@ impl ProcessRunner {
                                     &env,
                                     Some(&work_dir),
                                     true,
-                                    None,
+                                    Some(library_log),
                                     kind,
                                 )
                             } else {
@@ -967,6 +1032,7 @@ impl ProcessRunner {
                 }
                 _ => result,
             };
+            let success = !st.cancel_requested && matches!(&result, Ok(0));
             let note = match result {
                 _ if st.cancel_requested => "Preparación cancelada.".to_owned(),
                 Ok(0) if st.progress.unsupported > 0 => format!(
@@ -978,10 +1044,9 @@ impl ProcessRunner {
                 Ok(c) => format!("{} terminó con código {c}.", kind.label_es()),
                 Err(e) => format!("Error en {}: {e}", kind.label_es()),
             };
-            st.finish(note);
-        });
-
-        Ok(())
+            st.finish(note.clone());
+            if success { Ok(()) } else { Err(note) }
+        }))
     }
 
     /// Importa en segundo plano caché de shaders, pipelines, FidelityFX y partidas
@@ -1366,32 +1431,35 @@ fn run_command(
         std::thread::spawn(move || pump_reader(pipe, st, lf, kind))
     });
 
-    let mut close_started = None;
-    let mut close_sent = false;
-    let mut interrupted = false;
-    let status = loop {
-        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-            break status;
+    let result = if kind == TaskKind::NvidiaPlay && let Some(group) = &job {
+        crate::nvidia_session::wait(&mut child, group, || stop_requested(state), GAME_SHUTDOWN_TIMEOUT)
+    } else {
+        let mut close_started = None;
+        let mut close_sent = false;
+        loop {
+            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                break Ok(status.code().unwrap_or(-1));
+            }
+            if interruptible && stop_requested(state) {
+                if kind != TaskKind::Play {
+                    drop(job.take());
+                    child.wait().map_err(|e| e.to_string())?;
+                    break Err("Tarea cancelada en ejecución.".to_owned());
+                }
+                let start = close_started.get_or_insert_with(Instant::now);
+                if !close_sent {
+                    close_sent = request_game_close(child.id());
+                }
+                if start.elapsed() >= GAME_SHUTDOWN_TIMEOUT {
+                    let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                    push_log_locked(&mut st, "[launcher] El juego no terminó a tiempo. Cerrando de forma forzada.".to_owned());
+                    drop(st);
+                    kill_and_wait(&mut child).map_err(|e| e.to_string())?;
+                    break Err("Tarea cancelada en ejecución.".to_owned());
+                }
+            }
+            std::thread::sleep(Duration::from_millis(80));
         }
-        if interruptible && stop_requested(state) {
-            if kind != TaskKind::Play {
-                drop(job.take());
-                interrupted = true;
-                break child.wait().map_err(|e| e.to_string())?;
-            }
-            let start = close_started.get_or_insert_with(Instant::now);
-            if !close_sent {
-                close_sent = request_game_close(child.id());
-            }
-            if start.elapsed() >= GAME_SHUTDOWN_TIMEOUT {
-                let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-                push_log_locked(&mut st, "[launcher] El juego no terminó a tiempo. Cerrando de forma forzada.".to_owned());
-                drop(st);
-                interrupted = true;
-                break kill_and_wait(&mut child).map_err(|e| e.to_string())?;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(80));
     };
     // Cierra también cualquier descendiente residual que retenga las tuberías.
     drop(job);
@@ -1403,10 +1471,7 @@ fn run_command(
         let _ = t.join();
     }
 
-    if interrupted {
-        return Err("Tarea cancelada en ejecución.".to_owned());
-    }
-    Ok(status.code().unwrap_or(-1))
+    result
 }
 
 fn stop_requested(state: &Mutex<SharedState>) -> bool {
@@ -1423,7 +1488,7 @@ fn kill_and_wait(child: &mut Child) -> std::io::Result<std::process::ExitStatus>
     child.wait()
 }
 
-fn child_job(child: &Child) -> std::io::Result<OwnedHandle> {
+pub(crate) fn child_job(child: &Child) -> std::io::Result<OwnedHandle> {
     // SAFETY: null asks for an unnamed job with the default security attributes.
     let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
     if handle.is_null() {
@@ -1500,7 +1565,7 @@ fn pump_reader<R: std::io::Read>(
                 }
                 let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
                 match kind {
-                    TaskKind::Play => st.metrics.observe_line(&clean),
+                    TaskKind::Play | TaskKind::NvidiaPlay => st.metrics.observe_line(&clean),
                     TaskKind::Warm | TaskKind::PrepareAll => {
                         st.progress.observe_line(&clean)
                     }
@@ -1581,6 +1646,9 @@ pub fn configured_cache_root(
     cfg: &LauncherConfig,
     hw: &HardwareInfo,
 ) -> PathBuf {
+    if cfg.engine != crate::nvidia::Engine::Local {
+        return crate::nvidia::home(&crate::nvidia::root(), cfg.engine).join("cache");
+    }
     let Some(exe) = engine.active_victory(cfg.use_diag_build || cfg.gpu_timing) else {
         return cache_dir();
     };
@@ -1644,6 +1712,9 @@ pub fn preparation_verified(
     hw: &HardwareInfo,
     title: Option<&Path>,
 ) -> bool {
+    if cfg.engine != crate::nvidia::Engine::Local {
+        return false;
+    }
     let (Some(exe), Some(title)) = (engine.active_victory(cfg.use_diag_build || cfg.gpu_timing), title)
     else { return false };
     let env = runtime_environment(engine, cfg, hw);

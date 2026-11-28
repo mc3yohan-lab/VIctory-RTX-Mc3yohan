@@ -123,6 +123,10 @@ Double-click **`Launch-VIctory-RTX.cmd`** (or `target\release\VIctory-RTX.exe`) 
 3. Pick a preset (**Recomendado**, **Fluido 720p** native `1280×720`, **Equilibrado 1080p**, **Nítido 1080p**, **Alta 1440p**, **4K FSR 3.1**, or **Modo Seguro**), optionally toggle keyboard & mouse look, and press **JUGAR / PLAY**.
 4. Press **`F3`** in-game for the live telemetry HUD, and use the **Logs** tab for sanitized diagnostic reports.
 
+Under **Ajustes → Motor del perfil**, each named profile can select a runtime. To prepare the saved local profile without starting the game, run `Start-Process .\target\release\VIctory-RTX.exe -ArgumentList --prepare-current-profile -Wait -PassThru` in PowerShell and check `ExitCode`.
+
+The optional VIctory-NVIDIA executable offers **1080p → 1440p** (1920×1080 scene on Series X) and **DLSS Quality + FG 2×** (DLSS chooses the input size). The latter requires the official NVIDIA Streamline libraries. **F1** saves settings for the current mode. **Jugar** starts the game, while **Precargar y jugar** processes that engine’s catalog before starting it. Both external modes have independent caches and share their own save directory. [VIctory-NVIDIA releases](https://github.com/trustno1-coder/VIctory-NVIDIA/releases).
+
 ### 3. CLI / PowerShell Alternative (`scripts\play-nvidia.ps1`)
 Copy `victory.example.toml` → `victory.toml`, set `game_dir`, then pre-warm once and run (Normal, Non-Elevated PowerShell):
 ```powershell
