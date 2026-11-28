@@ -10,7 +10,7 @@ mod hardware;
 mod runner;
 mod theme;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -50,12 +50,17 @@ struct VictoryLauncherApp {
     in_wizard: bool,
     wizard_step: u8, // 1, 2, 3
     cfg: LauncherConfig,
+    profile_selection: Option<String>,
+    profile_name: String,
+    confirm_profile_delete: bool,
     hw: HardwareInfo,
     hw_async: Arc<Mutex<Option<HardwareInfo>>>,
     engine: EnginePaths,
     game: GameFilesStatus,
     cache: CacheStatus,
-    cache_async: Arc<Mutex<Option<CacheStatus>>>,
+    cache_root: PathBuf,
+    cache_async: Arc<Mutex<Option<(u64, CacheStatus)>>>,
+    cache_scan_generation: u64,
     cache_exact_started: bool,
     git: Arc<Mutex<GitInfo>>,
     git_checking: Arc<Mutex<bool>>,
@@ -85,9 +90,10 @@ impl VictoryLauncherApp {
         // - Conteo exacto de caché (~230k shaders) y escaneo de logs diferidos
         //   hasta que el usuario abra Ajustes o Logs.
         let hw = HardwareInfo::probe_fast();
-        let cfg = config::load_config(engine.repo_root.as_deref());
+        let (cfg, config_warning) = config::load_config(engine.repo_root.as_deref());
         let game = GameFilesStatus::inspect(Path::new(&cfg.game_dir));
-        let cache = CacheStatus::scan_fast();
+        let cache_root = runner::configured_cache_root(&engine, &cfg, &hw);
+        let cache = CacheStatus::scan_fast(&cache_root);
         let git_local = GitInfo::placeholder(engine.repo_root.as_deref());
 
         let hw_async = Arc::new(Mutex::new(None));
@@ -138,7 +144,7 @@ impl VictoryLauncherApp {
         let in_wizard = !cfg.wizard_completed || !game.ready();
         let wizard_step = if !game.ready() {
             1
-        } else if !cache.shaders_ready() {
+        } else if !runner::preparation_verified(&engine, &cfg, &hw, game.exe_path.as_deref()) {
             2
         } else {
             3
@@ -149,12 +155,17 @@ impl VictoryLauncherApp {
             in_wizard,
             wizard_step,
             cfg,
+            profile_selection: None,
+            profile_name: String::new(),
+            confirm_profile_delete: false,
             hw,
             hw_async,
             engine,
             game,
             cache,
+            cache_root,
             cache_async,
+            cache_scan_generation: 0,
             cache_exact_started: false,
             git,
             git_checking: Arc::new(Mutex::new(false)),
@@ -171,7 +182,7 @@ impl VictoryLauncherApp {
             viewing_file_lines: Vec::new(),
             last_finished_seq: 0,
             frames_drawn: 0,
-            toast: None,
+            toast: config_warning.map(|warning| (warning, theme::STATUS_ERR, Instant::now())),
         }
     }
 
@@ -205,19 +216,42 @@ impl VictoryLauncherApp {
             return;
         }
         self.cache_exact_started = true;
+        self.cache_scan_generation = self.cache_scan_generation.wrapping_add(1);
+        let generation = self.cache_scan_generation;
+        let root = self.cache_root.clone();
         let cache_slot = self.cache_async.clone();
         let ctx_bg = ctx.clone();
         std::thread::spawn(move || {
-            let exact = CacheStatus::scan_exact();
-            *cache_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(exact);
+            let exact = CacheStatus::scan_exact(&root);
+            let mut slot = cache_slot.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.as_ref().is_none_or(|(existing, _)| generation >= *existing) {
+                *slot = Some((generation, exact));
+            }
             ctx_bg.request_repaint();
         });
+    }
+
+    fn refresh_cache_root(&mut self) -> bool {
+        let root = runner::configured_cache_root(&self.engine, &self.cfg, &self.hw);
+        if self.cache_root == root {
+            return false;
+        }
+        self.cache_root = root;
+        self.cache = CacheStatus::scan_fast(&self.cache_root);
+        self.cache_exact_started = false;
+        self.cache_scan_generation = self.cache_scan_generation.wrapping_add(1);
+        true
+    }
+
+    fn preparation_verified(&self) -> bool {
+        runner::preparation_verified(&self.engine, &self.cfg, &self.hw, self.game.exe_path.as_deref())
     }
 
     fn refresh_status(&mut self, ctx: &egui::Context) {
         self.engine = EnginePaths::discover();
         self.game = GameFilesStatus::inspect(Path::new(&self.cfg.game_dir));
-        self.cache = CacheStatus::scan_fast();
+        let _ = self.refresh_cache_root();
+        self.cache = CacheStatus::scan_fast(&self.cache_root);
         if self.tab == Tab::Ajustes || self.cache_exact_started {
             self.ensure_cache_exact(ctx, true);
         }
@@ -230,10 +264,43 @@ impl VictoryLauncherApp {
         }
     }
 
-    fn persist(&mut self) {
+    fn persist(&mut self) -> bool {
         if let Err(e) = config::save_config(&self.cfg, self.engine.repo_root.as_deref()) {
             self.set_toast(e, theme::STATUS_ERR);
+            return false;
         }
+        let _ = self.refresh_cache_root();
+        true
+    }
+
+    fn save_candidate(&mut self, candidate: LauncherConfig) -> bool {
+        let previous = std::mem::replace(&mut self.cfg, candidate);
+        if self.persist() {
+            return true;
+        }
+        self.cfg = previous;
+        false
+    }
+
+    fn change_game_folder(&mut self, folder: &Path, ctx: &egui::Context) -> bool {
+        if let Err(error) = victory_core::ensure_outside_repo(folder) {
+            self.set_toast(error.to_string(), theme::STATUS_ERR);
+            return false;
+        }
+        if !GameFilesStatus::inspect(folder).ready() {
+            self.set_toast("Esa carpeta no contiene los archivos del juego.", theme::STATUS_WARN);
+            return false;
+        }
+        let mut candidate = self.cfg.clone();
+        candidate.set_game_dir(folder.to_string_lossy().into_owned());
+        if !self.save_candidate(candidate) {
+            return false;
+        }
+        self.profile_selection = None;
+        self.profile_name.clear();
+        self.confirm_profile_delete = false;
+        self.refresh_status(ctx);
+        true
     }
 
     fn pick_game_folder(&mut self, ctx: &egui::Context) {
@@ -241,29 +308,19 @@ impl VictoryLauncherApp {
         if !self.cfg.game_dir.is_empty() {
             dialog = dialog.set_directory(&self.cfg.game_dir);
         }
-        if let Some(folder) = dialog.pick_folder() {
-            self.cfg.game_dir = folder.to_string_lossy().into_owned();
-            self.persist();
-            self.refresh_status(ctx);
-            if self.game.ready() {
-                self.set_toast("Carpeta del juego lista.", theme::STATUS_OK);
-            } else {
-                self.set_toast(
-                    "Esa carpeta no contiene MicrosoftGame.config ni el ejecutable del juego.",
-                    theme::STATUS_WARN,
-                );
-            }
+        if let Some(folder) = dialog.pick_folder()
+            && self.change_game_folder(&folder, ctx)
+        {
+            self.set_toast("Carpeta del juego lista.", theme::STATUS_OK);
         }
     }
 
     fn auto_search_game(&mut self, ctx: &egui::Context) {
         match config::auto_find_game_dir(self.engine.repo_root.as_deref()) {
-            Some(found) => {
-                self.cfg.game_dir = found.to_string_lossy().into_owned();
-                self.persist();
-                self.refresh_status(ctx);
+            Some(found) if self.change_game_folder(&found, ctx) => {
                 self.set_toast("Juego encontrado automáticamente.", theme::STATUS_OK);
             }
+            Some(_) => {}
             None => {
                 self.set_toast(
                     "No se encontró automáticamente. Pulsa 'Elegir carpeta' para ubicarlo.",
@@ -274,10 +331,129 @@ impl VictoryLauncherApp {
     }
 
     fn finish_wizard(&mut self) {
-        self.cfg.wizard_completed = true;
-        self.in_wizard = false;
-        self.tab = Tab::Jugar;
-        self.persist();
+        let mut candidate = self.cfg.clone();
+        candidate.wizard_completed = true;
+        if self.save_candidate(candidate) {
+            self.in_wizard = false;
+            self.tab = Tab::Jugar;
+        }
+    }
+
+    fn edit_game_profiles(
+        &mut self,
+        edit: impl FnOnce(&mut LauncherConfig) -> Result<Option<String>, String>,
+        message: &str,
+    ) {
+        let mut candidate = self.cfg.clone();
+        match edit(&mut candidate) {
+            Ok(selection) => {
+                if self.save_candidate(candidate) {
+                    self.profile_selection = selection;
+                    self.profile_name.clear();
+                    self.confirm_profile_delete = false;
+                    self.set_toast(message, theme::STATUS_OK);
+                }
+            }
+            Err(error) => self.set_toast(error, theme::STATUS_ERR),
+        }
+    }
+
+    fn apply_game_profile(&mut self, name: &str) {
+        self.edit_game_profiles(
+            |cfg| {
+                cfg.load_profile(name)?;
+                Ok(Some(name.into()))
+            },
+            "Perfil aplicado para el próximo inicio.",
+        );
+    }
+
+    fn select_builtin_preset(&mut self, preset: Preset) {
+        let mut candidate = self.cfg.clone();
+        candidate.apply_preset(preset);
+        self.save_candidate(candidate);
+    }
+
+    fn ui_game_profiles(&mut self, ui: &mut egui::Ui, is_running: bool) {
+        theme::bento_card().show(ui, |ui| {
+            ui.label(
+                RichText::new("Perfiles de este juego")
+                    .strong()
+                    .color(theme::ACCENT_BLUE_LIGHT)
+                    .size(14.0),
+            );
+            ui.add_space(6.0);
+            if !self.game.ready() {
+                ui.label("Selecciona la carpeta del juego para guardar sus perfiles.");
+                return;
+            }
+
+            let names: Vec<_> = self.cfg.profile_names().map(str::to_owned).collect();
+            ui.add_enabled_ui(!is_running, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let quality = Preset::quality_for(self.hw.vram_tier);
+                    if ui.button(format!("Usar {}", quality.label_es())).on_hover_text(quality.description_es(&self.hw)).clicked() {
+                        self.select_builtin_preset(quality);
+                    }
+                    if !names.is_empty() {
+                        egui::ComboBox::from_id_salt("game_profiles")
+                            .selected_text(self.profile_selection.as_deref().unwrap_or("Elegir perfil"))
+                            .show_ui(ui, |ui| {
+                                for name in names {
+                                    if ui.selectable_value(&mut self.profile_selection, Some(name.clone()), name).changed() {
+                                        self.confirm_profile_delete = false;
+                                    }
+                                }
+                            });
+                    }
+                    if let Some(name) = self.profile_selection.clone() {
+                        if ui.button("Aplicar").clicked() {
+                            self.apply_game_profile(&name);
+                        }
+                        if ui.button("Guardar cambios en el perfil").clicked() {
+                            self.edit_game_profiles(
+                                |cfg| {
+                                    cfg.update_profile(&name)?;
+                                    Ok(Some(name))
+                                },
+                                "Perfil actualizado con los ajustes actuales.",
+                            );
+                        }
+                        if ui.button("Eliminar perfil").clicked() {
+                            self.confirm_profile_delete = true;
+                        }
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.profile_name)
+                        .hint_text("Nombre del perfil")
+                        .desired_width(172.0)
+                        .char_limit(48));
+                    let has_name = !self.profile_name.trim().is_empty();
+                    if ui.add_enabled(has_name, Button::new("Guardar como perfil")).clicked() {
+                        let name = self.profile_name.clone();
+                        self.edit_game_profiles(|cfg| cfg.create_profile(&name).map(Some), "Perfil guardado.");
+                    }
+                    if let Some(previous) = self.profile_selection.clone()
+                        && ui.add_enabled(has_name, Button::new("Cambiar nombre")).clicked()
+                    {
+                        let name = self.profile_name.clone();
+                        self.edit_game_profiles(|cfg| cfg.rename_profile(&previous, &name).map(Some), "Nombre actualizado.");
+                    }
+                });
+                if self.confirm_profile_delete && let Some(name) = self.profile_selection.clone() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(format!("¿Eliminar «{name}»?"));
+                        if ui.button("Confirmar eliminación").clicked() {
+                            self.edit_game_profiles(|cfg| { cfg.delete_profile(&name)?; Ok(None) }, "Perfil eliminado.");
+                        }
+                        if ui.button("Cancelar").clicked() {
+                            self.confirm_profile_delete = false;
+                        }
+                    });
+                }
+            });
+        });
     }
 
     fn trigger_git_check(&mut self) {
@@ -562,11 +738,12 @@ impl VictoryLauncherApp {
         snap: &runner::RunnerSnapshot,
         is_running: bool,
     ) {
+        let verified = self.preparation_verified();
         ui.horizontal(|ui| {
             theme::paint_badge_icon(
                 ui,
                 theme::BadgeKind::Bolt,
-                if self.cache.shaders_ready() {
+                if verified {
                     theme::STATUS_OK
                 } else {
                     theme::ACCENT_BLUE_LIGHT
@@ -575,7 +752,7 @@ impl VictoryLauncherApp {
             ui.add_space(4.0);
             ui.vertical(|ui| {
                 ui.label(
-                    RichText::new("Paso 2 · Prepara los gráficos (1 sola vez)")
+                    RichText::new("Paso 2 · Prepara los gráficos")
                         .strong()
                         .size(20.0),
                 );
@@ -630,7 +807,7 @@ impl VictoryLauncherApp {
                         self.runner.stop();
                     }
                 });
-        } else if self.cache.shaders_ready() {
+        } else if verified {
             theme::alert_banner(theme::STATUS_OK, Color32::from_rgb(10, 30, 24)).show(ui, |ui| {
                 ui.label(
                     RichText::new("¡Tus gráficos ya están preparados!")
@@ -712,7 +889,7 @@ impl VictoryLauncherApp {
                             )
                             .clicked()
                             && let Err(e) =
-                                self.runner.start_prep(&self.engine, &self.cfg, TaskKind::PrepareAll)
+                                self.runner.start_prep(&self.engine, &self.cfg, self.hw.clone(), TaskKind::PrepareAll)
                         {
                             self.set_toast(e, theme::STATUS_ERR);
                         }
@@ -744,7 +921,7 @@ impl VictoryLauncherApp {
                     .min_size(vec2(220.0, 40.0));
                     if ui.add(prep).clicked()
                         && let Err(e) =
-                            self.runner.start_prep(&self.engine, &self.cfg, TaskKind::PrepareAll)
+                            self.runner.start_prep(&self.engine, &self.cfg, self.hw.clone(), TaskKind::PrepareAll)
                     {
                         self.set_toast(e, theme::STATUS_ERR);
                     }
@@ -760,7 +937,7 @@ impl VictoryLauncherApp {
                 self.wizard_step = 1;
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let ready = self.cache.shaders_ready();
+                let ready = verified;
                 let label = if ready {
                     "Continuar  ->"
                 } else {
@@ -802,7 +979,7 @@ impl VictoryLauncherApp {
                 );
                 ui.label(
                     RichText::new(format!(
-                        "Detectamos tu {} — ya elegimos el ajuste ideal para ti.",
+                        "Tarjeta detectada: {}. Elige el perfil que quieres aplicar.",
                         self.hw.gpu_name
                     ))
                     .color(theme::TEXT_SECONDARY)
@@ -814,6 +991,8 @@ impl VictoryLauncherApp {
         ui.add_space(18.0);
 
         // 3 tarjetas simples y claras (sin abrumar).
+        let quality = Preset::quality_for(self.hw.vram_tier);
+        let quality_tip = quality.description_es(&self.hw);
         let choices = [
             (
                 Preset::Auto,
@@ -825,11 +1004,7 @@ impl VictoryLauncherApp {
                 "Más FPS (720p)",
                 "Máxima fluidez en laptops o gráficas de 8 GB.",
             ),
-            (
-                Preset::Native1080p,
-                "Máxima Nitidez",
-                "1080p nativo sin reescalado (16–24 GB VRAM).",
-            ),
+            (quality, quality.label_es(), quality_tip.as_str()),
         ];
 
         ui.columns(3, |cols| {
@@ -874,8 +1049,7 @@ impl VictoryLauncherApp {
                     .response
                     .interact(Sense::click());
                 if resp.clicked() {
-                    self.cfg.apply_preset(*preset);
-                    self.persist();
+                    self.select_builtin_preset(*preset);
                 }
             }
         });
@@ -1203,26 +1377,41 @@ impl VictoryLauncherApp {
                             .color(theme::TEXT_SECONDARY)
                             .size(12.5),
                     );
-                    let preset_tip = self.cfg.preset.description_es(&self.hw);
+                    let saved_name = self.cfg.matching_profile().map(str::to_owned);
+                    let saved_profiles: Vec<_> = self.cfg.profile_names().map(str::to_owned).collect();
+                    let preset_tip = if saved_name.is_some() {
+                        "Perfil guardado en Ajustes.".to_owned()
+                    } else {
+                        self.cfg.preset.description_es(&self.hw)
+                    };
                     egui::ComboBox::from_id_salt("home_preset_combo")
                         .width(155.0)
-                        .selected_text(self.cfg.preset.label_es())
+                        .selected_text(saved_name.as_deref().unwrap_or(self.cfg.preset.label_es()))
                         .show_ui(ui, |ui| {
                             for p in [
                                 Preset::Auto,
                                 Preset::Fluid720p,
                                 Preset::Balanced1080p,
+                                Preset::QualityRtx,
                                 Preset::Native1080p,
                                 Preset::High1440p,
                                 Preset::Fsr4K,
                                 Preset::Safe,
                             ] {
                                 if ui
-                                    .selectable_value(&mut self.cfg.preset, p, p.label_es())
-                                    .changed()
+                                    .selectable_label(saved_name.is_none() && self.cfg.preset == p, p.label_es())
+                                    .clicked()
                                 {
-                                    self.cfg.apply_preset(p);
-                                    self.persist();
+                                    self.select_builtin_preset(p);
+                                }
+                            }
+                            if !saved_profiles.is_empty() {
+                                ui.separator();
+                                for name in saved_profiles {
+                                    let active = saved_name.as_deref() == Some(name.as_str());
+                                    if ui.selectable_label(active, &name).clicked() {
+                                        self.apply_game_profile(&name);
+                                    }
                                 }
                             }
                         })
@@ -1257,7 +1446,7 @@ impl VictoryLauncherApp {
 
                         ui.add_space(8.0);
 
-                        if self.cache.shaders_ready() {
+                        if self.preparation_verified() {
                             theme::status_pill(ui, "Gráficos listos", theme::STATUS_OK);
                         } else if !is_running {
                             if let Some(legacy) = self.cache.legacy_importable.clone() {
@@ -1285,6 +1474,7 @@ impl VictoryLauncherApp {
                                     && let Err(e) = self.runner.start_prep(
                                         &self.engine,
                                         &self.cfg,
+                                        self.hw.clone(),
                                         TaskKind::PrepareAll,
                                     )
                                 {
@@ -1352,13 +1542,11 @@ impl VictoryLauncherApp {
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.button("Restaurar recomendados").clicked() {
-                    let saved_dir = self.cfg.game_dir.clone();
-                    let wiz = self.cfg.wizard_completed;
-                    self.cfg = LauncherConfig::default();
-                    self.cfg.game_dir = saved_dir;
-                    self.cfg.wizard_completed = wiz;
-                    changed = true;
-                    self.set_toast("Ajustes restaurados al perfil recomendado.", theme::STATUS_OK);
+                    let mut candidate = self.cfg.clone();
+                    candidate.reset_settings();
+                    if self.save_candidate(candidate) {
+                        self.set_toast("Ajustes restaurados al perfil recomendado.", theme::STATUS_OK);
+                    }
                 }
                 if ui
                     .add_enabled(!is_running, Button::new("Repetir asistente inicial"))
@@ -1404,20 +1592,17 @@ impl VictoryLauncherApp {
                     ui.horizontal_wrapped(|ui| {
                         let shaders_desc = if self.cache.shader_count_exact {
                             format!("{} ({} MB)", self.cache.shader_files, self.cache.shader_mb)
-                        } else if self.cache.shaders_ready() {
-                            "listos (calculando...)".to_owned()
                         } else {
-                            format!("{}", self.cache.shader_files)
+                            "calculando tamaño".to_owned()
                         };
-                        let status_str = format!(
-                            "Shaders: {shaders_desc}  ·  Escenas: {}",
-                            if self.cache.pipeline_lib_exists {
-                                format!("{} MB listas", self.cache.pipeline_lib_mb)
-                            } else {
-                                "pendiente".to_owned()
-                            }
-                        );
+                        let status_str = format!("Shaders en disco: {shaders_desc}");
                         ui.label(RichText::new(status_str).color(theme::TEXT_SECONDARY).size(12.0));
+                        let (status, color) = if self.preparation_verified() {
+                            ("Preparación verificada", theme::STATUS_OK)
+                        } else {
+                            ("Preparación pendiente para estos ajustes", theme::STATUS_WARN)
+                        };
+                        theme::status_pill(ui, status, color);
                         if ui
                             .add_enabled(
                                 !is_running && self.game.ready(),
@@ -1425,7 +1610,7 @@ impl VictoryLauncherApp {
                             )
                             .clicked()
                             && let Err(e) =
-                                self.runner.start_prep(&self.engine, &self.cfg, TaskKind::PrepareAll)
+                                self.runner.start_prep(&self.engine, &self.cfg, self.hw.clone(), TaskKind::PrepareAll)
                         {
                             self.set_toast(e, theme::STATUS_ERR);
                         }
@@ -1434,13 +1619,16 @@ impl VictoryLauncherApp {
                                 .add_enabled(!is_running, Button::new("Acelerar escenas"))
                                 .clicked()
                             && let Err(e) =
-                                self.runner.start_prep(&self.engine, &self.cfg, TaskKind::Warm)
+                                self.runner.start_prep(&self.engine, &self.cfg, self.hw.clone(), TaskKind::Warm)
                         {
                             self.set_toast(e, theme::STATUS_ERR);
                         }
                     });
                 });
 
+                ui.add_space(10.0);
+
+                self.ui_game_profiles(ui, is_running);
                 ui.add_space(10.0);
 
                 // Pantalla y calidad.
@@ -1568,10 +1756,13 @@ impl VictoryLauncherApp {
                             ui.end_row();
                         });
 
-                    if self.cfg.fsr_4k != FsrQuality::Off && !self.cache.ffx_dll_exists {
+                    if self.cfg.fsr_4k != FsrQuality::Off
+                        && !config::fidelityfx_dir(self.engine.repo_root.as_deref())
+                            .is_some_and(|dir| dir.join("amd_fidelityfx_upscaler_dx12.dll").is_file())
+                    {
                         ui.add_space(6.0);
                         ui.label(
-                            RichText::new("Falta amd_fidelityfx_upscaler_dx12.dll en %LOCALAPPDATA%\\victory\\fidelityfx.")
+                            RichText::new("Falta la DLL de FidelityFX en la ruta configurada para el juego.")
                                 .color(theme::STATUS_WARN)
                                 .size(11.5),
                         );
@@ -1581,7 +1772,7 @@ impl VictoryLauncherApp {
                     if ui
                         .checkbox(
                             &mut self.cfg.smooth_motion,
-                            "NVIDIA Smooth Motion (duplica FPS visuales usando victory_sm.exe)",
+                            "Preparar ejecutable para Smooth Motion de NVIDIA App",
                         )
                         .changed()
                     {
@@ -1675,21 +1866,22 @@ impl VictoryLauncherApp {
                                 changed = true;
                             }
                         });
+                        let settings = &mut self.cfg.settings;
                         for (val, label) in [
-                            (&mut self.cfg.video_planes, "Planos de video en cinemáticas (teléfono encendido, TVs)"),
-                            (&mut self.cfg.live_textures, "Actualización en vivo de texturas dinámicas (VICTORY_LIVE_TEXTURES)"),
-                            (&mut self.cfg.port_rt, "Port RT (elimina esperas mem_read en RTX 30/40/50)"),
-                            (&mut self.cfg.skip_rt_resolve, "Omitir CS_RaytracingResolve sin Ray Tracing (+FPS)"),
-                            (&mut self.cfg.skip_raymarched_lights, "Omitir luces raymarched sin BVH (+FPS)"),
-                            (&mut self.cfg.ambient_light, "Iluminación ambiental sustituta y filtro anti-cuadros magenta"),
-                            (&mut self.cfg.tex_store, "Caché de texturas en disco (TexStore)"),
-                            (&mut self.cfg.port_descriptors, "Port 2 experimental (VICTORY_PORT_DESCRIPTORS=1)"),
-                            (&mut self.cfg.send_bar, "VICTORY_SEND_BAR (envíos en VRAM)"),
-                            (&mut self.cfg.wc_no_back, "VICTORY_WC_NO_BACK"),
-                            (&mut self.cfg.wait_textures, "Esperar carga completa de texturas"),
-                            (&mut self.cfg.record_pipelines, "Grabar catálogo de pipelines (VICTORY_PIPELINE_BOOK)"),
-                            (&mut self.cfg.use_diag_build, "Usar compilación de diagnóstico (diag)"),
-                            (&mut self.cfg.gpu_timing, "Medir tiempos GPU por shader (VICTORY_GPU_TIMING)"),
+                            (&mut settings.video_planes, "Planos de video en cinemáticas y pantallas"),
+                            (&mut settings.live_textures, "Actualización en vivo de texturas dinámicas (VICTORY_LIVE_TEXTURES)"),
+                            (&mut settings.port_rt, "Optimizar esperas de memoria (Port RT)"),
+                            (&mut settings.skip_rt_resolve, "Omitir CS_RaytracingResolve sin Ray Tracing (+FPS)"),
+                            (&mut settings.skip_raymarched_lights, "Omitir luces raymarched sin BVH (+FPS)"),
+                            (&mut settings.ambient_light, "Iluminación ambiental sustituta y filtro anti-cuadros magenta"),
+                            (&mut settings.tex_store, "Caché de texturas en disco (TexStore)"),
+                            (&mut settings.port_descriptors, "Port 2 experimental (VICTORY_PORT_DESCRIPTORS=1)"),
+                            (&mut settings.send_bar, "VICTORY_SEND_BAR (envíos en VRAM)"),
+                            (&mut settings.wc_no_back, "VICTORY_WC_NO_BACK"),
+                            (&mut settings.wait_textures, "Esperar carga completa de texturas"),
+                            (&mut settings.record_pipelines, "Grabar catálogo de pipelines (VICTORY_PIPELINE_BOOK)"),
+                            (&mut settings.use_diag_build, "Usar compilación de diagnóstico (diag)"),
+                            (&mut settings.gpu_timing, "Medir tiempos GPU por shader (VICTORY_GPU_TIMING)"),
                         ] {
                             if ui.checkbox(val, label).changed() {
                                 changed = true;
@@ -1715,7 +1907,7 @@ impl VictoryLauncherApp {
                         }
                         ui.add_space(6.0);
                         ui.label(
-                            RichText::new("Variables extra (una por línea, ej. VICTORY_FPS=30):")
+                            RichText::new("Variables extra (una por línea, ej. VICTORY_DSP_CONVOLUTION=1)")
                                 .color(theme::TEXT_SECONDARY)
                                 .size(12.0),
                         );
@@ -2035,8 +2227,8 @@ impl VictoryLauncherApp {
                             if git_info.available {
                                 ui.label(
                                     RichText::new(format!(
-                                        "Rama: {}  ·  Instalada: {}",
-                                        git_info.branch, git_info.local_sha
+                                        "Rama {} · Fuentes {} · Launcher {}",
+                                        git_info.branch, git_info.local_sha, env!("VICTORY_GIT_SHA")
                                     ))
                                     .color(theme::TEXT_SECONDARY)
                                     .size(12.5),
@@ -2058,7 +2250,7 @@ impl VictoryLauncherApp {
                                     &format!("{} nueva(s)", git_info.behind_count),
                                     theme::STATUS_OK,
                                 );
-                            } else if git_info.checked_once {
+                            } else if git_info.up_to_date {
                                 theme::status_pill(ui, "Al día", theme::STATUS_OK);
                             }
                         });
@@ -2197,13 +2389,16 @@ impl eframe::App for VictoryLauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frames_drawn = self.frames_drawn.saturating_add(1);
         // Recoger resultados asíncronos de GPU, caché exacta y portada sin bloquear el hilo UI.
-        if let Ok(mut slot) = self.hw_async.try_lock()
-            && let Some(probed) = slot.take()
-        {
+        let hardware = self.hw_async.try_lock().ok().and_then(|mut slot| slot.take());
+        if let Some(probed) = hardware {
             self.hw = probed;
+            if self.refresh_cache_root() && self.tab == Tab::Ajustes {
+                self.ensure_cache_exact(ctx, false);
+            }
         }
         if let Ok(mut slot) = self.cache_async.try_lock()
-            && let Some(exact) = slot.take()
+            && let Some((generation, exact)) = slot.take()
+            && generation == self.cache_scan_generation
         {
             self.cache = exact;
         }
@@ -2217,6 +2412,9 @@ impl eframe::App for VictoryLauncherApp {
         }
 
         let snap = self.runner.snapshot();
+        if self.tab == Tab::Ajustes {
+            self.ensure_cache_exact(ctx, false);
+        }
 
         if snap.finished_seq != self.last_finished_seq {
             self.last_finished_seq = snap.finished_seq;

@@ -5,6 +5,14 @@ layer sends to the card, and the memory it reads) and run it again without
 the title, to see where the card's time goes and to try changes in seconds.
 Code: `crates/victory-gpu/src/replay`.
 
+For a picture and its draw/dispatch log, use a diagnostics build with
+`VICTORY_CAPTURE` set to a new local folder outside the repository and
+`VICTORY_CAPTURE_ON_REQUEST=1`. Create an empty file named `capture-next` in
+that folder when the defect is visible. The runtime checks every four presents
+and records the following frame in `frame-<n>.png` and `frame-<n>-ops.txt`.
+This trigger is used once per run and the usual power-of-two pictures are also saved.
+Lists recorded before the request can be missing from the operation log.
+
 ## Recording
 
 Off unless `VICTORY_RECORD` is set. Build with

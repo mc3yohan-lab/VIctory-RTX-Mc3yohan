@@ -73,7 +73,7 @@ fn scene_input(shaders: &[Arc<Shader>]) -> bool {
             "970c4fbb3b017c0e"
                 | "068c90badc86f1fd"
                 | "e4a7e088c7780ce8"
-                | "ebe4e53f031f5249"
+                | FIRST_FRAME_IMAGE
                 | "2cc4c197ee29e291"
                 | "369cbe906ea72764"
         ) || crate::draw::BAKE_PIXEL_SHADERS.contains(&s.hash.as_str())
@@ -112,12 +112,46 @@ impl Pending {
         &self.key
     }
 
+    fn startup_producer_hash(&self) -> Option<&str> {
+        let [shader] = self.shaders.as_slice() else { return None };
+        (self.graphics.is_none() && is_startup_producer(shader.stage, &shader.hash))
+            .then_some(shader.hash.as_str())
+    }
+
     fn make(&self) {
         self.make_with(|| {
             let _building = crate::timeline::span("pipeline: build a host pipeline");
+            let producer = self.startup_producer_hash();
+            let lighting = scene_lighting(&self.key);
+            if let Some(shader) = producer {
+                tracing::info!(shader, key = %self.key, "startup producer build started");
+            }
+            if let Some((group, pass)) = lighting {
+                tracing::info!(group = group.label(), pass, key = %self.key, "scene lighting pipeline build started");
+            }
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
-            super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
+            let build_ms = began.elapsed().as_millis() as u64;
+            if let Some(shader) = producer {
+                tracing::info!(
+                    shader,
+                    key = %self.key,
+                    build_ms,
+                    ready = made.is_some(),
+                    "startup producer build finished"
+                );
+            }
+            if let Some((group, pass)) = lighting {
+                tracing::info!(
+                    group = group.label(),
+                    pass,
+                    key = %self.key,
+                    build_ms,
+                    ready = made.is_some(),
+                    "scene lighting pipeline build finished"
+                );
+            }
+            super::library::note_time(&self.key, build_ms);
             made
         });
     }
@@ -220,11 +254,15 @@ pub(crate) fn waiting() -> u64 {
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
-    if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
+    let lighting = if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
-    }
-    if p.made.get().is_none() {
-        start(p, REQUESTED);
+        scene_lighting(&p.key).map(|(group, pass)| (group, pass, crate::frame::current()))
+    } else {
+        None
+    };
+    let pending_at_use = p.made.get().is_none();
+    if pending_at_use {
+        start(p, REQUESTED, false);
         if p.graphics.is_none() && compute_waits() {
             // Made here, or waited for while a worker makes it (fxceless #1312).
             p.make();
@@ -232,7 +270,21 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
             wait(p, crate::frame::current());
         }
     }
-    p.made.get()?.as_ref()
+    let state = p.made.get();
+    let host = state.and_then(Option::as_ref);
+    if let Some((group, pass, frame)) = lighting {
+        tracing::info!(
+            group = group.label(),
+            pass,
+            key = %p.key,
+            frame,
+            pending_at_use,
+            pending = state.is_none(),
+            ready = host.is_some(),
+            "scene lighting pipeline first use"
+        );
+    }
+    host
 }
 
 /// Whether a dispatch waits unconditionally for its compute pipeline
@@ -292,13 +344,101 @@ fn variant<'a>(p: &'a Arc<Pending>, g: &GraphicsState, bound: &TargetFormats) ->
     p
 }
 
-/// At the title's creation of a pipeline: starts it at once if an earlier
-/// run drew with it (during loading, so the world's first frames find it).
-pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
-        super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p, EARLY);
+/// Start the head deformation producer during loading even on a fresh library.
+/// Ported from TaynanGT/Vice-Tay@3e3fd579 (GPL-3.0). The existing shared
+/// frame deadline still bounds a first dispatch that reaches it before a worker.
+const HEAD_DEFORMATION: &str = "61e54e90adccaf6a";
+/// A first-frame compute pass that waited for its PSO during a cold NVIDIA run.
+const FIRST_FRAME_IMAGE: &str = "ebe4e53f031f5249";
+
+fn is_startup_producer(stage: &str, hash: &str) -> bool {
+    stage == "compute" && matches!(hash, HEAD_DEFORMATION | FIRST_FRAME_IMAGE)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SceneLightingMode {
+    Off,
+    Materials,
+    Atmosphere,
+    All,
+}
+
+impl SceneLightingMode {
+    fn for_adapter(value: Option<&str>, adapter_ids: Option<(u32, u32)>) -> Self {
+        match value {
+            Some("materials") => Self::Materials,
+            Some("atmosphere") => Self::Atmosphere,
+            Some("1") => Self::All,
+            // The native 1080p opening was tested on the desktop RTX 4090.
+            // Promoting the fog passes too delayed other visible draws.
+            None if adapter_ids == Some((0x10de, 0x2684)) => Self::Materials,
+            _ => Self::Off,
+        }
     }
+
+    fn includes(self, group: Self) -> bool {
+        self == Self::All || self == group
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "0",
+            Self::Materials => "materials",
+            Self::Atmosphere => "atmosphere",
+            Self::All => "1",
+        }
+    }
+}
+
+/// Full PSO keys of lighting passes still in flight when first bound in both
+/// NVIDIA startup captures. Their first-use waits use the ordinary budget.
+fn scene_lighting(key: &str) -> Option<(SceneLightingMode, &'static str)> {
+    use SceneLightingMode::{Atmosphere, Materials};
+    match key {
+        "6e43c05826326e95c52b2cb6cbd07415" => Some((Materials, "standard")),
+        "343f7d439b9494014316c30ace69c481" => Some((Materials, "standard without directional light")),
+        "5f4a6938b0e302ada858d875ee148d3a" => Some((Materials, "skin")),
+        "8c3c100697f46fed98a0e25b711f173f" => Some((Materials, "skin without directional light")),
+        "0336f3bf2ac9f035fbca84a050b430e7" => Some((Materials, "studio standard")),
+        "bc189c2ebfe68e94ec9a1eef3066107f" => Some((Materials, "studio skin")),
+        "d25ba210a974bdb2d659d4d03c020810" => Some((Atmosphere, "classified reconstruction full")),
+        "7a41bbbcb6f6fb17ca574219a71820b4" => Some((Atmosphere, "classified reconstruction without alpha")),
+        _ => None,
+    }
+}
+
+fn prewarm_scene_lighting() -> SceneLightingMode {
+    static MODE: OnceLock<SceneLightingMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let setting = std::env::var("VICTORY_PREWARM_SCENE_LIGHTING").ok();
+        let adapter_ids = crate::host::host().and_then(|host| host.adapter_ids);
+        SceneLightingMode::for_adapter(setting.as_deref(), adapter_ids)
+    })
+}
+
+/// Start the measured first-frame producers before their first consumers,
+/// including when no earlier run recorded their keys.
+pub(crate) fn early(p: &Arc<Pending>) {
+    let prewarm = if let Some((group, pass)) = scene_lighting(&p.key) {
+        let mode = prewarm_scene_lighting();
+        let prewarm = mode.includes(group) && workers();
+        tracing::info!(group = group.label(), pass, key = %p.key, mode = mode.label(), prewarm, "scene lighting pipeline created");
+        prewarm
+    } else {
+        false
+    };
+    let priority = if let Some(shader) = p.startup_producer_hash() {
+        tracing::info!(shader, key = %p.key, "startup producer queued at title creation");
+        REQUESTED
+    } else if prewarm {
+        REQUESTED
+    } else if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+        EARLY
+    } else {
+        return;
+    };
+    super::library::EARLY.fetch_add(1, Ordering::Relaxed);
+    start(p, priority, prewarm);
 }
 
 /// Whether the frame's budget is one for all threads together: a thread
@@ -523,8 +663,9 @@ impl Queue {
 
     /// Queues an unrequested pipeline or promotes one queued at creation.
     /// Returns whether it is new to the queue, or `None` if nothing changed.
-    fn push(&mut self, p: &Arc<Pending>, priority: u8) -> Option<bool> {
-        self.push_as(p, priority, slow_limit() != usize::MAX && super::library::slow(&p.key))
+    fn push(&mut self, p: &Arc<Pending>, priority: u8, prewarm: bool) -> Option<bool> {
+        let slow = !prewarm && slow_limit() != usize::MAX && super::library::slow(&p.key);
+        self.push_as(p, priority, slow)
     }
 
     fn push_as(&mut self, p: &Arc<Pending>, priority: u8, slow: bool) -> Option<bool> {
@@ -578,7 +719,7 @@ static AVAILABLE: Condvar = Condvar::new();
 
 /// Start or promote work for a draw without waiting behind the entire early
 /// list. Queue changes and worker claims happen under the same lock.
-fn start(p: &Arc<Pending>, priority: u8) {
+fn start(p: &Arc<Pending>, priority: u8, prewarm: bool) {
     if p.queue_state.load(Ordering::Relaxed) >= priority {
         return;
     }
@@ -589,7 +730,7 @@ fn start(p: &Arc<Pending>, priority: u8) {
         return;
     }
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(new) = queue.push(p, priority) {
+    if let Some(new) = queue.push(p, priority, prewarm) {
         if new {
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         }
@@ -681,11 +822,12 @@ static PEAK: AtomicU64 = AtomicU64::new(0);
 /// The workers ran out of work: logged after a batch of 10 or more, and
 /// the cache saved (at most every 20 s).
 fn drained() {
-    use super::library::{EARLY, LOADED, MADE};
+    use super::library::{EARLY, LOADED, MADE, STATIC_SAMPLERS_RECREATED};
     if PEAK.swap(0, Ordering::Relaxed) >= 10 {
         tracing::info!(
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
+            static_samplers_recreated = STATIC_SAMPLERS_RECREATED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
             "host pipelines all made"
         );
@@ -696,6 +838,77 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_two_first_frame_compute_producers_are_promoted_at_creation() {
+        for hash in [HEAD_DEFORMATION, FIRST_FRAME_IMAGE] {
+            assert!(is_startup_producer("compute", hash));
+            assert!(!is_startup_producer("pixel", hash));
+        }
+        assert!(!is_startup_producer("compute", "970c4fbb3b017c0e"));
+        assert!(!is_startup_producer("compute", "unknown"));
+    }
+
+    #[test]
+    fn scene_lighting_prewarm_keeps_screen_first_and_claims_each_pipeline_once() {
+        let mut lighting = Pending::new(Vec::new(), None);
+        lighting.key = "6e43c05826326e95c52b2cb6cbd07415".to_owned();
+        assert_eq!(scene_lighting(&lighting.key), Some((SceneLightingMode::Materials, "standard")));
+        assert_eq!(scene_lighting("6e43c05826326e95c52b2cb6cbd07416"), None);
+        assert!(!lighting.screen);
+        let lighting = Arc::new(lighting);
+        let delayed = Arc::new(Pending::new(Vec::new(), None));
+        let mut queue = Queue::new();
+        assert_eq!(queue.push_as(&lighting, EARLY, true), Some(true));
+        assert_eq!(queue.push_as(&delayed, REQUESTED, true), Some(true));
+        assert_eq!(queue.push(&lighting, REQUESTED, true), Some(false));
+        assert_eq!(queue.push(&lighting, REQUESTED, false), None);
+
+        if screens_first() {
+            let mut screen = Pending::new(Vec::new(), None);
+            screen.screen = true;
+            let screen = Arc::new(screen);
+            assert_eq!(queue.push_as(&screen, REQUESTED, false), Some(true));
+            assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &screen));
+            assert!(queue.pop(true, 1).is_none());
+        }
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &lighting));
+        let mut builds = 0;
+        lighting.make_with(|| {
+            builds += 1;
+            None
+        });
+        assert_eq!(builds, 1);
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &delayed));
+        assert!(queue.pop(false, 1).is_none());
+        assert_eq!(queue.push(&lighting, REQUESTED, true), None);
+    }
+
+    #[test]
+    fn scene_lighting_prewarm_selects_the_two_groups_independently() {
+        use SceneLightingMode::{All, Atmosphere, Materials, Off};
+        let group_for = |key| scene_lighting(key).map(|(group, _)| group);
+        assert_eq!(group_for("d25ba210a974bdb2d659d4d03c020810"), Some(Atmosphere));
+        assert_eq!(group_for("7a41bbbcb6f6fb17ca574219a71820b4"), Some(Atmosphere));
+        assert_eq!(group_for("e8c1306efd3dd8f050d4a5f7e34bbb41"), None);
+        assert_eq!(group_for("820ffee513cef10ff1a2fb70536a4272"), None);
+        for (value, mode, materials, atmosphere) in [
+            (None, Materials, true, false),
+            (Some("0"), Off, false, false),
+            (Some("materials"), Materials, true, false),
+            (Some("atmosphere"), Atmosphere, false, true),
+            (Some("1"), All, true, true),
+            (Some("unknown"), Off, false, false),
+        ] {
+            assert_eq!(SceneLightingMode::for_adapter(value, Some((0x10de, 0x2684))), mode);
+            assert_eq!(mode.includes(Materials), materials);
+            assert_eq!(mode.includes(Atmosphere), atmosphere);
+        }
+        for ids in [None, Some((0x10de, 0x2800)), Some((0x1002, 0x2684))] {
+            assert_eq!(SceneLightingMode::for_adapter(None, ids), Off);
+            assert_eq!(SceneLightingMode::for_adapter(Some("atmosphere"), ids), Atmosphere);
+        }
+    }
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {
@@ -758,15 +971,15 @@ mod tests {
         let requested = Arc::new(Pending::new(Vec::new(), None));
         let mut queue = Queue::new();
 
-        assert_eq!(queue.push(&earlier, EARLY), Some(true));
-        assert_eq!(queue.push(&promoted, EARLY), Some(true));
-        assert_eq!(queue.push(&requested, REQUESTED), Some(true));
-        assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
-        assert_eq!(queue.push(&promoted, REQUESTED), None);
+        assert_eq!(queue.push(&earlier, EARLY, false), Some(true));
+        assert_eq!(queue.push(&promoted, EARLY, false), Some(true));
+        assert_eq!(queue.push(&requested, REQUESTED, false), Some(true));
+        assert_eq!(queue.push(&promoted, REQUESTED, false), Some(false));
+        assert_eq!(queue.push(&promoted, REQUESTED, false), None);
 
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &requested));
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &promoted));
-        assert_eq!(queue.push(&promoted, REQUESTED), None);
+        assert_eq!(queue.push(&promoted, REQUESTED, false), None);
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &earlier));
         assert!(queue.pop(false, 1).is_none());
     }
@@ -805,8 +1018,8 @@ mod tests {
         };
         let (world, screen) = (of(false), of(true));
         let mut queue = Queue::new();
-        assert_eq!(queue.push(&world, REQUESTED), Some(true));
-        assert_eq!(queue.push(&screen, REQUESTED), Some(true));
+        assert_eq!(queue.push(&world, REQUESTED, false), Some(true));
+        assert_eq!(queue.push(&screen, REQUESTED, false), Some(true));
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));

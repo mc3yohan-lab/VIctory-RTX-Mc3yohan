@@ -377,6 +377,28 @@ struct BakeSources {
     other: u32,
 }
 
+impl BakeSources {
+    fn note_texture(&mut self, index: u32, ready: bool, mapped: impl FnOnce() -> bool) {
+        if ready {
+            self.ready += 1;
+        } else if mapped() {
+            self.unmade.push(index);
+        } else if self.queued.binary_search(&index).is_err() {
+            self.other += 1;
+        }
+    }
+
+    fn upload_order(&self) -> Vec<u32> {
+        // Both lists follow the sorted indices from bake_named. Repair
+        // missing views before spending the budget on ordinary rechecks.
+        self.unmade
+            .iter()
+            .copied()
+            .chain(self.queued.iter().copied().filter(|index| self.unmade.binary_search(index).is_err()))
+            .collect()
+    }
+}
+
 /// Since the start: early runs of the texture pass, and those of them
 /// made for a bake draw.
 pub(crate) static EARLY_TEXTURE_PASSES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -1162,6 +1184,7 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 /// as before, they counted as not there at all).
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static DROPPED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DESCRIPTOR_DROPS: AtomicU64 = AtomicU64::new(0);
 
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
@@ -2161,6 +2184,7 @@ impl State {
             let made = self.tables(list, &t.tables, &t.host.half_views, compute);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
+                DESCRIPTOR_DROPS.fetch_add(1, Ordering::Relaxed);
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
             }
@@ -2752,7 +2776,7 @@ impl State {
             }
             if crate::resource::within_budget(most) {
                 host.texture_slots_requeue(&sources.unmade, crate::frame::current());
-                PASS_SOURCES.set(Some(sources.queued.iter().chain(&sources.unmade).copied().collect()));
+                PASS_SOURCES.set(Some(sources.upload_order()));
                 PASS_SOURCED.set([0; 4]);
                 PASS_BUDGET.set(Some((0, 0, true)));
                 crate::texture::BAKING.set(bake_exact());
@@ -2766,6 +2790,57 @@ impl State {
             }
         }
         Self::log_bake_sources(p, &sources, done, Self::bake_missing(&sources, host), skipped);
+        #[cfg(feature = "diagnostics")]
+        {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *ON.get_or_init(|| crate::switch::on("VICTORY_BAKE_AUDIT")) {
+                Self::audit_bake_sources(p, &sources, host);
+            }
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn audit_bake_sources(p: &HostPipeline, sources: &BakeSources, host: &crate::descriptor::host::HostHeap) {
+        use crate::texture::BakeAudit;
+        const BYTES: u64 = 8 << 20;
+        const DRAWS: u64 = 128;
+        static AUDITED: AtomicU64 = AtomicU64::new(0);
+        let audited = AUDITED.fetch_add(1, Ordering::Relaxed);
+        if audited >= DRAWS {
+            if audited == DRAWS {
+                tracing::info!(draws = DRAWS, "skin-bake source audit reached its draw limit (VICTORY_BAKE_AUDIT)");
+            }
+            return;
+        }
+        let mut left = BYTES;
+        let mut counts = [0u32; BakeAudit::Budget as usize + 1];
+        let mut different_indices = Vec::new();
+        for &(index, handle) in &sources.textures {
+            let view = host.texture_slot_made_from(index, handle).then(|| crate::descriptor::view(handle)).flatten();
+            let status = match view {
+                Some(View::Placed(false, mut words, desc)) if words[0] != 1 => {
+                    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                    // The host's placed SRV uses the resource without target flags.
+                    words[12] &= !0x7;
+                    crate::resource::texture_at_made(address, &words)
+                        .map_or(BakeAudit::NoFingerprint, |r| crate::texture::audit_bake_source(r, &mut left))
+                }
+                Some(View::Shader(r, _)) => crate::texture::audit_bake_source(r as This, &mut left),
+                Some(View::Unordered(..) | View::Placed(true, ..)) => BakeAudit::GpuAuthoritative,
+                _ => BakeAudit::NoFingerprint,
+            };
+            counts[status as usize] += 1;
+            if status == BakeAudit::Different {
+                different_indices.push(index);
+            }
+        }
+        let [equal, different, no_fingerprint, gpu_authoritative, unreadable, over_budget] = counts;
+        let pixel = p.stages.iter().find(|s| s.shader.stage == "pixel").map_or("", |s| s.shader.hash.as_str());
+        tracing::info!(
+            frame = crate::frame::current(), pixel, equal, different, no_fingerprint, gpu_authoritative,
+            unreadable, over_budget, bytes_attempted = BYTES - left, ?different_indices,
+            "skin-bake source audit (VICTORY_BAKE_AUDIT)"
+        );
     }
 
     /// The textures a draw of the title's skin bake samples
@@ -2812,26 +2887,20 @@ impl State {
             .into_iter()
             .map(|q| q.0)
             .collect();
-        sources.textures = textures;
-        for &(index, handle) in &sources.textures {
-            if host.texture_slot_made_from(index, handle) {
-                sources.ready += 1;
-                continue;
-            }
-            if sources.queued.contains(&index) {
-                continue;
-            }
-            if let Some(View::Placed(false, resource, desc)) = crate::descriptor::view(handle)
-                && crate::texture::mapped_bytes(
-                    (u64::from(desc[10]) | u64::from(desc[11]) << 32) as *const u8,
-                    crate::resource::placed_bytes_from(&resource, crate::resource::first_mip(&desc)).unwrap_or(1) as usize,
-                ) > 0
-            {
-                sources.unmade.push(index);
-            } else {
-                sources.other += 1;
-            }
+        for &(index, handle) in &textures {
+            // A fingerprint recheck may still be queued after its host view
+            // went away. Requeue the view even if its contents never changed.
+            sources.note_texture(index, host.texture_slot_made_from(index, handle), || {
+                matches!(
+                    crate::descriptor::view(handle),
+                    Some(View::Placed(false, resource, desc)) if crate::texture::mapped_bytes(
+                        (u64::from(desc[10]) | u64::from(desc[11]) << 32) as *const u8,
+                        crate::resource::placed_bytes_from(&resource, crate::resource::first_mip(&desc)).unwrap_or(1) as usize,
+                    ) > 0
+                )
+            });
         }
+        sources.textures = textures;
         Some(sources)
     }
 
@@ -3174,6 +3243,7 @@ impl State {
         // the system is short of memory, after the catch-up and early budgets;
         // not for a bake, which samples its textures at once.)
         let required = PASS_BUDGET.get().is_some_and(|(_, _, bake)| bake);
+        let gate_growth = !only && !baking && !required && crate::pool::gate();
         let bytes_at_most = if required || asked.is_some() {
             bytes_at_most
         } else {
@@ -3437,6 +3507,30 @@ impl State {
             if !crate::residency::admit_texture_pass(required) {
                 served = false;
                 break;
+            }
+            // Allocate missing copies before mirroring the slot. If a new
+            // allocation would cost too much VRAM, keep its old view and
+            // leave the new one queued. Bakes and explicit source passes use
+            // their existing admission rules.
+            if gate_growth && room {
+                let wanted = heap.handle(index).and_then(crate::descriptor::view);
+                let placed = wanted.as_ref().and_then(crate::descriptor::host::placed_texture);
+                if let Some(&View::Shader(resource, _)) = placed.as_ref().or(wanted.as_ref())
+                    && crate::resource::title_fills(resource as This)
+                    && crate::resource::host_waits(resource as This)
+                    && crate::pool::prefetch_deferred(|| {
+                        let _ = crate::resource::host_resource(resource as This);
+                    })
+                {
+                    static DEFERRED: AtomicU64 = AtomicU64::new(0);
+                    let deferred = DEFERRED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if deferred.is_power_of_two() {
+                        tracing::info!(slot = index, deferred, "texture prefetch allocation deferred by the VRAM limit (VICTORY_POOL_GATE)");
+                    }
+                    served = false;
+                    host.texture_slot_later(index, write, frame, most);
+                    continue;
+                }
             }
             // A slot that shows the texture by an earlier view of it (one
             // from another level) goes on doing so until the upload of what
@@ -4518,20 +4612,29 @@ impl State {
                 continue;
             }
             // The table and what its entries hold (record words).
-            let key = {
+            let read_record = |k| {
+                let at = table + u64::from(k) * 32;
+                // SAFETY: the span above bounds these slots in the title's heap.
+                unsafe { (at as *const [u32; 3]).read_unaligned() }
+            };
+            let hash = if half.is_empty() && (32..=1024).contains(&n) && table_hash_reuse() {
+                TABLE_HASHES.with_borrow_mut(|memos| {
+                    let index = ((table >> 5) ^ (table >> 12) ^ (table >> 19) ^ u64::from(n)) as usize;
+                    memos[index % TABLE_HASH_MEMOS].hash(table, n, read_record)
+                })
+            } else {
                 let mut h = RecordHash::default();
                 for k in 0..n {
-                    let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
+                    h.add(read_record(k));
                     // (Another table than the same slots made for a shader
                     // that reads them in the title's formats.)
                     if half.contains(&(slot, k * 8)) {
                         h.add([u32::MAX, slot.into(), k]);
                     }
                 }
-                (table, n, h.0)
+                h.0
             };
+            let key = (table, n, hash);
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
             if let Some(known) = self.fresh_tables.get_mut(&key) {
@@ -5472,6 +5575,64 @@ fn ready_once() -> bool {
     crate::toggled!("VICTORY_READY_ONCE")
 }
 
+const TABLE_HASH_MEMOS: usize = 8;
+
+thread_local! {
+    static TABLE_HASHES: std::cell::RefCell<[TableHashMemo; TABLE_HASH_MEMOS]> =
+        const { std::cell::RefCell::new([const { TableHashMemo::new() }; TABLE_HASH_MEMOS]) };
+}
+
+fn table_hash_reuse() -> bool {
+    const SWITCH: &str = "VICTORY_TABLE_HASH_REUSE";
+    #[cfg(feature = "diagnostics")]
+    {
+        static MODE: std::sync::OnceLock<Result<bool, u32>> = std::sync::OnceLock::new();
+        match *MODE.get_or_init(|| crate::ab::bit(SWITCH).map_or_else(|| Ok(crate::switch::on(SWITCH)), Err)) {
+            Ok(enabled) => enabled,
+            Err(bit) => crate::ab::on(bit),
+        }
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| crate::switch::on(SWITCH))
+    }
+}
+
+/// Reuses the fingerprint alone. A matching address and extent still need an
+/// exact read of the live record words, including writes by the guest directly.
+struct TableHashMemo {
+    table: u64,
+    records: Vec<[u32; 3]>,
+    hash: u64,
+}
+
+impl TableHashMemo {
+    const fn new() -> Self {
+        Self { table: 0, records: Vec::new(), hash: 0 }
+    }
+
+    fn hash(&mut self, table: u64, n: u32, mut read: impl FnMut(u32) -> [u32; 3]) -> u64 {
+        if self.table == table
+            && self.records.len() == n as usize
+            && (0..n).zip(&self.records).all(|(k, record)| read(k) == *record)
+        {
+            return self.hash;
+        }
+        self.records.clear();
+        self.records.reserve_exact(n as usize);
+        let mut hash = RecordHash::default();
+        for k in 0..n {
+            let record = read(k);
+            hash.add(record);
+            self.records.push(record);
+        }
+        self.table = table;
+        self.hash = hash.0;
+        self.hash
+    }
+}
+
 /// A hash of records' words: 64 bits, two multiplications a record. (The
 /// standard library's took 3 % of the recording threads' time.)
 #[derive(Default)]
@@ -5824,7 +5985,22 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{BAKE_CONSTANT_INDICES, BAKE_RECORD_INDICES, bake_named, staging_budget_per_frame};
+    use super::{BAKE_CONSTANT_INDICES, BAKE_RECORD_INDICES, BakeSources, bake_named, staging_budget_per_frame};
+
+    #[test]
+    fn missing_bake_sources_are_requeued_ahead_of_unchanged_views() {
+        let mut sources = BakeSources { queued: vec![3, 7, 9], ..Default::default() };
+        sources.note_texture(3, true, || unreachable!("ready views need no mapping query"));
+        sources.note_texture(7, false, || true);
+        sources.note_texture(9, false, || false);
+        sources.note_texture(11, false, || true);
+        sources.note_texture(13, false, || false);
+
+        assert_eq!(sources.ready, 1);
+        assert_eq!(sources.unmade, [7, 11]);
+        assert_eq!(sources.other, 1);
+        assert_eq!(sources.upload_order(), [7, 11, 3, 9]);
+    }
 
     #[test]
     fn staging_budget_scales_with_vram_budget() {
@@ -5879,7 +6055,41 @@ mod tests {
 
 #[cfg(test)]
 mod record_hash_tests {
-    use super::{Few, RecordHash};
+    use super::{Few, RecordHash, TableHashMemo};
+
+    #[test]
+    fn descriptor_fingerprint_reuse_observes_direct_writes() {
+        let mut memo = TableHashMemo::new();
+        let mut records = [[7, 17, 42]; 32];
+        let expected = |records: &[[u32; 3]]| {
+            let mut hash = RecordHash::default();
+            for &record in records {
+                hash.add(record);
+            }
+            hash.0
+        };
+        let table = 0x1000;
+        let n = records.len() as u32;
+        let initial = memo.hash(table, n, |k| records[k as usize]);
+        assert_eq!(initial, expected(&records));
+        let mut checked = 0;
+        assert_eq!(memo.hash(table, n, |k| {
+            checked += 1;
+            records[k as usize]
+        }), initial);
+        assert_eq!(checked, n);
+
+        let mut last = initial;
+        for word in 0..3 {
+            records[31][word] += 1;
+            let next = memo.hash(table, n, |k| records[k as usize]);
+            assert_eq!(next, expected(&records));
+            assert_ne!(next, last);
+            last = next;
+        }
+        assert_eq!(memo.hash(table, n - 1, |k| records[k as usize]), expected(&records[..31]));
+        assert_eq!(memo.hash(table + 32, n, |k| records[k as usize]), expected(&records));
+    }
 
     #[test]
     fn a_few_things_are_kept_in_order_however_many() {

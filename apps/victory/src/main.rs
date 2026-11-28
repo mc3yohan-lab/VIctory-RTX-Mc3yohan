@@ -141,7 +141,7 @@ enum Command {
         #[arg(long)]
         used: bool,
         /// After warming the driver cache, also populate and save
-        /// `host-pipelines.bin` in-process for all non-bad matching pipelines.
+        /// `host-pipelines.bin` in-process for eligible matching pipelines.
         #[arg(long)]
         save_library: bool,
         /// Apply the VIctory-RTX-Mc3yohan NVIDIA preset shader cache defaults
@@ -403,7 +403,6 @@ fn apply_nvidia_preset(run_console: Option<Console>) {
         ("VICTORY_BATCHED_SWEEP", "1"),
         ("VICTORY_PIPELINE_SAVE_ON_EXIT_ONLY", "1"),
         ("VICTORY_TABLES_EARLY", "1"),
-        ("VICTORY_DYNAMIC_SLOTS", "262144"),
         ("VICTORY_PIPELINE_LOWEST", "0"),
         ("VICTORY_PIPELINE_WORKERS", "8"),
         ("VICTORY_PIPELINE_WAIT_ONCE", "1"),

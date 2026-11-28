@@ -1,7 +1,7 @@
 //! Compiled host pipelines kept on disk, and the title pipelines worth
 //! starting early (decision 0007, "Pipeline cache").
 //!
-//! 1. Every host pipeline goes into the host's pipeline library, named by
+//! 1. Cacheable host pipelines go into the host's pipeline library, named by
 //!    a hash of all that its host description holds (the translated
 //!    shaders' code, which changes when a translation does, our root
 //!    signature, the graphics state). The library is saved under the cache
@@ -71,6 +71,7 @@ pub(super) fn folder() -> Option<PathBuf> {
 /// started at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
+pub(super) static STATIC_SAMPLERS_RECREATED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 /// For the memory lines: the bytes of the library's file, kept in memory
 /// while the library lives, and the bytes the last save wrote (a buffer of
@@ -513,16 +514,74 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
-/// The pipeline named `name`: loaded from the library by `load` if it is
-/// there with the same description, else made by `create` and stored.
-pub(crate) fn pipeline(
-    name: &str,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PipelineSource<'a> {
+    Library(&'a str),
+    RecreateStaticSamplers(&'a str),
+}
+
+impl<'a> PipelineSource<'a> {
+    /// Workaround from readmet3xt-lab, louketa/paulistalow@7fa0e95
+    /// (GPL-3.0), also tested by clankenjoyer/scarlet-fps@8cef264.
+    /// On NVIDIA, static sampler bindings in a loaded PSO may depend on the
+    /// driver's sampler order at creation. Recreate these PSOs by default on
+    /// that adapter. `VICTORY_SAMPLERS_MADE=0` uses the library, `1` recreates
+    /// them on any adapter.
+    pub(super) fn for_root(name: &'a str, has_static_samplers: bool) -> Self {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        let enabled = has_static_samplers
+            && *ENABLED.get_or_init(|| {
+                let setting = std::env::var("VICTORY_SAMPLERS_MADE").ok();
+                let vendor_id = crate::host::host().and_then(|host| host.adapter_ids).map(|(vendor, _)| vendor);
+                recreate_static_samplers(setting.as_deref(), vendor_id)
+            });
+        Self::select(name, has_static_samplers, enabled)
+    }
+
+    fn select(name: &'a str, has_static_samplers: bool, enabled: bool) -> Self {
+        if has_static_samplers && enabled {
+            Self::RecreateStaticSamplers(name)
+        } else {
+            Self::Library(name)
+        }
+    }
+}
+
+fn recreate_static_samplers(setting: Option<&str>, vendor_id: Option<u32>) -> bool {
+    const NVIDIA: u32 = 0x10de;
+    match setting {
+        Some("0") => false,
+        Some("1") => true,
+        _ => vendor_id == Some(NVIDIA),
+    }
+}
+
+/// Load from the library and store misses, except when the root's static
+/// samplers require a fresh pipeline. Those PSOs stay out of the library.
+pub(super) fn pipeline(
+    source: PipelineSource<'_>,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let create = || {
         let _creating = crate::timeline::span("pipeline: create a PSO in the driver");
         create()
+    };
+    let name = match source {
+        PipelineSource::Library(name) => name,
+        PipelineSource::RecreateStaticSamplers(name) => {
+            let _call = call("make static samplers", name);
+            let pso = create()?;
+            MADE.fetch_add(1, Ordering::Relaxed);
+            let recreated = STATIC_SAMPLERS_RECREATED.fetch_add(1, Ordering::Relaxed) + 1;
+            if recreated.is_power_of_two() {
+                tracing::info!(
+                    recreated,
+                    "host pipeline recreated with static samplers"
+                );
+            }
+            return Ok(pso);
+        }
     };
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
@@ -581,6 +640,12 @@ pub(crate) fn pipeline(
 /// Writes the library and the early list if pipelines were added since the
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
+    if now {
+        let static_samplers_recreated = STATIC_SAMPLERS_RECREATED.load(Ordering::Relaxed);
+        if static_samplers_recreated > 0 {
+            tracing::info!(static_samplers_recreated, "static sampler pipeline totals");
+        }
+    }
     // Lifecycle shutdown calls save(true); optionally skip periodic mid-game
     // 1.7 GB library serialization checkpoints (`VICTORY_PIPELINE_SAVE_ON_EXIT_ONLY=1`).
     static EXIT_ONLY: OnceLock<bool> = OnceLock::new();
@@ -807,6 +872,45 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_roots_with_static_samplers_bypass_the_library_when_enabled() {
+        for (has_static_samplers, enabled) in [(false, false), (false, true), (true, false)] {
+            assert_eq!(
+                PipelineSource::select("pso", has_static_samplers, enabled),
+                PipelineSource::Library("pso")
+            );
+        }
+        assert_eq!(
+            PipelineSource::select("pso", true, true),
+            PipelineSource::RecreateStaticSamplers("pso")
+        );
+    }
+
+    #[test]
+    fn static_sampler_pipelines_default_to_recreation_on_nvidia_only() {
+        assert!(recreate_static_samplers(None, Some(0x10de)));
+        for vendor_id in [Some(0x1002), Some(0x8086), Some(0x1414), None] {
+            assert!(!recreate_static_samplers(None, vendor_id));
+        }
+    }
+
+    #[test]
+    fn static_sampler_recreation_explicit_settings_override_vendor_defaults() {
+        assert!(!recreate_static_samplers(Some("0"), Some(0x10de)));
+        assert!(recreate_static_samplers(Some("1"), Some(0x1002)));
+        assert!(recreate_static_samplers(Some("1"), None));
+    }
+
+    #[test]
+    fn a_recreated_pipeline_reports_creation_failure_directly() {
+        let result = pipeline(
+            PipelineSource::RecreateStaticSamplers("test static samplers"),
+            |_, _| panic!("recreated PSOs must not load from the library"),
+            || Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL)),
+        );
+        assert_eq!(result.unwrap_err().code(), windows::Win32::Foundation::E_FAIL);
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {

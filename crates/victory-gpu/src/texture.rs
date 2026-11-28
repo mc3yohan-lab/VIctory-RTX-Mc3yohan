@@ -2023,6 +2023,60 @@ fn staged_from(resource: This) -> u32 {
         .map_or(u32::MAX, |s| s.first)
 }
 
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BakeAudit {
+    Equal,
+    Different,
+    NoFingerprint,
+    GpuAuthoritative,
+    Unreadable,
+    Budget,
+}
+
+/// Compares title bytes with the last complete upload's fingerprint.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn audit_bake_source(resource: This, left: &mut u64) -> BakeAudit {
+    if host_wrote(resource as usize) || crate::resource::alias_of(resource).is_some() {
+        return BakeAudit::GpuAuthoritative;
+    }
+    let Some(copy) = crate::resource::made_copy(resource) else { return BakeAudit::NoFingerprint };
+    if !title_written(&copy.texture) {
+        return BakeAudit::GpuAuthoritative;
+    }
+    let Some((0, held)) = *copy.holds.lock().unwrap_or_else(|e| e.into_inner()) else {
+        return BakeAudit::NoFingerprint;
+    };
+    if copy.base != 0 || crate::resource::host_tiled(resource).is_some() {
+        return BakeAudit::NoFingerprint;
+    }
+    let Some((memory, desc)) = crate::resource::texture_memory(resource) else { return BakeAudit::Unreadable };
+    let Some(layout) = crate::resource::texture_layout(&desc) else { return BakeAudit::Unreadable };
+    let [plane] = layout.planes.as_slice() else { return BakeAudit::NoFingerprint };
+    let size = plane.layout.bytes_from(0);
+    if size == 0 {
+        return BakeAudit::Unreadable;
+    }
+    if size > *left {
+        return BakeAudit::Budget;
+    }
+    *left -= size;
+    let current = with_read(size as usize, |read| {
+        crate::host::read_into(memory, read).then(|| digest(read))
+    });
+    if host_wrote(resource as usize) {
+        return BakeAudit::GpuAuthoritative;
+    }
+    if *copy.holds.lock().unwrap_or_else(|e| e.into_inner()) != Some((0, held)) {
+        return BakeAudit::NoFingerprint;
+    }
+    match current {
+        Some(current) if current == held => BakeAudit::Equal,
+        Some(_) => BakeAudit::Different,
+        None => BakeAudit::Unreadable,
+    }
+}
+
 /// Whether the levels from `first` on of `resource`'s host copy were filled
 /// from the bytes title memory holds now: an upload would bring nothing new.
 /// (Of 787 repeated uploads of a frame that streams 398 were equal in every

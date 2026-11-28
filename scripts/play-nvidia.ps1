@@ -1,4 +1,4 @@
-﻿# VIctory-RTX-Mc3yohan — NVIDIA RTX / Wave32 Launcher (maintained by Mc3yohan)
+# VIctory-RTX-Mc3yohan — NVIDIA RTX / Wave32 Launcher (maintained by Mc3yohan)
 # Built on Marvisak/VIctory + avatarmanz/VIctory-7900XTX + community NVIDIA/Wave32 fixes.
 # Tuned for NVIDIA RTX 4090 (24 GB VRAM, Wave32, 1M view heap) & hybrid Intel Core i9:
 # - avatarmanz/VIctory-7900XTX (`c9c932c`): Renderer Ports 1, 2, 5, 6, 7 (VICTORY_PORT_CONSTANTS,
@@ -92,7 +92,7 @@ param(
     [int]$MipDrop = -1,
     [int]$WindowKb = 4096,
     [int]$CardBuffersMinKb = -1,
-    [int]$DynamicSlots = 262144,
+    [int]$DynamicSlots = -1,
     [switch]$RecordPipelines,
     [switch]$Panel,
     [switch]$Kbm,
@@ -241,9 +241,8 @@ $settings = @{
     VICTORY_BATCHED_SWEEP              = '1'
     VICTORY_PIPELINE_SAVE_ON_EXIT_ONLY = '1'
 
-    # --- NVIDIA 1M view heap: zero refused tables / zero dropped draws ---
+    # --- Return descriptor tables early on the capped NVIDIA heap ---
     VICTORY_TABLES_EARLY               = '1'
-    VICTORY_DYNAMIC_SLOTS              = "$DynamicSlots"
 
     # --- Pipeline workers, format variants & watchdog safety ---
     VICTORY_PIPELINE_LOWEST            = '0'
@@ -518,7 +517,17 @@ if ($RecordPipelines) { $settings.VICTORY_PIPELINE_BOOK = '1' }
 if ($Panel)           { $settings.VICTORY_PANEL         = '1' }
 if ($WindowMax)       { $settings.VICTORY_WINDOW_MAX    = $WindowMax }
 
+if ($DynamicSlots -ge 0) { $settings.VICTORY_DYNAMIC_SLOTS = "$DynamicSlots" }
 foreach ($k in $More.Keys) { $settings[$k] = "$($More[$k])" }
+
+# Match the DXGI display mode to the title's effective native 1080p output.
+if (-not $SeriesS -and -not $settings.ContainsKey('VICTORY_DISPLAY_MODE') -and
+    $settings.VICTORY_OUTPUT -match '^\s*1920\s*x\s*1080\s*$' -and
+    ($settings.VICTORY_RENDER_SCALE -as [single]) -eq 1.0 -and
+    ($settings.VICTORY_UPSCALER -as [int]) -eq 6 -and
+    (-not $settings.ContainsKey('VICTORY_FSR_4K') -or $settings.VICTORY_FSR_4K -eq '0')) {
+    $settings.VICTORY_DISPLAY_MODE = '1920x1080'
+}
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
 if (-not (Test-Path -LiteralPath $victory)) {

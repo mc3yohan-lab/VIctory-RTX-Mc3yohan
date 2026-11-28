@@ -73,7 +73,7 @@ En el primer inicio, el asistente te guiará en **3 pasos simples**:
 | **Recomendado (`Auto`)** | 720p (8 GB) / 1080p (12–24 GB+) | Automática | Empezar sin complicaciones con valores calibrados por VRAM |
 | **Fluido 720p** | `1280×720` | `1.000` nativo (Series X) / dinámica (Series S) | Imagen nítida 720p con máximos FPS y mínima espera GPU |
 | **Equilibrado 1080p** | `1920×1080` | `0.667` (`720p` interno → `1080p`) | Mejor balance nitidez/FPS en RTX 3070/4070/4090 |
-| **Nítido 1080p** | `1920×1080` | `1.000` (100% nativo) | Máxima nitidez 1080p en GPUs de 16–24 GB VRAM |
+| **Nítido 1080p** | `1920×1080` | `1.000` (100% nativo) | Series X con espera de texturas, FSR apagado y preparación para Smooth Motion desactivada |
 | **Alta 1440p** | `2560×1440` | `0.667` | Monitores 2K con 16–24 GB VRAM |
 | **4K FSR 3.1** | `3840×2160` | Según modo FSR | Requiere la DLL oficial firmada de AMD FidelityFX SDK (`amd_fidelityfx_upscaler_dx12.dll`) en `%LOCALAPPDATA%\victory\fidelityfx` |
 | **Modo Seguro** | `1280×720` | `0.667` (sin parches agresivos) | Diagnóstico si ocurren cierres inesperados o fallos gráficos |
@@ -139,7 +139,9 @@ Si prefieres PowerShell en lugar del launcher gráfico:
 
 ### Rendimiento Medido de Referencia (RTX 4090 · i9-12900KF · 64 GB RAM · RT Off)
 
-| Escenario (`release`, traductor `v6`) | FPS Estables / Pico | Espera GPU | Notas verificadas |
+La pasada de 15 minutos a 1080p nativos dio 16,8 FPS de mediana y 8,0 de mínimo en la lancha tras excluir menús y transiciones observados. El launcher 0.9.1 permite reproducir el perfil desde **Jugar → Calidad → Nítido 1080p**. Los tramos históricos de 720p y 1080p reescalados de la tabla corresponden a otras cargas. [Informe de calidad, mediciones y próximas pruebas](docs/rtx4090-informe-2026-11-27.md)
+
+| Escenario (`release`, traductor `v6`) | FPS en el tramo medido | Espera GPU | Notas verificadas |
 |---|---|---|---|
 | **Menús / Interfaz** | **60.0 FPS** (`16.7 ms`) | `0.0 ms` | Tope de 60 FPS sin alterar velocidad de simulación |
 | **Fluido 720p (`1280×720`, `Scale 1.0`)** | **22.6–26.6 FPS** (`24.5 FPS` en ~5,000 draws) | `0.0–1.8 ms` | `prep` bajó a `26.1 ms`, `0` warnings/errors, `0` errores en `372` skin-bake draws |

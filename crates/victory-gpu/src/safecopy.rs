@@ -324,21 +324,36 @@ pub(crate) unsafe fn merge(title: *mut u8, now: *const u8, held: *mut u8, len: u
 ///
 /// # Safety
 /// Both are `len` bytes that can be read; the card may be writing them.
-pub(crate) unsafe fn differ(a: *const u8, b: *const u8, len: usize) -> bool {
+pub(crate) unsafe fn differ(a: *const u8, b: *const u8, len: usize, unroll: bool) -> bool {
     use std::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_or_si256, _mm256_setzero_si256, _mm256_testz_si256, _mm256_xor_si256};
     /// # Safety
     /// [`differ`]'s; the processor has AVX2 (as the code above assumes).
     #[target_feature(enable = "avx2")]
-    unsafe fn blocks(a: *const u8, b: *const u8, n: usize) -> bool {
+    unsafe fn blocks(a: *const u8, b: *const u8, n: usize, unroll: bool) -> bool {
+        let xor = |k| {
+            // SAFETY: both inputs contain vector k and this runs with AVX2.
+            unsafe {
+                let x = _mm256_loadu_si256(a.add(k * 32).cast::<__m256i>());
+                let y = _mm256_loadu_si256(b.add(k * 32).cast::<__m256i>());
+                _mm256_xor_si256(x, y)
+            }
+        };
         let mut at = 0;
+        if unroll {
+            while at + 4 <= n {
+                let front = _mm256_or_si256(xor(at), xor(at + 1));
+                let back = _mm256_or_si256(xor(at + 2), xor(at + 3));
+                let any = _mm256_or_si256(front, back);
+                if _mm256_testz_si256(any, any) == 0 {
+                    return true;
+                }
+                at += 4;
+            }
+        }
         while at < n {
             let mut any = _mm256_setzero_si256();
             for k in at..n.min(at + 4) {
-                // SAFETY: block `k`, inside both.
-                let (x, y) = unsafe {
-                    (_mm256_loadu_si256(a.add(k * 32).cast::<__m256i>()), _mm256_loadu_si256(b.add(k * 32).cast::<__m256i>()))
-                };
-                any = _mm256_or_si256(any, _mm256_xor_si256(x, y));
+                any = _mm256_or_si256(any, xor(k));
             }
             if _mm256_testz_si256(any, any) == 0 {
                 return true;
@@ -348,7 +363,7 @@ pub(crate) unsafe fn differ(a: *const u8, b: *const u8, len: usize) -> bool {
         false
     }
     // SAFETY: the caller's.
-    if unsafe { blocks(a, b, len / 32) } {
+    if unsafe { blocks(a, b, len / 32, unroll) } {
         return true;
     }
     // SAFETY: the bytes behind the blocks.
@@ -762,15 +777,28 @@ mod tests {
 
     #[test]
     fn differences_are_seen_wherever_they_are() {
-        for len in [0usize, 1, 31, 32, 33, 127, 128, 129, 200] {
-            let a = vec![7u8; len];
-            // SAFETY: the vectors' bytes.
-            assert!(!unsafe { differ(a.as_ptr(), a.clone().as_ptr(), len) });
+        for len in [0usize, 1, 31, 32, 33, 127, 128, 129, 200, 4096, 4113] {
+            let a = vec![7u8; len + 3];
+            let mut b = a.clone();
+            // SAFETY: the vectors' bytes after the unaligned prefix.
+            let same = unsafe {
+                (
+                    differ(a.as_ptr().add(3), b.as_ptr().add(3), len, false),
+                    differ(a.as_ptr().add(3), b.as_ptr().add(3), len, true),
+                )
+            };
+            assert_eq!(same, (false, false));
             for at in 0..len {
-                let mut b = a.clone();
-                b[at] = 8;
+                b[at + 3] = 8;
                 // SAFETY: as above.
-                assert!(unsafe { differ(a.as_ptr(), b.as_ptr(), len) }, "{len} {at}");
+                let changed = unsafe {
+                    (
+                        differ(a.as_ptr().add(3), b.as_ptr().add(3), len, false),
+                        differ(a.as_ptr().add(3), b.as_ptr().add(3), len, true),
+                    )
+                };
+                assert_eq!(changed, (true, true), "{len} {at}");
+                b[at + 3] = 7;
             }
         }
     }

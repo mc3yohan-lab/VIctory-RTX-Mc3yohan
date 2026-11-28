@@ -596,13 +596,19 @@ mod tests {
     /// and the pointer, the scratch register and the flags come out as from the loop.
     #[test]
     fn a_clzero_loop_becomes_plain_stores() {
+        use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree};
-        // Against rdx (rm rax, reg rdx) and against rcx, the scratch register.
-        for (cmp, by) in [([0x48, 0x39, 0xd0], 2), ([0x48, 0x39, 0xc8], 1), ([0x4c, 0x39, 0xc0], 8)] {
-            // SAFETY: memory of our own, written and run inside it.
-            unsafe {
-                let page = VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
-                assert_ne!(page, 0);
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: memory of our own, written and run within its page.
+        unsafe {
+            let page = VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
+            assert_ne!(page, 0);
+            let comparisons = [([0x48, 0x39, 0xd0], 2), ([0x48, 0x39, 0xc8], 1), ([0x4c, 0x39, 0xc0], 8)];
+            for (slot, (cmp, by)) in comparisons.into_iter().enumerate() {
+                let entry = page + 64 * slot;
+                let loop_at = entry + 16;
+                let fallback = page + 512 + 64 * slot;
+                let stub = page + 1024 + 128 * slot;
                 // A function of (start, end): the start in rax, the end in its register, the
                 // loop at 16, and what rax became.
                 let mut head = vec![0x48, 0x89, 0xc8]; // mov rax, rcx
@@ -617,37 +623,52 @@ mod tests {
                 code.extend(cmp);
                 code.extend([0x72, 0xf4]);
                 code.push(0xc3);
-                std::ptr::copy_nonoverlapping(code.as_ptr(), page as *mut u8, code.len());
+                std::ptr::copy_nonoverlapping(code.as_ptr(), entry as *mut u8, code.len());
                 let mut context: CONTEXT = std::mem::zeroed();
                 let mut block = vec![0xaau8; 64 * 8 + 64];
                 let base = block.as_mut_ptr() as usize;
                 let first = base.next_multiple_of(64);
-                // The fault itself: emulated whole, and replaced.
-                context.Rip = page as u64 + 16;
+                let at = first - base;
+                // A legacy prefix makes this a 13-byte loop. The actual
+                // fault path emulates it without using the process arena.
+                let mut prefixed = vec![0x66];
+                prefixed.extend_from_slice(&code[16..]);
+                std::ptr::copy_nonoverlapping(prefixed.as_ptr(), fallback as *mut u8, prefixed.len());
+                context.Rip = fallback as u64;
                 context.Rax = first as u64;
                 context.Rdx = first as u64 + 128;
                 context.Rcx = context.Rdx;
                 context.R8 = context.Rdx;
                 assert_eq!(emulate(&mut context), CONTINUE_EXECUTION);
-                assert_eq!((context.Rip, context.Rax), (page as u64 + 28, first as u64 + 128));
-                if patches_clzero() {
-                    assert_eq!(*((page + 16) as *const u8), 0xe9, "a jump");
-                    block.fill(0xaa);
-                    let run: extern "system" fn(usize, usize) -> usize = std::mem::transmute(page);
-                    // From inside a line to inside the third: whole lines, one past the end.
-                    assert_eq!(run(first + 8, first + 130), first + 8 + 128);
-                    let at = first - base;
-                    assert!(block[at..at + 128].iter().all(|&b| b == 0));
-                    assert!(block[..at].iter().chain(&block[at + 128..]).all(|&b| b == 0xaa));
-                    // An end at the start: one line.
-                    block.fill(0xaa);
-                    assert_eq!(run(first, first), first + 64);
-                    assert!(block[at..at + 64].iter().all(|&b| b == 0) && block[at + 64] == 0xaa);
-                }
-                VirtualFree(page as *mut _, 0, MEM_RELEASE);
+                assert_eq!((context.Rip, context.Rax), (fallback as u64 + 13, first as u64 + 128));
+                assert_eq!(std::slice::from_raw_parts(fallback as *const u8, prefixed.len()), prefixed.as_slice());
+                assert!(block[at..at + 128].iter().all(|&b| b == 0));
+                assert!(block[..at].iter().chain(&block[at + 128..]).all(|&b| b == 0xaa));
+
+                // Install and run the existing stub and jump using the
+                // fixture's own executable page. Both jumps are in reach.
+                let body = clzero_stub(loop_at, stub, cmp).unwrap();
+                std::ptr::copy_nonoverlapping(body.as_ptr(), stub as *mut u8, body.len());
+                let branch = jump(loop_at, stub).unwrap();
+                assert!(patch(loop_at, code[16..21].try_into().unwrap(), branch));
+                assert_eq!(std::slice::from_raw_parts(loop_at as *const u8, branch.len()), branch);
+                assert_ne!(FlushInstructionCache(GetCurrentProcess(), page as *const _, 4096), 0);
+
+                block.fill(0xaa);
+                let run: extern "system" fn(usize, usize) -> usize = std::mem::transmute(entry);
+                // From inside a line to inside the third: whole lines, one past the end.
+                assert_eq!(run(first + 8, first + 130), first + 8 + 128);
+                assert!(block[at..at + 128].iter().all(|&b| b == 0));
+                assert!(block[..at].iter().chain(&block[at + 128..]).all(|&b| b == 0xaa));
+                // An end at the start: one line.
+                block.fill(0xaa);
+                assert_eq!(run(first, first), first + 64);
+                assert!(block[at..at + 64].iter().all(|&b| b == 0) && block[at + 64] == 0xaa);
             }
+            assert_ne!(VirtualFree(page as *mut _, 0, MEM_RELEASE), 0);
         }
         assert!(clzero_stub(0x1000, 0x2000, [0x48, 0x39, 0xc0]).is_none(), "against rax itself");
         assert!(jump(0x1000, 0x9000_0000_0000).is_none(), "out of reach");
+        assert!(clzero_stub(0x1000, 0x9000_0000_0000, [0x48, 0x39, 0xd0]).is_none(), "return jump out of reach");
     }
 }

@@ -40,11 +40,13 @@ Reference test hardware: **Windows 11 x64, Intel Core i9-12900KF (8P/16T + 8E/8T
 NVIDIA GeForce RTX 4090 (24 GB GDDR6X, 32 GiB Resizable BAR, Wave32, SM 6.2 `native16=true`, 48 KiB LDS, 1M view heap)**,
 Series X profile (ray tracing off).
 
+The 15-minute RTX 4090 run at native 1080p reached 16.8 FPS median in the boat after excluding observed menus and transitions, with an 8.0 FPS minimum across measurement windows. The earlier 720p and scaled 1080p figures below describe different workloads. Launcher 0.9.1 exposes the native setup under **Nítido 1080p**. [Image quality, measurements and next tests (Spanish)](docs/rtx4090-informe-2026-11-27.md)
+
 | Metric | Measured Status |
 |---|---|
 | **Menu / UI** | **60.0 FPS** (`16.7 ms/frame`, `0.0 ms` GPU wait) with native 60 FPS unlock (`-Fps 60`, simulation clock stays `1.00x`) |
-| **Fluid 720p (`1280×720`, `Scale 1.0`, `release`, v6)** | **22.6–26.6 FPS steady** (`24.5 FPS` / `40.9 ms`, `prep 26.1 ms`, `copyback 21.0 ms` at `4,857–5,022` draws/frame; `0` warnings/errors, `0` skin-bake errors across `372` draws, `0` shader misses) |
-| **Balanced 1080p (`1920×1080`, `Scale 0.667`, `release`, v6)** | **20.1–26.0 FPS steady** (`0.0–0.6 ms` GPU wait, `3,173` shader hits / `0` misses, `0` warnings/errors — CPU-bound in `victory-submit`) |
+| **Fluid 720p (`1280×720`, `Scale 1.0`, `release`, v6)** | **22.6–26.6 FPS in the sampled section** (`24.5 FPS` / `40.9 ms`, `prep 26.1 ms`, `copyback 21.0 ms` at `4,857–5,022` draws/frame; `0` warnings/errors, `0` skin-bake errors across `372` draws, `0` shader misses) |
+| **Balanced 1080p (`1920×1080`, `Scale 0.667`, `release`, v6)** | **20.1–26.0 FPS in the sampled section** (`0.0–0.6 ms` GPU wait, `3,173` shader hits / `0` misses, `0` warnings/errors — CPU-bound in `victory-submit`) |
 | **Wave32 Shader Coverage (`TRANSLATOR_VERSION = 6`, `SHADER_OPT = 191`)** | **`25,784` shaders translated to Wave32 (`99.98%`) in `165 s`** (**`974.9 MB`** clean disk cache); **`2,787` used pipelines pre-warmed (`254.7 MB` `host-pipelines.bin`, `0` driver refusals)**; includes native FP16 (`SM 6.2`), `48 KiB` LDS, linked Mesh+Pixel lowering, 2-D group thread tickets (`64/64` slots verified on RTX 4090 vs `32/64` legacy), lane-mask select fix, `s_min`/`s_max` SCC fix, transmission tile rewrite, and un-skipped Wave32 paired open-water lighting (`WATER_LIGHT_HASHES`) |
 | **Native PC FidelityFX 4K (`-Fsr4K`)** | **Verified live on RTX 4090 with signed AMD FSR `3.1.6`** (`FSR SDK v2.4.0`, pixel-exact `fidelityfx` hardware test `1/1 ok` + byte-verified `quality`/`balanced`/`performance` 4K profiles) |
 | **Exclusive NVIDIA 1M-Heap Port 5 (`VICTORY_PORT_CBV=1` in-place)** | **`8,700–16,750` table CBVs/frame (`3.7–6.7 MB/frame`) read in place** (`0` unaligned fallbacks), slashing `card_steps` fills from `~12,000` → **`~145/frame`**; with `own.between` SRV L1TEX state barrier + aligned `raw_dwords` + collapsed `smem` dispatch |

@@ -3227,7 +3227,8 @@ fn put_changed(at: usize, title: &[u8], merged: &[u8]) -> usize {
         }
         return merged.len();
     }
-    let mut runs = dword_runs(at, title, merged, 0);
+    // Use the same exact compare as the refresh path (Walid ben miled, VIctory-NVIDIA #145).
+    let mut runs = word_runs(at, title, merged);
     if runs.len() > 64 {
         runs = dword_runs(at, title, merged, 32);
         PUT[3].fetch_add(1, Ordering::Relaxed);
@@ -3478,7 +3479,7 @@ mod merge_tests {
             seed >> 8
         };
         for round in 0..200 {
-            let n = 4 * (random() as usize % 400);
+            let n = 4 * (random() as usize % 400) + round % 4;
             let was: Vec<u8> = (0..n).map(|_| random() as u8).collect();
             let mut now = was.clone();
             for _ in 0..random() % 200 {
@@ -3491,7 +3492,10 @@ mod merge_tests {
                     *b = random() as u8;
                 }
             }
-            assert_eq!(word_runs(0x1000, &now, &was), dword_runs(0x1000, &now, &was, 0), "round {round}");
+            for offset in 0..4 {
+                let at = 0x1000 + offset;
+                assert_eq!(word_runs(at, &now, &was), dword_runs(at, &now, &was, 0), "round {round}, offset {offset}");
+            }
         }
     }
 

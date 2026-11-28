@@ -9,6 +9,8 @@
 //! 24,000 queued when the world loads in each of its 250 ms turns, some
 //! forty seconds of a world without its textures.
 //! `VICTORY_TEXTURE_POOL=0` makes every one an allocation of its own again.
+//! `VICTORY_POOL_GATE=1` lets index prefetch defer new blocks above the VRAM
+//! line. It still uses free pieces of blocks the card already holds.
 //!
 //! A piece given back is used again only two seconds later (nothing the card
 //! was told before that is still running: Windows resets a card that takes
@@ -17,6 +19,7 @@
 //! goes (an object of ours the texture holds says so), a staging buffer's
 //! when the last list that recorded its copy is reset.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
@@ -111,6 +114,68 @@ fn now() -> u64 {
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_POOL").is_none_or(|v| v != "0"))
+}
+
+// Allocation-time VRAM gate after fxceless/victory-fork 2eade68cade9 (GPL-3.0).
+pub(crate) fn gate() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_GATE").is_some_and(|v| v == "1"))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Growth {
+    Required,
+    Prefetch,
+    Deferred,
+}
+
+thread_local! {
+    static GROWTH: Cell<Growth> = const { Cell::new(Growth::Required) };
+}
+
+/// Let one speculative texture wait for memory. Restore the caller's
+/// policy even if making the texture unwinds.
+pub(crate) fn prefetch_deferred(prepare: impl FnOnce()) -> bool {
+    struct Restore(Growth);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            GROWTH.set(self.0);
+        }
+    }
+    let _restore = Restore(GROWTH.replace(Growth::Prefetch));
+    prepare();
+    GROWTH.get() == Growth::Deferred
+}
+
+pub(crate) fn texture_growth_deferred() -> bool {
+    gate() && GROWTH.get() == Growth::Deferred
+}
+
+pub(crate) fn texture_prefetching() -> bool {
+    gate() && GROWTH.get() == Growth::Prefetch
+}
+
+pub(crate) fn defer_texture_growth() {
+    GROWTH.set(Growth::Deferred);
+}
+
+fn texture_block_allowed(now: u64, needed: bool) -> bool {
+    if !gate() || (needed && GROWTH.get() == Growth::Required) {
+        return true;
+    }
+    // Reuse denials briefly. A stale permission could allow many 64 MiB
+    // blocks against one sample, so every successful growth samples again.
+    static DENIED_UNTIL: AtomicU64 = AtomicU64::new(0);
+    if now >= DENIED_UNTIL.load(Ordering::Relaxed) {
+        if crate::resource::texture_growth_allowed(BLOCK) {
+            return true;
+        }
+        DENIED_UNTIL.store(now.saturating_add(100), Ordering::Relaxed);
+    }
+    if needed {
+        defer_texture_growth();
+    }
+    false
 }
 
 /// How many blocks of textures are made ahead, so that one has been there
@@ -240,17 +305,19 @@ impl<B: Clone> Pool<B> {
     /// A piece of `len` bytes and the memory it lies in, and whether that
     /// part was ever used before; `make` makes a block when none has room.
     fn take(&mut self, len: u64, align: u64, now: u64, make: impl FnMut() -> Option<B>) -> Option<(Piece, B, bool)> {
-        self.take_ripe(len, align, now, Ripe::ALL, make)
+        self.take_ripe(len, align, now, Ripe::ALL, |_| true, make)
     }
 
     /// The same from a block that is ripe, if one has room; `make` makes one
-    /// ahead too, when few are empty.
+    /// ahead too, when few are empty. `allow_growth` distinguishes a block
+    /// needed for this piece from a spare, after searching existing blocks.
     fn take_ripe(
         &mut self,
         len: u64,
         align: u64,
         now: u64,
         ripe: Ripe,
+        mut allow_growth: impl FnMut(bool) -> bool,
         mut make: impl FnMut() -> Option<B>,
     ) -> Option<(Piece, B, bool)> {
         // With blocks made ahead, what would be an allocation of its own (and
@@ -279,6 +346,9 @@ impl<B: Clone> Pool<B> {
         let (i, start) = match found {
             Some(found) => found,
             None => {
+                if !allow_growth(true) {
+                    return None;
+                }
                 let memory = self.grow(now, &mut make)?;
                 let i = self.add(memory, ripe.started);
                 (i, self.blocks[i].as_mut()?.free.take(len, align)?)
@@ -293,6 +363,7 @@ impl<B: Clone> Pool<B> {
             }
             let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
             if empty < ripe.ahead
+                && allow_growth(false)
                 && let Some(memory) = self.grow(now, &mut make)
             {
                 self.add(memory, ripe.started);
@@ -705,8 +776,9 @@ pub(crate) unsafe fn texture(
     if info.SizeInBytes == u64::MAX {
         return None;
     }
+    let opened_at = now();
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
+    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), opened_at, Ripe::now(), |needed| texture_block_allowed(opened_at, needed), || {
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: BLOCK,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
@@ -781,6 +853,55 @@ mod tests {
         }
         assert_eq!(calls.get(), 1);
         assert!(pool.take(24080, 512, 1012, || Some(1)).is_some());
+    }
+
+    #[test]
+    fn a_full_budget_still_leaves_paid_fragments_for_smaller_textures() {
+        let mut pool = Pool::new(SPARE);
+        let quarter = BLOCK / 4;
+        let align = 65536;
+        let filled: [Piece; 4] = std::array::from_fn(|_| pool.take(quarter, align, 0, || Some(1)).unwrap().0);
+        pool.give(filled[0], 0);
+        pool.give(filled[2], 0);
+
+        // Two free quarters cannot satisfy a half-block allocation.
+        let mut gated = |needed: bool| {
+            assert!(needed);
+            false
+        };
+        assert!(pool.take_ripe(quarter * 2, align, REST, Ripe::ALL, &mut gated, || panic!("growth denied")).is_none());
+        let (piece, block, reused) = pool.take_ripe(quarter, align, REST, Ripe::ALL, |_| panic!("a paid fragment fits"), || panic!("growth not needed")).unwrap();
+        assert_eq!((piece.start, block, reused), (filled[0].start, 1, true));
+
+        // Denying prefetch does not put a required allocation into the
+        // cooldown for an actual driver allocation failure.
+        assert_eq!(pool.take(quarter * 2, align, REST, || Some(2)).unwrap().1, 2);
+    }
+
+    #[test]
+    fn a_spare_block_can_wait_after_placing_in_a_paid_block() {
+        let mut pool = Pool::new(SPARE);
+        pool.add(1, 0);
+        let ripe = Ripe { started: 0, finished: 0, ahead: 1 };
+        let (_, block, _) = pool.take_ripe(BLOCK / 2, 65536, 0, ripe, |needed| {
+            assert!(!needed);
+            false
+        }, || panic!("spare growth denied")).unwrap();
+        assert_eq!(block, 1);
+        assert_eq!(pool.blocks(), 1);
+    }
+
+    #[test]
+    fn speculative_growth_context_is_scoped_to_its_request() {
+        assert!(GROWTH.get() == Growth::Required);
+        assert!(prefetch_deferred(|| {
+            assert!(GROWTH.get() == Growth::Prefetch);
+            assert!(prefetch_deferred(defer_texture_growth));
+            assert!(GROWTH.get() == Growth::Prefetch);
+            defer_texture_growth();
+        }));
+        assert!(!prefetch_deferred(|| {}));
+        assert!(GROWTH.get() == Growth::Required);
     }
 
     #[test]
@@ -872,7 +993,7 @@ mod tests {
             Some(made.get())
         };
         let at = |started, finished| Ripe { started, finished, ahead: 2 };
-        let take = |pool: &mut Pool<u64>, ripe| pool.take_ripe(BLOCK / 2, 65536, 0, ripe, make).unwrap().1;
+        let take = |pool: &mut Pool<u64>, ripe| pool.take_ripe(BLOCK / 2, 65536, 0, ripe, |_| true, make).unwrap().1;
         // Nothing runs: at once, and two are made ahead, one a time.
         assert_eq!(take(&mut pool, at(0, 0)), 1);
         assert_eq!(made.get(), 2);
@@ -888,7 +1009,7 @@ mod tests {
         assert_eq!(take(&mut pool, at(7, 4)), 4);
         assert_eq!(take(&mut pool, at(7, 5)), 4);
         // A whole block's worth too.
-        assert_eq!(pool.take_ripe(BLOCK, 65536, 0, at(8, 7), make).unwrap().1, 5);
+        assert_eq!(pool.take_ripe(BLOCK, 65536, 0, at(8, 7), |_| true, make).unwrap().1, 5);
         // Off: the first with room, whatever its age, none ahead.
         let n = made.get();
         assert_eq!(pool.take(BLOCK / 2, 65536, 0, make).unwrap().1, 6);

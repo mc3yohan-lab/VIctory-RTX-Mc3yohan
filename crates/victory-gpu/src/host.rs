@@ -57,6 +57,8 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
+    /// PCI vendor and device IDs of the adapter that owns the D3D12 device.
+    pub(crate) adapter_ids: Option<(u32, u32)>,
     /// Shader-visible heaps of one slot, bound where a list sets no view or
     /// no sampler heap ([`fallback_heaps`]).
     fallback_view: OnceLock<Option<ID3D12DescriptorHeap>>,
@@ -1165,7 +1167,8 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
-        if let Some(desc) = adapter.as_ref().and_then(|a| a.GetDesc1().ok()) {
+        let adapter_desc = adapter.as_ref().and_then(|a| a.GetDesc1().ok());
+        if let Some(desc) = &adapter_desc {
             let name = String::from_utf16_lossy(&desc.Description);
             tracing::info!(
                 adapter = name.trim_end_matches('\0'),
@@ -1191,6 +1194,7 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
+            adapter_ids: adapter_desc.map(|desc| (desc.VendorId, desc.DeviceId)),
             fallback_view: OnceLock::new(),
             fallback_sampler: OnceLock::new(),
         })
@@ -10550,8 +10554,82 @@ fn meter_lines(lines: impl FnOnce() + Send + 'static) {
     }
 }
 
+/// Optional native presentation cadence. Only consecutive S_OK results
+/// contribute intervals. Occlusion and errors break the sequence.
+#[derive(Default)]
+struct PresentTiming {
+    previous: Option<std::time::Instant>,
+    batch: PresentTimingBatch,
+}
+
+#[derive(Default)]
+struct PresentTimingBatch {
+    intervals_us: Vec<u64>,
+    accepted: u64,
+    occluded: u64,
+    rejected: u64,
+    overflow: u64,
+}
+
+static PENDING_PRESENT_TIMING: AtomicU32 = AtomicU32::new(0);
+
+struct QueuedPresentTiming(PresentTimingBatch);
+
+impl Drop for QueuedPresentTiming {
+    fn drop(&mut self) {
+        PENDING_PRESENT_TIMING.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl PresentTiming {
+    const MAX_INTERVALS: usize = 512;
+
+    fn observe(&mut self, status: windows::core::HRESULT, now: std::time::Instant) {
+        use windows::Win32::Foundation::{DXGI_STATUS_OCCLUDED, S_OK};
+        match status {
+            S_OK => {
+                self.batch.accepted += 1;
+                if let Some(previous) = self.previous.replace(now) {
+                    if self.batch.intervals_us.len() == Self::MAX_INTERVALS {
+                        self.batch.overflow += 1;
+                    } else {
+                        let us = now.duration_since(previous).as_micros();
+                        self.batch.intervals_us.push(us.try_into().unwrap_or(u64::MAX));
+                    }
+                }
+            }
+            DXGI_STATUS_OCCLUDED => {
+                self.batch.occluded += 1;
+                self.previous = None;
+            }
+            _ => {
+                self.batch.rejected += 1;
+                self.previous = None;
+            }
+        }
+    }
+
+    fn queue_batch(&mut self) -> Option<QueuedPresentTiming> {
+        // The existing meter worker never blocks presentation. Bound this
+        // optional payload even if the logging writer cannot keep pace.
+        let reserved = PENDING_PRESENT_TIMING.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |pending| (pending < 4).then_some(pending + 1),
+        );
+        if reserved.is_ok() {
+            Some(QueuedPresentTiming(std::mem::take(&mut self.batch)))
+        } else {
+            self.batch.overflow += self.batch.intervals_us.len() as u64;
+            self.batch.intervals_us.clear();
+            None
+        }
+    }
+}
+
 struct Meter {
     last_present: windows::core::HRESULT,
+    present_timing: Option<Box<PresentTiming>>,
     since: std::time::Instant,
     frames: u32,
     #[cfg(feature = "diagnostics")]
@@ -10567,6 +10645,8 @@ impl Meter {
         let now = std::time::Instant::now();
         Meter {
             last_present: windows::Win32::Foundation::S_OK,
+            present_timing: (std::env::var("VICTORY_PRESENT_TIMES").as_deref() == Ok("1"))
+                .then(Box::default),
             since: now,
             frames: 0,
             #[cfg(feature = "diagnostics")]
@@ -10580,6 +10660,13 @@ impl Meter {
     /// Whether the next frame counted makes the frame-rate line.
     fn line_due(&self) -> bool {
         self.since.elapsed() >= std::time::Duration::from_secs(1)
+    }
+
+    /// Timestamp the return from DXGI before updating the performance panel.
+    fn timestamp_present(&mut self, status: windows::core::HRESULT) {
+        if let Some(timing) = &mut self.present_timing {
+            timing.observe(status, std::time::Instant::now());
+        }
     }
 
     /// Record a frame once the swap chain has accepted it.
@@ -10629,6 +10716,7 @@ impl Meter {
         }
         #[cfg(feature = "diagnostics")]
         let copy_stats_frames = if five { std::mem::take(&mut self.copy_stats_frames) as f64 } else { 0.0 };
+        let timing = self.present_timing.as_mut().and_then(|timing| timing.queue_batch());
         meter_lines(move || {
             // Of a frame, ms preparing submissions and ms waiting for the GPU.
             let [cpu, gpu] = [0, 1].map(|i| {
@@ -10647,6 +10735,19 @@ impl Meter {
             let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
             let refused = BUDGET_NOTES[0].swap(0, Ordering::Relaxed) as f64 / frames;
             let biggest = BUDGET_NOTES[1].swap(0, Ordering::Relaxed);
+            if let Some(timing) = timing {
+                let batch = &timing.0;
+                tracing::info!(
+                    target: "victory_gpu::present_timing",
+                    accepted = batch.accepted,
+                    occluded = batch.occluded,
+                    rejected = batch.rejected,
+                    overflow = batch.overflow,
+                    draws_per_frame = draws,
+                    intervals_us = ?batch.intervals_us,
+                    "present cadence"
+                );
+            }
             tracing::info!(
                 "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^27), the largest cost of one {biggest} (0: under 2^22)"
             );
@@ -10852,7 +10953,9 @@ impl Meter {
                      {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                      textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
                      {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}; \
-                     raw view clamp (past end, shortened, sub-dword, unaligned) since start: SRV {raw_srv:?}, UAV {raw_uav:?}",
+                     raw view clamp (past end, shortened, sub-dword, unaligned) since start: SRV {raw_srv:?}, UAV {raw_uav:?}; \
+                     commands dropped while making descriptor tables since start: {descriptor_drops}",
+                    descriptor_drops = crate::draw::DESCRIPTOR_DROPS.load(Ordering::Relaxed),
                     picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                     picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
                     picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
@@ -10933,7 +11036,8 @@ impl Meter {
 
 #[cfg(test)]
 mod present_status_tests {
-    use super::{HWND, Meter};
+    use super::{HWND, Meter, PresentTiming};
+    use std::time::{Duration, Instant};
     use windows::Win32::Foundation::{DXGI_STATUS_OCCLUDED, E_FAIL, S_OK};
 
     #[test]
@@ -10949,6 +11053,41 @@ mod present_status_tests {
         assert!(meter.record_present(hwnd, S_OK));
         assert_eq!(meter.frames, 3);
         assert_eq!(meter.last_present, S_OK);
+    }
+
+    #[test]
+    fn cadence_only_measures_consecutive_visible_presents() {
+        let mut timing = PresentTiming::default();
+        let start = Instant::now();
+        for (ms, status) in [
+            (0, S_OK),
+            (40, S_OK),
+            (80, DXGI_STATUS_OCCLUDED),
+            (200, S_OK),
+            (233, S_OK),
+            (240, E_FAIL),
+            (400, S_OK),
+        ] {
+            timing.observe(status, start + Duration::from_millis(ms));
+        }
+        assert_eq!(timing.batch.intervals_us, [40_000, 33_000]);
+        assert_eq!(timing.batch.accepted, 5);
+        assert_eq!(timing.batch.occluded, 1);
+        assert_eq!(timing.batch.rejected, 1);
+    }
+
+    #[test]
+    fn cadence_counts_overflow_and_preserves_continuity_across_batches() {
+        let mut timing = PresentTiming::default();
+        let start = Instant::now();
+        for ms in 0..=PresentTiming::MAX_INTERVALS + 2 {
+            timing.observe(S_OK, start + Duration::from_millis(ms as u64));
+        }
+        let batch = std::mem::take(&mut timing.batch);
+        assert_eq!(batch.intervals_us.len(), PresentTiming::MAX_INTERVALS);
+        assert_eq!(batch.overflow, 2);
+        timing.observe(S_OK, start + Duration::from_millis(PresentTiming::MAX_INTERVALS as u64 + 3));
+        assert_eq!(timing.batch.intervals_us, [1_000]);
     }
 }
 
@@ -11236,6 +11375,7 @@ impl Host {
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
             let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            p.meter.timestamp_present(status);
             showing.next("the frame meter");
             if status == windows::Win32::Foundation::S_OK {
                 p.panel.frame(p.meter.line_due());

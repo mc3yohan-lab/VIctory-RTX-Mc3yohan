@@ -2,11 +2,16 @@
 //! with `VICTORY_CAPTURE=<folder>`, every frame whose number is a power of
 //! two (the frames the log reports) is saved as `frame-<n>.png`, at half
 //! size. Only in builds with diagnostics.
+//! With `VICTORY_CAPTURE_ON_REQUEST=1`, creating `capture-next` in that
+//! folder also traces and saves the next frame. One request per run.
 
 use std::path::PathBuf;
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
+
+/// A frame armed from the capture folder while the title is running.
+static REQUESTED_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The folder frames go to, if capturing.
 pub(crate) fn folder() -> Option<&'static PathBuf> {
@@ -47,7 +52,9 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named
+        || n != 0 && REQUESTED_FRAME.load(std::sync::atomic::Ordering::Acquire) == n
+        || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -126,6 +133,24 @@ static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u
 /// At the present of `frame`: the draws run on the host so far.
 pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
+    static MARKER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    let marker = MARKER.get_or_init(|| {
+        folder()
+            .filter(|_| crate::switch::on("VICTORY_CAPTURE_ON_REQUEST"))
+            .map(|folder| folder.join("capture-next"))
+    });
+    // At most one stat every four presents, only in a manually armed run.
+    // File I/O stays off the recording threads. Leave the marker untouched.
+    if let Some(marker) = marker
+        && frame.is_multiple_of(4)
+        && REQUESTED_FRAME.load(Relaxed) == 0
+        && marker.is_file()
+    {
+        let next = frame + 1;
+        if REQUESTED_FRAME.compare_exchange(0, next, std::sync::atomic::Ordering::Release, Relaxed).is_ok() {
+            tracing::info!(frame = next, "one frame requested from the capture folder");
+        }
+    }
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = LAST.swap(drawn, Relaxed);
     if world_on()

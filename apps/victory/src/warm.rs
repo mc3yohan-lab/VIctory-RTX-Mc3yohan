@@ -134,10 +134,10 @@ pub fn run(
             .collect();
         targets.sort_by_key(|&n| (!early.contains(keys[n].as_str()), &keys[n]));
         targets.truncate(limit.unwrap_or(usize::MAX));
-        println!("saving {} verified pipelines into host-pipelines.bin ({jobs} threads)...", targets.len());
+        println!("preparing {} verified pipelines and saving cacheable PSOs in host-pipelines.bin ({jobs} threads)...", targets.len());
         let (ok, fail) = known::populate_library(&dir, &targets, jobs);
         println!(
-            "host-pipelines.bin saved in {:.1} s ({ok} stored/loaded, {fail} no host pipeline)",
+            "host pipeline preparation finished in {:.1} s ({ok} host pipelines ready, {fail} without a host pipeline)",
             lib_began.elapsed().as_secs_f64()
         );
     }

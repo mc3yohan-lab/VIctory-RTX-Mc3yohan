@@ -104,7 +104,7 @@ const RING: u64 = 64;
 const LAG: u64 = 16;
 
 const SOURCE: &str = r#"
-cbuffer Set : register(b0) { uint record; uint cells; uint has_stats; uint unused; };
+cbuffer Set : register(b0) { uint record; uint cells; uint has_stats; uint sequence; };
 globallycoherent RWByteAddressBuffer ring : register(u0);
 #ifdef EXPOSURE
 Texture2D<float4> average : register(t0);
@@ -115,6 +115,8 @@ RWStructuredBuffer<float4> mean : register(u2);
 [numthreads(1, 1, 1)]
 void exposure() {
     uint at = record * 256;
+    ring.Store(at + 252, 0);
+    DeviceMemoryBarrier();
     ring.Store4(at, asuint(average.Load(int3(0, 0, 0))));
     ring.Store4(at + 16, asuint(before.Load(int3(0, 0, 0))));
     if (has_stats != 0) {
@@ -126,7 +128,7 @@ void exposure() {
         ring.Store4(at + 80, uint4(0, 0, 0, 0));
     }
     DeviceMemoryBarrier();
-    ring.Store(at + 252, record + 1);
+    ring.Store(at + 252, sequence);
 }
 #endif
 #ifdef LUX
@@ -201,40 +203,79 @@ fn uav_barrier(list: &ID3D12GraphicsCommandList) {
     unsafe { list.ResourceBarrier(&[barrier]) };
 }
 
+/// A completion identifies the request, not just the address in the ring.
+/// Zero is reserved for an unwritten slot or one being overwritten.
+fn sequence_tag(record: u64) -> u32 {
+    (record % u64::from(u32::MAX)) as u32 + 1
+}
+
+fn completed_record<T>(
+    record: u64,
+    marker: impl Fn() -> u32,
+    read: impl FnOnce() -> T,
+) -> Option<T> {
+    let expected = sequence_tag(record);
+    if marker() != expected {
+        return None;
+    }
+    let value = read();
+    (marker() == expected).then_some(value)
+}
+
+fn newest_completed<T>(
+    last: &mut Option<u64>,
+    newest_first: impl Iterator<Item = u64>,
+    mut read: impl FnMut(u64) -> Option<T>,
+) -> Option<(u64, T)> {
+    for record in newest_first {
+        if last.is_some_and(|last| record <= last) {
+            break;
+        }
+        if let Some(value) = read(record) {
+            *last = Some(record);
+            return Some((record, value));
+        }
+    }
+    None
+}
+
+impl Pass {
+    fn completed<T>(&self, record: u64, read: impl FnOnce(usize) -> T) -> Option<T> {
+        let at = self.data + ((record % RING) * RECORD * 4) as usize;
+        // SAFETY: the aligned completion word is within the retained mapping.
+        let marker = || unsafe { ((at + 252) as *const u32).read_volatile() };
+        completed_record(record, marker, || read(at))
+    }
+}
+
 /// Writes the record asked for `LAG` records ago (the card has run it), and
 /// feeds the latest completed exposure multiplier back to `crate::ambient`.
 fn write_old(pass: &Pass, now: u64) {
-    static DRAIN: Mutex<()> = Mutex::new(());
-    let _guard = DRAIN.lock().unwrap_or_else(|e| e.into_inner());
+    static DRAIN: Mutex<Option<u64>> = Mutex::new(None);
+    let mut last = DRAIN.lock().unwrap_or_else(|e| e.into_inner());
     if !file_on() {
-        for back in 1..=LAG {
-            let Some(old) = now.checked_sub(back) else {
-                break;
-            };
-            let slot = old % RING;
-            // SAFETY: the ring's mapping; sentinel at dword 63 is written last by GPU.
-            let done = unsafe { ((pass.data + (slot * RECORD * 4 + 252) as usize) as *const u32).read_volatile() };
-            if u64::from(done) == slot + 1 {
-                // SAFETY: slot completed on GPU; word 4 holds `before.Load(0).x` (exposure).
-                let exp = f32::from_bits(unsafe {
-                    ((pass.data + (slot * RECORD * 4 + 16) as usize) as *const u32).read_volatile()
-                });
-                crate::ambient::note_exposure(exp);
-                unsafe { ((pass.data + (slot * RECORD * 4 + 252) as usize) as *mut u32).write_volatile(0) };
-                break;
-            }
+        let candidates = (1..=LAG).map_while(|back| now.checked_sub(back));
+        if let Some((_, exp)) = newest_completed(&mut last, candidates, |record| {
+            pass
+                .completed(record, |at| {
+                    // SAFETY: word 4 is within the retained record mapping.
+                    f32::from_bits(unsafe { ((at + 16) as *const u32).read_volatile() })
+                })
+                .filter(|exp| exp.is_finite() && *exp > 1e-6)
+        }) {
+            crate::ambient::note_exposure(exp);
         }
         return;
     }
-    let Some(old) = now.checked_sub(LAG) else {
+    let Some((old, words)) = newest_completed(&mut last, now.checked_sub(LAG).into_iter(), |record| {
+        pass.completed(record, |at| {
+            // SAFETY: the ring mapping covers the entire aligned record.
+            unsafe { (at as *const [u32; RECORD as usize]).read_volatile() }
+        })
+    }) else {
         return;
     };
     let slot = old % RING;
-    // SAFETY: the ring's mapping; the card wrote this record frames ago.
-    let words: [u32; RECORD as usize] = unsafe { ((pass.data + (slot * RECORD * 4) as usize) as *const [u32; RECORD as usize]).read_volatile() };
-    if u64::from(words[63]) != slot + 1 {
-        return;
-    }
     let f = |i: usize| f32::from_bits(words[i]);
     crate::ambient::note_exposure(f(4));
     let ms = WHEN[slot as usize].load(Relaxed);
@@ -252,9 +293,6 @@ fn write_old(pass: &Pass, now: u64) {
             let _ = file.flush();
         }
     }
-    // Mark it read.
-    // SAFETY: as above.
-    unsafe { ((pass.data + (slot * RECORD * 4 + 252) as usize) as *mut u32).write_volatile(0) };
 }
 
 /// After the exposure program's draw, in `list` with its heap set: its two
@@ -270,7 +308,7 @@ pub(crate) fn after_exposure(list: &HostList, average: D3D12_GPU_DESCRIPTOR_HAND
     }
     write_old(pass, n);
     let stats = csv.then(crate::ambient::probe_buffers).flatten();
-    let words = [(n % RING) as u32, crate::ambient::CELLS_AT, u32::from(stats.is_some()), 0];
+    let words = [(n % RING) as u32, crate::ambient::CELLS_AT, u32::from(stats.is_some()), sequence_tag(n)];
     list.keep(&pass.ring);
     let l = &list.list;
     // SAFETY: an open list with the views' heap set; buffers kept.
@@ -331,6 +369,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_new_exposure_is_never_replaced_by_an_older_ready_record() {
+        let mut last = None;
+        let ready = |record| [8, 9].contains(&record).then_some(record);
+        assert_eq!(newest_completed(&mut last, (8..=9).rev(), ready), Some((9, 9)));
+        assert_eq!(newest_completed(&mut last, (8..=10).rev(), ready), None);
+        assert_eq!(newest_completed(&mut last, [10].into_iter(), Some), Some((10, 10)));
+    }
+
+    #[test]
+    fn an_exposure_slot_rejects_old_data_across_a_ring_wrap_and_during_overwrite() {
+        let old = 9;
+        let current = old + RING;
+        assert_eq!(current % RING, old % RING);
+        assert_ne!(sequence_tag(current), 0);
+        assert_ne!(sequence_tag(current), sequence_tag(old));
+        let marker = std::cell::Cell::new(sequence_tag(old));
+        assert!(completed_record(current, || marker.get(), || unreachable!()).is_none());
+        marker.set(sequence_tag(current));
+        assert_eq!(completed_record(current, || marker.get(), || 0.25), Some(0.25));
+        assert_eq!(completed_record(current, || marker.get(), || {
+            marker.set(0);
+            0.25
+        }), None);
+    }
+
+    #[test]
     fn roles_by_name() {
         assert_eq!(role(b"..PS_CalculateExposure_396dfccc_Wrapped.."), Some(Role::Exposure));
         assert_eq!(role(b"avgLuminanceCompute:ComputeLuxCompressionInfoSmooth_5b8554dd"), lux_on().then_some(Role::Lux));
@@ -341,6 +405,10 @@ mod tests {
     #[test]
     fn the_passes_build() {
         let Some(host) = host() else {
+            assert!(
+                !cfg!(feature = "diagnostics") || !crate::switch::on("VICTORY_D3D12_WARP"),
+                "WARP was requested but no host device opened"
+            );
             return;
         };
         pipeline(&host.device, "EXPOSURE", RS_EXPOSURE, s!("exposure")).expect("exposure pass");

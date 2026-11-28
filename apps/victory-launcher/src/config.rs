@@ -3,9 +3,13 @@
 //! generación de variables de entorno calibradas para NVIDIA RTX.
 
 use std::collections::BTreeMap;
+use std::io::{self, Write};
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
+use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::hardware::{HardwareInfo, VramTier};
 
@@ -14,6 +18,7 @@ pub enum Preset {
     Auto,
     Fluid720p,
     Balanced1080p,
+    QualityRtx,
     Native1080p,
     High1440p,
     Fsr4K,
@@ -22,11 +27,19 @@ pub enum Preset {
 }
 
 impl Preset {
+    pub fn quality_for(vram: VramTier) -> Self {
+        match vram {
+            VramTier::Gb24Plus => Self::Native1080p,
+            _ => Self::QualityRtx,
+        }
+    }
+
     pub fn label_es(self) -> &'static str {
         match self {
             Self::Auto => "Recomendado",
             Self::Fluid720p => "Fluido 720p",
             Self::Balanced1080p => "Equilibrado 1080p",
+            Self::QualityRtx => "Calidad RTX",
             Self::Native1080p => "Nítido 1080p",
             Self::High1440p => "Alta 1440p",
             Self::Fsr4K => "4K FSR 3.1",
@@ -48,7 +61,7 @@ impl Preset {
                     "Ajuste automático para 16 GB: 1080p rápido con sincronización optimizada para tarjetas RTX 40/50.".to_owned()
                 }
                 VramTier::Gb24Plus => {
-                    "Ajuste automático Ultra (24 GB+): salida 1080p súper fluida con texturas al máximo y brillo de escenas mejorado.".to_owned()
+                    "Salida de 1080p y texturas con todos sus niveles de detalle para tarjetas con al menos 24 GB de VRAM.".to_owned()
                 }
             },
             Self::Fluid720p => {
@@ -57,8 +70,11 @@ impl Preset {
             Self::Balanced1080p => {
                 "Salida 1080p con reescalado interno rápido. Excelente equilibrio entre nitidez y FPS en tarjetas NVIDIA.".to_owned()
             }
+            Self::QualityRtx => {
+                "Series X con salida de 1080p, escala interna del 67 % y espera de texturas.".to_owned()
+            }
             Self::Native1080p => {
-                "Resolución 1080p completamente nativa (escala 100%). Imagen muy nítida sin filtros externos.".to_owned()
+                "Series X a 1920 × 1080 con escala del 100 % y espera de texturas. FSR y la preparación para Smooth Motion quedan desactivados.".to_owned()
             }
             Self::High1440p => {
                 "Salida 2560×1440 (2K) pensada para tarjetas de 16–24 GB VRAM.".to_owned()
@@ -187,6 +203,15 @@ pub struct LauncherConfig {
     pub config_version: u32,
     pub wizard_completed: bool,
     pub game_dir: String,
+    #[serde(flatten)]
+    pub settings: LauncherSettings,
+    profiles: BTreeMap<String, BTreeMap<String, LauncherSettings>>,
+    active_profile: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LauncherSettings {
     pub preset: Preset,
     pub console: ConsoleModel,
     pub output: OutputRes,
@@ -230,6 +255,30 @@ impl Default for LauncherConfig {
             config_version: CURRENT_CONFIG_VERSION,
             wizard_completed: false,
             game_dir: String::new(),
+            settings: LauncherSettings::default(),
+            profiles: BTreeMap::new(),
+            active_profile: None,
+        }
+    }
+}
+
+impl Deref for LauncherConfig {
+    type Target = LauncherSettings;
+
+    fn deref(&self) -> &Self::Target {
+        &self.settings
+    }
+}
+
+impl DerefMut for LauncherConfig {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.settings
+    }
+}
+
+impl Default for LauncherSettings {
+    fn default() -> Self {
+        Self {
             preset: Preset::Auto,
             console: ConsoleModel::Auto,
             output: OutputRes::Auto,
@@ -278,7 +327,96 @@ impl LauncherConfig {
         true
     }
 
+    pub fn reset_settings(&mut self) {
+        self.settings = LauncherSettings::default();
+        self.active_profile = None;
+    }
+
+    pub fn set_game_dir(&mut self, dir: String) {
+        if profile_game_key(&self.game_dir) != profile_game_key(&dir) {
+            self.active_profile = None;
+        }
+        self.game_dir = dir;
+    }
+
+    pub fn profile_names(&self) -> impl Iterator<Item = &str> {
+        self.profiles
+            .get(&profile_game_key(&self.game_dir))
+            .into_iter()
+            .flat_map(|profiles| profiles.keys().map(String::as_str))
+    }
+
+    pub fn matching_profile(&self) -> Option<&str> {
+        let name = self.active_profile.as_deref()?;
+        let settings = self.profiles.get(&profile_game_key(&self.game_dir))?.get(name)?;
+        (settings == &self.settings).then_some(name)
+    }
+
+    pub fn create_profile(&mut self, name: &str) -> Result<String, String> {
+        let name = valid_profile_name(name)?;
+        let key = profile_game_key(&self.game_dir);
+        if key.is_empty() {
+            return Err("Selecciona la carpeta del juego antes de guardar un perfil.".into());
+        }
+        let profiles = self.profiles.entry(key).or_default();
+        check_profile_name(profiles, name, None)?;
+        profiles.insert(name.into(), self.settings.clone());
+        self.active_profile = Some(name.into());
+        Ok(name.into())
+    }
+
+    pub fn load_profile(&mut self, name: &str) -> Result<(), String> {
+        let settings = self
+            .profiles
+            .get(&profile_game_key(&self.game_dir))
+            .and_then(|profiles| profiles.get(name))
+            .ok_or_else(missing_profile)?;
+        self.settings = settings.clone();
+        self.active_profile = Some(name.into());
+        Ok(())
+    }
+
+    pub fn update_profile(&mut self, name: &str) -> Result<(), String> {
+        let settings = self
+            .profiles
+            .get_mut(&profile_game_key(&self.game_dir))
+            .and_then(|profiles| profiles.get_mut(name))
+            .ok_or_else(missing_profile)?;
+        *settings = self.settings.clone();
+        self.active_profile = Some(name.into());
+        Ok(())
+    }
+
+    pub fn rename_profile(&mut self, from: &str, to: &str) -> Result<String, String> {
+        let to = valid_profile_name(to)?;
+        let profiles = self
+            .profiles
+            .get_mut(&profile_game_key(&self.game_dir))
+            .ok_or_else(missing_profile)?;
+        check_profile_name(profiles, to, Some(from))?;
+        let settings = profiles.remove(from).ok_or_else(missing_profile)?;
+        profiles.insert(to.into(), settings);
+        if self.active_profile.as_deref() == Some(from) {
+            self.active_profile = Some(to.into());
+        }
+        Ok(to.into())
+    }
+
+    pub fn delete_profile(&mut self, name: &str) -> Result<(), String> {
+        let key = profile_game_key(&self.game_dir);
+        let profiles = self.profiles.get_mut(&key).ok_or_else(missing_profile)?;
+        profiles.remove(name).ok_or_else(missing_profile)?;
+        if profiles.is_empty() {
+            self.profiles.remove(&key);
+        }
+        if self.active_profile.as_deref() == Some(name) {
+            self.active_profile = None;
+        }
+        Ok(())
+    }
+
     pub fn apply_preset(&mut self, preset: Preset) {
+        self.active_profile = None;
         self.preset = preset;
         if !matches!(preset, Preset::Safe | Preset::Custom) {
             self.ambient_light = true;
@@ -291,6 +429,7 @@ impl LauncherConfig {
                 self.output = OutputRes::Auto;
                 self.render_scale = 0.0;
                 self.texture_quality = TextureQuality::Auto;
+                self.wait_textures = false;
                 self.fsr_4k = FsrQuality::Off;
                 self.skip_rt_resolve = true;
                 self.skip_raymarched_lights = true;
@@ -307,6 +446,7 @@ impl LauncherConfig {
                 self.output = OutputRes::P720;
                 self.render_scale = 0.0;
                 self.fsr_4k = FsrQuality::Off;
+                self.wait_textures = false;
                 self.skip_rt_resolve = true;
                 self.skip_raymarched_lights = true;
                 self.port_rt = true;
@@ -324,16 +464,26 @@ impl LauncherConfig {
                 self.thin_lists = TriState::Auto;
                 self.send_bar = true;
             }
-            Preset::Native1080p => {
+            Preset::QualityRtx | Preset::Native1080p => {
                 self.console = ConsoleModel::SeriesX;
                 self.output = OutputRes::P1080;
-                self.render_scale = 1.0;
+                self.render_scale = if preset == Preset::Native1080p { 1.0 } else { 0.667 };
+                if preset == Preset::Native1080p {
+                    self.smooth_motion = false;
+                }
+                self.texture_quality = TextureQuality::Auto;
                 self.fsr_4k = FsrQuality::Off;
+                self.wait_textures = true;
+                self.live_textures = true;
+                self.video_planes = true;
                 self.skip_rt_resolve = true;
                 self.skip_raymarched_lights = true;
                 self.port_rt = true;
+                self.port_descriptors = false;
                 self.thin_lists = TriState::Auto;
+                self.ram_low_profile = TriState::Auto;
                 self.send_bar = true;
+                self.wc_no_back = false;
             }
             Preset::High1440p => {
                 self.console = ConsoleModel::SeriesX;
@@ -510,7 +660,6 @@ impl LauncherConfig {
 
         // --- Heap de vistas NVIDIA 1M ---
         set("VICTORY_TABLES_EARLY", "1");
-        set("VICTORY_DYNAMIC_SLOTS", "262144");
 
         // --- Pipelines y audio ---
         set("VICTORY_PIPELINE_LOWEST", "0");
@@ -605,7 +754,6 @@ impl LauncherConfig {
 
         if self.tex_store {
             let dir = local_app_data().join("victory").join("cache").join("textures");
-            let _ = std::fs::create_dir_all(&dir);
             set("VICTORY_TEXTURE_STORE", &dir.to_string_lossy());
         }
 
@@ -658,10 +806,6 @@ impl LauncherConfig {
         // --- Salida y reescalado ---
         if let Some(fsr) = self.fsr_4k.env_value() {
             set("VICTORY_FSR_4K", fsr);
-            let ffx_dir = local_app_data().join("victory").join("fidelityfx");
-            if ffx_dir.join("amd_fidelityfx_upscaler_dx12.dll").is_file() {
-                set("VICTORY_FIDELITYFX_DIR", &ffx_dir.to_string_lossy());
-            }
         } else if is_series_s {
             set("VICTORY_PLANES", "1");
             set("VICTORY_UPSCALER", "6");
@@ -669,7 +813,8 @@ impl LauncherConfig {
                 OutputRes::P720 => set("VICTORY_OUTPUT", "1280x720"),
                 OutputRes::P1080 => set("VICTORY_OUTPUT", "1920x1080"),
                 OutputRes::P1440 => set("VICTORY_OUTPUT", "2560x1440"),
-                OutputRes::P4K | OutputRes::Auto => {}
+                OutputRes::P4K => set("VICTORY_OUTPUT", "3840x2160"),
+                OutputRes::Auto => {}
             }
         } else {
             set("VICTORY_UPSCALER", "6");
@@ -677,7 +822,7 @@ impl LauncherConfig {
                 OutputRes::P720 => set("VICTORY_OUTPUT", "1280x720"),
                 OutputRes::P1080 | OutputRes::Auto => set("VICTORY_OUTPUT", "1920x1080"),
                 OutputRes::P1440 => set("VICTORY_OUTPUT", "2560x1440"),
-                OutputRes::P4K => {}
+                OutputRes::P4K => set("VICTORY_OUTPUT", "3840x2160"),
             }
         }
 
@@ -704,23 +849,58 @@ impl LauncherConfig {
             }
         }
 
+        // The title's output size and the DXGI display mode are independent.
+        // Match them for native 1080p after applying custom environment overrides.
+        let setting = |name: &str| {
+            env.iter()
+                .rev()
+                .find_map(|(key, value)| key.eq_ignore_ascii_case(name).then_some(value.as_str()))
+        };
+        let native_1080p = console == "series-x"
+            && setting("VICTORY_OUTPUT")
+                .and_then(|value| value.split_once(['x', 'X']))
+                .is_some_and(|(width, height)| width.trim() == "1920" && height.trim() == "1080")
+            && setting("VICTORY_RENDER_SCALE").and_then(|value| value.parse::<f32>().ok())
+                == Some(1.0)
+            && setting("VICTORY_UPSCALER").and_then(|value| value.parse::<u32>().ok()) == Some(6)
+            && matches!(setting("VICTORY_FSR_4K"), None | Some("0"));
+        if native_1080p && setting("VICTORY_DISPLAY_MODE").is_none() {
+            env.insert("VICTORY_DISPLAY_MODE".into(), "1920x1080".into());
+        }
+
         env
     }
 
-    pub fn build_prep_env(&self) -> BTreeMap<String, String> {
-        let mut env = BTreeMap::new();
-        env.insert("VICTORY_SHADER_OPT".to_owned(), "191".to_owned());
-        env.insert("VICTORY_SHADER_FAST_BITS".to_owned(), "24".to_owned());
-        env.insert("VICTORY_WAVE_WIDE".to_owned(), "last".to_owned());
-        env.insert("VICTORY_NAN_SCRUB".to_owned(), "1".to_owned());
-        env.insert("VICTORY_PORT_CBV".to_owned(), "1".to_owned());
-        env.insert("VICTORY_CONSTANT_MARKS".to_owned(), "1".to_owned());
-        env.insert("VICTORY_BVH_NO_HIT".to_owned(), "1".to_owned());
-        if !self.game_dir.is_empty() {
-            env.insert("VICTORY_GAME_DIR".to_owned(), self.game_dir.clone());
-        }
-        env
+}
+
+fn profile_game_key(dir: &str) -> String {
+    dir.replace('/', "\\").trim_end_matches('\\').to_lowercase()
+}
+
+fn valid_profile_name(name: &str) -> Result<&str, String> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 48 || name.chars().any(char::is_control) {
+        return Err("Escribe un nombre de perfil de 1 a 48 caracteres.".into());
     }
+    Ok(name)
+}
+
+fn check_profile_name(
+    profiles: &BTreeMap<String, LauncherSettings>,
+    name: &str,
+    except: Option<&str>,
+) -> Result<(), String> {
+    let key = name.to_lowercase();
+    if profiles.keys().any(|existing| {
+        Some(existing.as_str()) != except && existing.to_lowercase() == key
+    }) {
+        return Err("Ya hay un perfil con ese nombre para este juego.".into());
+    }
+    Ok(())
+}
+
+fn missing_profile() -> String {
+    "Ese perfil ya no está disponible para este juego.".into()
 }
 
 pub fn local_app_data() -> PathBuf {
@@ -733,59 +913,168 @@ pub fn launcher_config_path() -> PathBuf {
     local_app_data().join("victory").join("launcher.json")
 }
 
-pub fn load_config(repo_root: Option<&Path>) -> LauncherConfig {
+pub fn load_config(repo_root: Option<&Path>) -> (LauncherConfig, Option<String>) {
     let path = launcher_config_path();
-    let mut cfg = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<LauncherConfig>(&raw).ok())
-        .unwrap_or_default();
+    let (mut cfg, load_error) = match read_launcher_config(&path) {
+        Ok(config) => (config.unwrap_or_default(), None),
+        Err(error) => (LauncherConfig::default(), Some(error)),
+    };
     let mut changed = cfg.migrate();
 
     // Si la carpeta guardada está vacía o ya no existe, buscar automáticamente.
     let valid_saved = !cfg.game_dir.is_empty()
         && GameFilesStatus::inspect(Path::new(&cfg.game_dir)).ready();
     if !valid_saved && let Some(found) = auto_find_game_dir(repo_root) {
-        cfg.game_dir = found.to_string_lossy().into_owned();
+        cfg.set_game_dir(found.to_string_lossy().into_owned());
         changed = true;
     }
-    if changed {
-        let _ = save_config(&cfg, repo_root);
-    }
-    cfg
+    let warning = load_error.or_else(|| {
+        if changed { save_config(&cfg, repo_root).err() } else { None }
+    });
+    (cfg, warning)
 }
 
 pub fn save_config(cfg: &LauncherConfig, repo_root: Option<&Path>) -> Result<(), String> {
     let path = launcher_config_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("No se pudo crear {}: {e}", parent.display()))?;
-    }
-    let json = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| format!("No se pudo guardar {}: {e}", path.display()))?;
+    // VICTORY_CONFIG is an explicit operator choice. The launcher passes
+    // VICTORY_GAME_DIR to its child, so it need not edit that separate file.
+    let runtime = if explicit_runtime_config().is_none() {
+        default_runtime_config(repo_root)
+    } else {
+        None
+    };
+    save_config_to(cfg, &path, runtime.as_deref())
+}
 
-    if !cfg.game_dir.is_empty() {
-        let toml_target = repo_root
-            .map(|r| r.join("victory.toml"))
-            .or_else(|| {
-                std::env::current_exe()
-                    .ok()
-                    .and_then(|e| e.parent().map(|p| p.join("victory.toml")))
-            });
-        if let Some(toml_path) = toml_target {
-            let ffx_dir = local_app_data().join("victory").join("fidelityfx");
-            let mut body = format!(
-                "[paths]\ngame_dir = '{}'\n",
-                cfg.game_dir.replace('\'', "''")
-            );
-            if ffx_dir.is_dir() {
-                body.push_str(&format!(
-                    "fidelityfx_dir = '{}'\n",
-                    ffx_dir.to_string_lossy().replace('\'', "''")
-                ));
+fn save_config_to(
+    cfg: &LauncherConfig,
+    launcher_path: &Path,
+    runtime_path: Option<&Path>,
+) -> Result<(), String> {
+    let previous = read_launcher_config(launcher_path)?;
+    let json = serde_json::to_vec_pretty(cfg).map_err(|e| e.to_string())?;
+    if !cfg.game_dir.is_empty()
+        && previous.as_ref().is_none_or(|saved| saved.game_dir != cfg.game_dir)
+        && let Some(runtime_path) = runtime_path
+    {
+        let on_disk = read_optional(runtime_path)?;
+        if let Some(updated) = updated_runtime_config(runtime_path, on_disk.as_deref(), &cfg.game_dir)? {
+            write_atomically(runtime_path, updated.as_bytes())?;
+            if let Err(error) = write_atomically(launcher_path, &json) {
+                let current = read_optional(runtime_path).map_err(|rollback| {
+                    format!("{error} No se pudo confirmar el estado del archivo de rutas ({rollback}).")
+                })?;
+                if current.as_deref() == Some(updated.as_str()) {
+                    let restored = if let Some(original) = on_disk {
+                        write_atomically(runtime_path, original.as_bytes())
+                    } else {
+                        std::fs::remove_file(runtime_path).map_err(|e| e.to_string())
+                    };
+                    restored.map_err(|rollback| {
+                        format!("{error} El archivo de rutas también quedó actualizado ({rollback}).")
+                    })?;
+                }
+                return Err(error);
             }
-            let _ = std::fs::write(&toml_path, body);
+            return Ok(());
         }
     }
-    Ok(())
+    write_atomically(launcher_path, &json)
+}
+
+fn read_launcher_config(path: &Path) -> Result<Option<LauncherConfig>, String> {
+    read_optional(path)?.map(|raw| {
+        serde_json::from_str(&raw)
+            .map_err(|e| format!("Corrige el archivo {} antes de guardar ajustes ({e}).", path.display()))
+    }).transpose()
+}
+
+fn read_optional(path: &Path) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("No se pudo leer {} ({e}).", path.display())),
+    }
+}
+
+fn updated_runtime_config(path: &Path, original: Option<&str>, game_dir: &str) -> Result<Option<String>, String> {
+    let mut doc = original.unwrap_or_default().parse::<DocumentMut>()
+        .map_err(|e| format!("Corrige el archivo {} antes de guardar la carpeta ({e}).", path.display()))?;
+    if !doc.contains_key("paths") {
+        doc["paths"] = Item::Table(Table::new());
+    }
+    let paths = doc["paths"].as_table_like_mut()
+        .ok_or_else(|| format!("La sección paths de {} debe ser una tabla.", path.display()))?;
+    if paths.get("game_dir").and_then(Item::as_str) == Some(game_dir) {
+        return Ok(None);
+    }
+    if let Some(existing) = paths.get_mut("game_dir").and_then(Item::as_value_mut) {
+        let decor = existing.decor().clone();
+        *existing = game_dir.into();
+        *existing.decor_mut() = decor;
+    } else {
+        paths.insert("game_dir", value(game_dir));
+    }
+    Ok(Some(doc.to_string()))
+}
+
+fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let write = || -> io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
+        name.push(format!(".tmp-{}-{nonce}", std::process::id()));
+        let tmp = path.with_file_name(name);
+        let mut file = std::fs::File::create_new(&tmp)?;
+        let written = file.write_all(bytes).and_then(|()| file.sync_all());
+        drop(file);
+        let result = written.and_then(|()| std::fs::rename(&tmp, path));
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
+    };
+    write().map_err(|e| format!("No se pudo guardar {} ({e}).", path.display()))
+}
+
+fn explicit_runtime_config() -> Option<PathBuf> {
+    std::env::var_os("VICTORY_CONFIG")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
+fn resolve_from_root(path: PathBuf, root: Option<&Path>) -> PathBuf {
+    if path.is_relative() && let Some(root) = root {
+        return root.join(path);
+    }
+    path
+}
+
+fn default_runtime_config(repo_root: Option<&Path>) -> Option<PathBuf> {
+    repo_root
+        .map(|root| root.join("victory.toml"))
+        .or_else(|| std::env::current_exe().ok()?.parent().map(|dir| dir.join("victory.toml")))
+}
+
+pub fn fidelityfx_dir(repo_root: Option<&Path>) -> Option<PathBuf> {
+    let configured = explicit_runtime_config()
+        .map(|path| resolve_from_root(path, repo_root))
+        .or_else(|| default_runtime_config(repo_root));
+    std::env::var_os("VICTORY_FIDELITYFX_DIR")
+        .filter(|path| !path.is_empty())
+        .map(|dir| resolve_from_root(PathBuf::from(dir), repo_root))
+        .or_else(|| {
+            let doc = std::fs::read_to_string(configured?).ok()?.parse::<toml::Table>().ok()?;
+            let dir = PathBuf::from(doc.get("paths")?.get("fidelityfx_dir")?.as_str()?);
+            Some(resolve_from_root(dir, repo_root))
+        })
+        .or_else(|| {
+            let dir = local_app_data().join("victory").join("fidelityfx");
+            dir.join("amd_fidelityfx_upscaler_dx12.dll").is_file().then_some(dir)
+        })
 }
 
 /// Busca automáticamente la carpeta del juego en:
@@ -793,18 +1082,27 @@ pub fn save_config(cfg: &LauncherConfig, repo_root: Option<&Path>) -> Result<(),
 /// 2) `%LOCALAPPDATA%\ScarlettPort\launcher.json` (si probó otro launcher)
 /// 3) Carpetas comunes en `Downloads`, `Desktop`, `Games`, `XboxGames` y raíces de disco `C:\..F:\`.
 pub fn auto_find_game_dir(repo_root: Option<&Path>) -> Option<PathBuf> {
-    // 1. victory.toml en repo o junto al ejecutable.
-    let mut toml_candidates = Vec::new();
-    if let Some(root) = repo_root {
-        toml_candidates.push(root.join("victory.toml"));
+    // 1. Variables del runtime y victory.toml en repo o junto al ejecutable.
+    if let Some(raw) = std::env::var_os("VICTORY_GAME_DIR").filter(|path| !path.is_empty()) {
+        let dir = resolve_from_root(PathBuf::from(raw), repo_root);
+        if GameFilesStatus::inspect(&dir).ready() {
+            return Some(dir);
+        }
     }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        toml_candidates.push(dir.join("victory.toml"));
+    let mut toml_candidates = Vec::new();
+    if let Some(explicit) = explicit_runtime_config() {
+        toml_candidates.push(resolve_from_root(explicit, repo_root));
+    } else {
+        if let Some(root) = repo_root {
+            toml_candidates.push(root.join("victory.toml"));
+        }
+        if let Some(exe_config) = default_runtime_config(None) {
+            toml_candidates.push(exe_config);
+        }
     }
     for toml_path in toml_candidates {
         if let Some(dir) = read_game_dir_from_toml(&toml_path)
+            .map(|dir| resolve_from_root(dir, repo_root.or_else(|| toml_path.parent())))
             && GameFilesStatus::inspect(&dir).ready()
         {
             return Some(dir);
@@ -1022,7 +1320,7 @@ mod tests {
         assert_eq!(env.get("VICTORY_GUARD_HOT").map(String::as_str), Some("0"));
         assert_eq!(env.get("VICTORY_SHADER_OPT").map(String::as_str), Some("191"));
         assert_eq!(env.get("VICTORY_SMALL_RECHECK"), None);
-        assert_eq!(env.get("VICTORY_DYNAMIC_SLOTS").map(String::as_str), Some("262144"));
+        assert!(!env.contains_key("VICTORY_DYNAMIC_SLOTS"));
         assert_eq!(env.get("VICTORY_THIN").map(String::as_str), Some("1"));
         assert_eq!(env.get("VICTORY_OUTPUT").map(String::as_str), Some("1920x1080"));
     }
@@ -1075,15 +1373,205 @@ mod tests {
     }
 
     #[test]
+    fn selecting_native_quality_replaces_previous_graphics_settings_and_preserves_saved_profiles() {
+        let hw = mock_hw("NVIDIA GeForce RTX 4090", 24564, 64.0);
+        let mut cfg = LauncherConfig::default();
+        cfg.set_game_dir("D:/Game".into());
+        cfg.apply_preset(Preset::Fluid720p);
+        cfg.smooth_motion = true;
+        cfg.texture_quality = TextureQuality::Medium;
+        cfg.kbm_gta = true;
+        let previous = cfg.settings.clone();
+        cfg.create_profile("Anterior").unwrap();
+
+        let preset = Preset::quality_for(hw.vram_tier);
+        assert_eq!(preset, Preset::Native1080p);
+        cfg.apply_preset(preset);
+        let env = cfg.build_run_env(&hw);
+        assert_eq!(cfg.effective_console(&hw), "series-x");
+        assert_eq!(env["VICTORY_OUTPUT"], "1920x1080");
+        assert_eq!(env["VICTORY_DISPLAY_MODE"], "1920x1080");
+        assert_eq!(env["VICTORY_RENDER_SCALE"], "1.000");
+        assert_eq!(env["VICTORY_TEXTURE_NO_WAIT"], "0");
+        assert_eq!(env["VICTORY_EXACT_NO_WAIT"], "0");
+        assert_eq!(cfg.effective_mip_drop(&hw), 0);
+        assert_eq!(cfg.fsr_4k, FsrQuality::Off);
+        assert!(!cfg.smooth_motion);
+        assert!(cfg.kbm_gta);
+        cfg.load_profile("Anterior").unwrap();
+        assert_eq!(cfg.settings, previous);
+        for tier in [VramTier::Gb8, VramTier::Gb12, VramTier::Gb16] {
+            assert_eq!(Preset::quality_for(tier), Preset::QualityRtx);
+        }
+    }
+
+    #[test]
+    fn native_series_x_reports_1080p_display_and_respects_overrides() {
+        let hw = mock_hw("NVIDIA GeForce RTX 4090", 24564, 64.0);
+        let mut cfg = LauncherConfig::default();
+        cfg.apply_preset(Preset::Native1080p);
+        assert_eq!(cfg.build_run_env(&hw)["VICTORY_DISPLAY_MODE"], "1920x1080");
+
+        for extra in [
+            "VICTORY_OUTPUT=1280x720",
+            "VICTORY_RENDER_SCALE=0.667",
+            "VICTORY_FSR_4K=quality",
+            "VICTORY_UPSCALER=7",
+        ] {
+            cfg.extra_env = extra.into();
+            assert!(
+                !cfg.build_run_env(&hw).contains_key("VICTORY_DISPLAY_MODE"),
+                "{extra}"
+            );
+        }
+
+        cfg.extra_env = "victory_display_mode=3840x2160".into();
+        let env = cfg.build_run_env(&hw);
+        assert!(!env.contains_key("VICTORY_DISPLAY_MODE"));
+        assert_eq!(env["victory_display_mode"], "3840x2160");
+
+        cfg.extra_env.clear();
+        cfg.apply_preset(Preset::Fluid720p);
+        assert!(!cfg.build_run_env(&hw).contains_key("VICTORY_DISPLAY_MODE"));
+        cfg.apply_preset(Preset::Native1080p);
+        cfg.console = ConsoleModel::SeriesS;
+        assert!(!cfg.build_run_env(&hw).contains_key("VICTORY_DISPLAY_MODE"));
+    }
+
+    #[test]
     fn scale_clamps_safely_on_series_s_and_4k() {
         let hw = mock_hw("NVIDIA GeForce RTX 4090", 24564, 64.0);
         let mut cfg = LauncherConfig {
-            output: OutputRes::P4K,
-            render_scale: 1.0,
+            settings: LauncherSettings {
+                output: OutputRes::P4K,
+                render_scale: 1.0,
+                ..LauncherSettings::default()
+            },
             ..LauncherConfig::default()
         };
         assert_eq!(cfg.effective_scale(&hw), Some(0.667));
+        assert_eq!(cfg.build_run_env(&hw)["VICTORY_OUTPUT"], "3840x2160");
         cfg.output = OutputRes::P1080;
         assert_eq!(cfg.effective_scale(&hw), Some(1.0));
+    }
+
+    #[test]
+    fn quality_rtx_preserves_series_x_and_enables_texture_waits() {
+        let hw = mock_hw("NVIDIA GeForce RTX 4090", 24564, 64.0);
+        let mut cfg = LauncherConfig::default();
+        cfg.apply_preset(Preset::QualityRtx);
+        let env = cfg.build_run_env(&hw);
+        assert_eq!(cfg.effective_console(&hw), "series-x");
+        assert_eq!(cfg.effective_output(&hw), OutputRes::P1080);
+        assert_eq!(cfg.effective_scale(&hw), Some(0.667));
+        assert_eq!(cfg.effective_mip_drop(&hw), 0);
+        assert_eq!(env["VICTORY_TEXTURE_NO_WAIT"], "0");
+        assert_eq!(env["VICTORY_EXACT_NO_WAIT"], "0");
+        assert!(!env.contains_key("VICTORY_DYNAMIC_SLOTS"));
+        cfg.apply_preset(Preset::Fluid720p);
+        assert_eq!(cfg.build_run_env(&hw)["VICTORY_TEXTURE_NO_WAIT"], "1");
+    }
+
+    #[test]
+    fn profiles_persist_independently_for_each_game() {
+        let legacy = r#"{"config_version":2,"wizard_completed":true,"game_dir":"D:/Game A/","fps_cap":45}"#;
+        let mut cfg: LauncherConfig = serde_json::from_str(legacy).unwrap();
+        assert_eq!(cfg.fps_cap, 45);
+        let first = cfg.create_profile(" Calidad ").unwrap();
+        assert_eq!(first, "Calidad");
+        assert!(cfg.create_profile("calidad").is_err());
+        assert!(cfg.create_profile("  ").is_err());
+        cfg.set_game_dir("D:/Game B".into());
+        cfg.fps_cap = 25;
+        assert_eq!(cfg.profile_names().count(), 0);
+        cfg.create_profile("Calidad").unwrap();
+
+        let raw = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(raw["fps_cap"], 25);
+        let mut cfg: LauncherConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(cfg.matching_profile(), Some("Calidad"));
+        cfg.set_game_dir("d:\\GAME A".into());
+        assert_eq!(cfg.matching_profile(), None);
+        cfg.load_profile(&first).unwrap();
+        assert_eq!(cfg.fps_cap, 45);
+        assert!(cfg.wizard_completed);
+        assert_eq!(cfg.matching_profile(), Some("Calidad"));
+        cfg.create_profile("Mismos ajustes").unwrap();
+        assert_eq!(cfg.matching_profile(), Some("Mismos ajustes"));
+        cfg.delete_profile("Mismos ajustes").unwrap();
+        cfg.reset_settings();
+        assert_eq!(cfg.profile_names().collect::<Vec<_>>(), ["Calidad"]);
+
+        cfg.fps_cap = 30;
+        cfg.update_profile(&first).unwrap();
+        let renamed = cfg.rename_profile(&first, "Mi perfil RTX").unwrap();
+        cfg.fps_cap = 60;
+        cfg.load_profile(&renamed).unwrap();
+        assert_eq!(cfg.fps_cap, 30);
+        cfg.delete_profile(&renamed).unwrap();
+        assert!(cfg.load_profile(&renamed).is_err());
+        cfg.set_game_dir("D:/Game B".into());
+        cfg.load_profile("Calidad").unwrap();
+        assert_eq!(cfg.fps_cap, 25);
+    }
+
+    #[test]
+    fn synchronizing_runtime_config_preserves_comments_and_custom_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = dir.path().join("launcher.json");
+        let runtime = dir.path().join("victory.toml");
+        let original = r#"# Keep this comment
+[paths]
+game_dir = 'D:\\Games\\Old' # Game comment
+cache_dir = 'D:\\CustomCache'
+data_dir = 'D:\\Saves'
+fidelityfx_dir = 'D:\\FidelityFX'
+test_titles = ['D:\\OtherGame']
+"#;
+        std::fs::write(&runtime, original).unwrap();
+        let mut cfg = LauncherConfig {
+            game_dir: r"D:\Games\New Game's Folder".into(),
+            ..LauncherConfig::default()
+        };
+        save_config_to(&cfg, &launcher, Some(&runtime)).unwrap();
+        let updated = std::fs::read_to_string(&runtime).unwrap();
+        let decoded = updated.parse::<toml::Table>().unwrap();
+        let original_values = original.parse::<toml::Table>().unwrap();
+        assert!(updated.contains("# Keep this comment"));
+        assert!(updated.contains("# Game comment"));
+        assert_eq!(decoded["paths"]["game_dir"].as_str(), Some(cfg.game_dir.as_str()));
+        for key in ["cache_dir", "data_dir", "fidelityfx_dir", "test_titles"] {
+            assert_eq!(decoded["paths"][key], original_values["paths"][key]);
+        }
+        assert_eq!(read_launcher_config(&launcher).unwrap().unwrap().game_dir, cfg.game_dir);
+
+        cfg.create_profile("Mi perfil").unwrap();
+        save_config_to(&cfg, &launcher, Some(&runtime)).unwrap();
+        assert_eq!(std::fs::read_to_string(&runtime).unwrap(), updated);
+        assert_eq!(
+            read_launcher_config(&launcher).unwrap().unwrap().profile_names().collect::<Vec<_>>(),
+            ["Mi perfil"],
+        );
+    }
+
+    #[test]
+    fn malformed_settings_are_never_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = dir.path().join("launcher.json");
+        let runtime = dir.path().join("victory.toml");
+        let cfg = LauncherConfig {
+            game_dir: "D:/Example".into(),
+            ..LauncherConfig::default()
+        };
+        std::fs::write(&launcher, "corrupt JSON").unwrap();
+        assert!(save_config_to(&cfg, &launcher, Some(&runtime)).is_err());
+        assert_eq!(std::fs::read_to_string(&launcher).unwrap(), "corrupt JSON");
+        assert!(!runtime.exists());
+
+        std::fs::remove_file(&launcher).unwrap();
+        std::fs::write(&runtime, "[unclosed").unwrap();
+        assert!(save_config_to(&cfg, &launcher, Some(&runtime)).is_err());
+        assert_eq!(std::fs::read_to_string(&runtime).unwrap(), "[unclosed");
+        assert!(!launcher.exists());
     }
 }

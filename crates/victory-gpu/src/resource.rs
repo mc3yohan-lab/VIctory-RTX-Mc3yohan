@@ -1744,7 +1744,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             None => host_texture(&r.desc.from_level(base), r.host.state, clear),
         };
         let Some(texture) = texture else {
-            r.host.refused.store(true, Relaxed);
+            if !crate::pool::texture_growth_deferred() {
+                r.host.refused.store(true, Relaxed);
+            }
             return None;
         };
         let twin = twin_texture(&r.desc, &texture);
@@ -1820,6 +1822,15 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
     }
 }
 
+#[cfg(windows)]
+fn texture_limit_bytes() -> Option<u64> {
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
+        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
+    })
+}
+
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
 /// up to [`texture_floor_bytes`] bytes of them, beyond that while the card's
@@ -1831,15 +1842,10 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
 pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     const WITHOUT_BUDGET: u64 = 4 << 30;
-    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let limit = *LIMIT.get_or_init(|| {
-        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
-        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
-    });
     // (With the tiles of the copies made level by level, whose own bytes
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
-    if let Some(limit) = limit {
+    if let Some(limit) = texture_limit_bytes() {
         return filled < limit;
     }
     let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
@@ -1857,6 +1863,36 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         }
         None => filled < WITHOUT_BUDGET,
     }
+}
+
+/// Whether another allocation fits after setting aside needed VRAM for
+/// draws. Unlike `room`, committed usage here includes all existing pool
+/// blocks. Safe under the pool lock, as there is no pool callback.
+#[cfg(windows)]
+pub(crate) fn texture_growth_allowed(bytes: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let filled = KINDS[1].load(Relaxed).saturating_add(crate::tiles::given_total());
+    let explicit = texture_limit_bytes();
+    if explicit.is_some_and(|limit| filled >= limit) {
+        return false;
+    }
+    let memory = crate::host::host().and_then(|host| host.sample_video_memory()[0]);
+    let Some(memory) = memory.filter(|memory| memory.Budget != 0) else {
+        // Without a local budget, the existing queue's limit still applies.
+        return true;
+    };
+    let below_floor = explicit.is_none() && filled < texture_floor_bytes(Some(memory.Budget));
+    let (line, kept) = if below_floor {
+        (memory.Budget, 0)
+    } else {
+        (memory.Budget / 100 * room_percent(), crate::shadow::card_room_kept().saturating_add(targets_room_kept()))
+    };
+    texture_growth_fits(memory.CurrentUsage, bytes, kept, line)
+}
+
+#[cfg(any(windows, test))]
+fn texture_growth_fits(used: u64, bytes: u64, kept: u64, line: u64) -> bool {
+    used.checked_add(kept).and_then(|total| total.checked_add(bytes)).is_some_and(|projected| projected <= line)
 }
 
 /// Whether `bytes` more stay within 95 % of the card's DXGI memory budget by
@@ -2680,6 +2716,20 @@ fn host_texture_as(
             format!("texture {}x{} f{} flags {:#x} (in a block)", d.width, d.height, d.format, d.flags)
         });
         return Some(t);
+    }
+    if !reserved && crate::pool::texture_growth_deferred() {
+        // A committed resource must not circumvent the pool's deferral.
+        return None;
+    }
+    if !reserved && crate::pool::texture_prefetching() {
+        // Large or non-poolable textures commit their driver's allocation
+        // size directly. Query this only for speculative allocations.
+        // SAFETY: `d` has the host description's layout.
+        let allocation = unsafe { host.device.GetResourceAllocationInfo(0, std::slice::from_ref(&*(&raw const d).cast())) };
+        if allocation.SizeInBytes != u64::MAX && !texture_growth_allowed(allocation.SizeInBytes) {
+            crate::pool::defer_texture_growth();
+            return None;
+        }
     }
     let mut texture: Option<ID3D12Resource> = None;
     let made = if reserved {
@@ -4858,6 +4908,20 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+    }
+
+    #[test]
+    fn texture_growth_counts_all_committed_bytes_and_reserved_space() {
+        const MIB: u64 = 1 << 20;
+        let line = 20_000 * MIB;
+        let used = 18_912 * MIB;
+        let reserved = 1024 * MIB;
+        assert!(texture_growth_fits(used, 64 * MIB, reserved, line));
+        assert!(!texture_growth_fits(used + 1, 64 * MIB, reserved, line));
+        // The committed-resource fallback uses its own allocation size.
+        assert!(texture_growth_fits(used + MIB, 63 * MIB, reserved, line));
+        assert!(!texture_growth_fits(used, 128 * MIB, reserved, line));
+        assert!(!texture_growth_fits(u64::MAX, 1, 0, u64::MAX));
     }
 
     /// A placed texture viewed from a later level has a host copy of that

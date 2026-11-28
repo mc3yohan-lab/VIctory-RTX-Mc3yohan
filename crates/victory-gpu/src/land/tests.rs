@@ -88,6 +88,12 @@ fn a_panicking_job_reaches_the_caller() {
 /// block stay in the order given, and jobs never cut a block.
 #[test]
 fn ordered_pieces_hold_the_same_bytes() {
+    // Same start in one copy: keep the index of the earlier request.
+    let tied = [(9, 2 * BLOCK, 8), (7, BLOCK, 4), (9, 2 * BLOCK, 16)];
+    let expected = vec![(1, BLOCK, 4), (0, 2 * BLOCK, 16)];
+    assert_eq!(ordered_impl(&tied, false), expected);
+    assert_eq!(ordered_impl(&tied, true), expected);
+
     let mut random = Random(99);
     for _ in 0..400 {
         let count = random.next() % 40;
@@ -100,6 +106,7 @@ fn ordered_pieces_hold_the_same_bytes() {
             })
             .collect();
         let out = ordered(&pieces);
+        assert_eq!(ordered_impl(&pieces, true), ordered_impl(&pieces, false));
         let bytes = |copy: u64, at: usize, all: &[Piece]| all.iter().any(|p| p.0 == copy && p.1 <= at && at < p.1 + p.2);
         let landed: Vec<Piece> = out.iter().map(|&(i, at, len)| (pieces[i].0, at, len)).collect();
         for copy in 0..3 {

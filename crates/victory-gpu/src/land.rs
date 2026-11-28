@@ -404,19 +404,46 @@ pub(crate) type Piece = (u64, usize, usize);
 /// of the same memory, and what overlapped came down and was merged twice.
 /// Each with the number of the piece given that it begins with.
 pub(crate) fn ordered(pieces: &[Piece]) -> Vec<(usize, usize, usize)> {
+    ordered_impl(pieces, prep_on())
+}
+
+/// `VICTORY_LAND_PREP=1`: order in place and unroll the compare before
+/// opening guards. Both paths produce the same pieces and page decisions.
+fn prep_on() -> bool {
+    const NAME: &str = "VICTORY_LAND_PREP";
+    #[cfg(feature = "diagnostics")]
+    {
+        static AB: OnceLock<Option<u32>> = OnceLock::new();
+        if let Some(bit) = *AB.get_or_init(|| crate::ab::bit(NAME)) {
+            return crate::ab::on(bit);
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(NAME).is_some_and(|v| v == "1"))
+}
+
+fn ordered_impl(pieces: &[Piece], in_place: bool) -> Vec<(usize, usize, usize)> {
     let mut order: Vec<usize> = (0..pieces.len()).collect();
     order.sort_by_key(|&i| pieces[i].1 / BLOCK);
     let mut out: Vec<(usize, usize, usize)> = Vec::with_capacity(order.len());
-    for group in order.chunk_by(|&a, &b| pieces[a].1 / BLOCK == pieces[b].1 / BLOCK) {
+    for group in order.chunk_by_mut(|&a, &b| pieces[a].1 / BLOCK == pieces[b].1 / BLOCK) {
         let alone = group.len() > 1 && group.iter().all(|&i| pieces[i].0 == pieces[group[0]].0);
         if !alone {
             out.extend(group.iter().map(|&i| (i, pieces[i].1, pieces[i].2)));
             continue;
         }
-        let mut sorted = group.to_vec();
-        sorted.sort_by_key(|&i| pieces[i].1);
+        let mut scratch;
+        let sorted: &[usize] = if in_place {
+            // Preserve the original piece index in ties, as in the stable sort.
+            group.sort_unstable_by_key(|&i| (pieces[i].1, i));
+            group
+        } else {
+            scratch = group.to_vec();
+            scratch.sort_by_key(|&i| pieces[i].1);
+            &scratch
+        };
         let begun = out.len();
-        for i in sorted {
+        for &i in sorted {
             let (_, at, len) = pieces[i];
             match out[begun..].last_mut() {
                 Some(last) if at <= last.1 + last.2 => {
@@ -638,9 +665,10 @@ unsafe fn piece_at(
     if beside.is_none() {
         drop(reading);
         differing.fill(false);
+        let unroll = prep_on();
         for_pages(title, parts, |from, n| {
             // SAFETY: the caller's.
-            if unsafe { crate::safecopy::differ(now.add(from), held.add(from), n) } {
+            if unsafe { crate::safecopy::differ(now.add(from), held.add(from), n, unroll) } {
                 differing[(title + from) / PAGE - base] = true;
             }
         });

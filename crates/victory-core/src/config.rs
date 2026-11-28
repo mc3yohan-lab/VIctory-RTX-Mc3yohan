@@ -49,18 +49,28 @@ struct FilePaths {
 impl Config {
     /// Loads configuration from the environment and the config file.
     pub fn load() -> Result<Self> {
-        let explicit = explicit_config_path(|k| std::env::var_os(k));
-        let path = explicit
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("victory.toml"));
+        Self::load_in(Path::new(""), |k| std::env::var_os(k))
+    }
+
+    /// Resolves the configuration a child process would see in its working directory.
+    pub fn load_in(
+        directory: &Path,
+        env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    ) -> Result<Self> {
+        let explicit = explicit_config_path(&env);
+        let path = directory.join(
+            explicit
+                .as_deref()
+                .unwrap_or_else(|| Path::new("victory.toml")),
+        );
         let file = if path.is_file() {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
             Some((path, text))
-        } else if let Some(p) = explicit {
+        } else if explicit.is_some() {
             anyhow::bail!(
                 "VICTORY_CONFIG points at {}, which does not exist",
-                p.display()
+                path.display()
             );
         } else {
             None
@@ -73,7 +83,7 @@ impl Config {
             }
             None => (None, FileConfig::default()),
         };
-        Self::resolve(parsed.paths, source, |k| std::env::var_os(k))
+        Self::resolve(parsed.paths, source, env)
     }
 
     fn resolve(
@@ -209,6 +219,21 @@ mod tests {
             explicit_config_path(set),
             Some(PathBuf::from("custom.toml"))
         );
+    }
+
+    #[test]
+    fn child_config_resolves_relative_paths_from_its_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("local.toml");
+        std::fs::write(&config_path, "[paths]\ncache_dir = 'from-file'\ndata_dir = 'saves'").unwrap();
+        let config = Config::load_in(dir.path(), |key| match key {
+            "VICTORY_CONFIG" => Some("local.toml".into()),
+            "VICTORY_CACHE_DIR" => Some("from-profile".into()),
+            _ => None,
+        }).unwrap();
+        assert_eq!(config.source.as_deref(), Some(config_path.as_path()));
+        assert_eq!(config.cache_dir, Path::new("from-profile"));
+        assert_eq!(config.data_dir, Path::new("saves"));
     }
 
     #[test]

@@ -815,15 +815,20 @@ impl Spans {
     }
 }
 
-/// Title memory written behind the guards' back whose bytes are there
-/// (DirectStorage's reads into physical pages, at the addresses the title
-/// has them mapped; `crate::watch::title_memory_written`), since a texture
-/// pass last took the ranges ([`page_written`]). Kept apart from
-/// [`REMAPPED`] so that what such writes do is counted by itself.
-static PAGE_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+/// A view heap receives its own notes as soon as it tracks a placed texture.
+/// Adapted from TaynanGT/Vice-Tay #371 (GPL-3.0),
+/// commit 059fa1d06e0656bf9b5d4e2c735c9185668b34c7.
+#[derive(Default)]
+struct HeapTextureChanges {
+    written: Vec<(u64, u64)>,
+    remapped: Vec<(u64, u64)>,
+}
 
-/// Since the start: such ranges kept for a pass; ranges dropped because no
-/// pass took them; slots of placed textures that held bytes of them when a
+static HEAP_TEXTURE_CHANGES: Mutex<std::collections::BTreeMap<u64, HeapTextureChanges>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// Since the start: written ranges noted; queue entries compacted across heaps;
+/// slots of placed textures that held bytes of the ranges when a
 /// pass took them; of those, the slots whose texture had been uploaded
 /// before the write (out of the queue, or in it after an upload): they are
 /// the ones that kept the bytes from before, and the ones made due when
@@ -883,17 +888,14 @@ pub(crate) fn page_written(at: usize, len: usize) {
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
-    let mut ranges = PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut heaps = HEAP_TEXTURE_CHANGES.lock().unwrap_or_else(|e| e.into_inner());
     PAGE_WRITES[0].fetch_add(1, Relaxed);
-    let compacted = remember_texture_change(&mut ranges, start, end);
+    let compacted: usize = heaps.values_mut()
+        .map(|notes| remember_texture_change(&mut notes.written, start, end)).sum();
     if compacted != 0 {
         PAGE_WRITES[1].fetch_add(compacted as u64, Relaxed);
     }
 }
-
-/// Title memory the runtime mapped, unmapped or is about to write since a
-/// texture pass last took the ranges ([`remapped`]).
-static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
 /// The lowest start and the highest end of any span of [`Spans`] so far
 /// (the start is `u64::MAX` until there is one): what the runtime does to
@@ -905,7 +907,7 @@ static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
 
 /// Since the start: slots whose view a newer view of other memory there
 /// made stale; ranges of memory noted as mapped, unmapped or written;
-/// ranges dropped because no pass took them; slots made due by such
+/// queue entries compacted across heaps; slots made due by such
 /// ranges; and made slots whose memory was found unmapped (made null).
 pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
@@ -936,9 +938,10 @@ pub(crate) fn remapped(at: usize, len: usize) {
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
-    let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut heaps = HEAP_TEXTURE_CHANGES.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
-    let compacted = remember_texture_change(&mut ranges, start, end);
+    let compacted: usize = heaps.values_mut()
+        .map(|notes| remember_texture_change(&mut notes.remapped, start, end)).sum();
     if compacted != 0 {
         STALE[2].fetch_add(compacted as u64, Relaxed);
     }
@@ -1869,16 +1872,22 @@ fn dynamic_slots(count: u32, null: u32) -> u32 {
             .and_then(|v| v.trim().parse().ok())
     });
     if null < PORTABLE_VIEWS {
-        // On 1M-capped hosts (NVIDIA), default to 327,680 dynamic slots leaving
-        // ~672k title slots so heavy RTX scenes never hit `no free dynamic
-        // descriptor slots`, while still honoring an explicit override bounded
-        // so at least 524,288 title slots remain.
+        // Use 327,680 dynamic slots by default on NVIDIA's one-million-view
+        // heap. An explicit override must leave at least 524,288 title slots.
         let default_capped = 327_680_u32.min(null.saturating_sub(1 << 19).max(DYNAMIC));
         let max_on_capped = null.saturating_sub(1 << 19).max(DYNAMIC);
         return asked.unwrap_or(default_capped).clamp(DYNAMIC / 2, max_on_capped);
     }
     let most = asked.unwrap_or(DYNAMIC << 2);
     null.saturating_sub(count).min(most).max(DYNAMIC)
+}
+
+impl Drop for HostHeap {
+    fn drop(&mut self) {
+        if !self.sampler {
+            HEAP_TEXTURE_CHANGES.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id);
+        }
+    }
 }
 
 impl HostHeap {
@@ -1942,7 +1951,8 @@ impl HostHeap {
             } else {
                 // shortcut: descriptors past the host's limit are left out; a title that reaches
                 // them needs remapping. They read the null slot instead.
-                tracing::warn!(count, "host view heap capped at {size}; views past it read a null slot");
+                tracing::warn!(count, dynamic_slots = extra, title_slots = null - extra,
+                    "host view heap capped at {size}; views past it read a null slot");
                 null - extra
             };
             match make(size) {
@@ -2343,8 +2353,9 @@ impl HostHeap {
     /// Whether a completed bake covered this heap and there are no pending memory notes.
     pub(crate) fn bake_covered(&self) -> bool {
         let covered = self.textures.lock().unwrap_or_else(|e| e.into_inner()).bake_covered();
-        let noted = |ranges: &Mutex<Vec<(u64, u64)>>| !ranges.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
-        covered && !noted(&REMAPPED) && !noted(&PAGE_WRITTEN)
+        covered && HEAP_TEXTURE_CHANGES.lock().unwrap_or_else(|e| e.into_inner())
+            .get(&self.id)
+            .is_none_or(|notes| notes.remapped.is_empty() && notes.written.is_empty())
     }
 
     /// Every title slot of the queue that is due at `frame`, and whether
@@ -2433,12 +2444,13 @@ impl HostHeap {
     /// texture streamed into the place of another of the same description
     /// is uploaded although no descriptor says so. Slots tables read are
     /// left to their draws. Returns how many slots it made due.
-    /// shortcut: the ranges are kept in one place for all heaps; the heap
-    /// whose pass runs first takes them (a title has one view heap).
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
-        self.texture_slots_page_written(frame);
-        let mut ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
+        self.texture_slots_page_written(frame, crate::watch::page_writes() & 2 != 0);
+        let mut ranges = HEAP_TEXTURE_CHANGES.lock().unwrap_or_else(|e| e.into_inner())
+            .get_mut(&self.id)
+            .map(|notes| std::mem::take(&mut notes.remapped))
+            .unwrap_or_default();
         if ranges.is_empty() {
             return 0;
         }
@@ -2494,12 +2506,15 @@ impl HostHeap {
     /// upload takes the bytes that are there by then. Slots tables read
     /// are left to their draws. Counted either way; returns how many slots
     /// it made due.
-    fn texture_slots_page_written(&self, frame: u64) -> usize {
-        let ranges = std::mem::take(&mut *PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
+    fn texture_slots_page_written(&self, frame: u64, due: bool) -> usize {
+        let ranges = HEAP_TEXTURE_CHANGES.lock().unwrap_or_else(|e| e.into_inner())
+            .get_mut(&self.id)
+            .map(|notes| std::mem::take(&mut notes.written))
+            .unwrap_or_default();
         if ranges.is_empty() {
             return 0;
         }
-        self.slots_written_under(&ranges, frame, crate::watch::page_writes() & 2 != 0)[2]
+        self.slots_written_under(&ranges, frame, due)[2]
     }
 
     /// [`HostHeap::texture_slots_page_written`] for `ranges` (start, end):
@@ -3161,6 +3176,11 @@ impl HostHeap {
             });
             match span {
                 Some((start, end, first, held)) => {
+                    if placed.by_start.is_empty() {
+                        // Subscribe before publishing the span to the producers.
+                        HEAP_TEXTURE_CHANGES.lock().unwrap_or_else(|e| e.into_inner())
+                            .entry(self.id).or_default();
+                    }
                     SPANNED[0].fetch_min(start, Relaxed);
                     SPANNED[1].fetch_max(end, Relaxed);
                     placed.rule = stale_rule();
@@ -3290,36 +3310,51 @@ impl HostHeap {
                 views.made.clear();
             }
             let twins = self.twins.get(index as usize).is_some();
-            if !views.made.contains_key(&words) {
-                let view = super::view_at(words[1], words[2])?;
-                let at = 2 * views.made.len() as u32;
-                // (A constant buffer's bytes are copied for each draw.)
-                if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
-                    return None;
+            let put = |views: &ListViews, made: &ListView| {
+                self.copy_from(index, views.slot(made.at));
+                if made.twin && twins {
+                    self.copy_from(self.raw + index, views.slot(made.at + 1));
+                    self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    self.clear_twin(index);
                 }
-                let twin = self.raw != 0 && twinned(&view);
-                let kept = make_twinned(&view, views.slot(at), twin.then(|| views.slot(at + 1)))?;
-                let stride_word = view_stride_word(&view);
-                let address = view_address(&view).unwrap_or(0);
-                let listed = Listed {
-                    kind: crate::draw::view_kind(&view),
-                    texture: is_texture_view(&view),
-                    ready: (0, 0, false),
-                    tabled: None,
-                };
-                views.made.insert(words, ListView { view, at, twin, stride_word, address, kept, listed });
+                self.write_view_metadata(index, made.stride_word, made.address);
+                self.keep(index, made.kept.clone());
+                made.listed
+            };
+            // One probe on a hit, after runkmaskin/runkis-nvidia 37e866753552 (GPL-3.0).
+            if let Some(made) = views.made.get(&words) {
+                return Some(put(views, made));
             }
-            let made = &views.made[&words];
-            self.copy_from(index, views.slot(made.at));
-            if made.twin && twins {
-                self.copy_from(self.raw + index, views.slot(made.at + 1));
-                self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
-            } else {
-                self.clear_twin(index);
+            let view = super::view_at(words[1], words[2])?;
+            let at = 2 * views.made.len() as u32;
+            // (A constant buffer's bytes are copied for each draw.)
+            if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
+                return None;
             }
-            self.write_view_metadata(index, made.stride_word, made.address);
-            self.keep(index, made.kept.clone());
-            Some(made.listed)
+            let twin = self.raw != 0 && twinned(&view);
+            let kept = make_twinned(&view, views.slot(at), twin.then(|| views.slot(at + 1)))?;
+            let stride_word = view_stride_word(&view);
+            let address = view_address(&view).unwrap_or(0);
+            let listed = Listed {
+                kind: crate::draw::view_kind(&view),
+                texture: is_texture_view(&view),
+                ready: (0, 0, false),
+                tabled: None,
+            };
+            views.made.insert(
+                words,
+                ListView {
+                    view,
+                    at,
+                    twin,
+                    stride_word,
+                    address,
+                    kept,
+                    listed,
+                },
+            );
+            Some(put(views, &views.made[&words]))
         })
     }
 
@@ -6679,7 +6714,7 @@ mod tests {
     /// A write behind the guards' back under a placed texture: a slot
     /// waiting for its first upload is left alone, one uploaded before is
     /// counted, and made due two frames on when that is asked for. (The
-    /// ranges are handed over here, not through the list all heaps share.)
+    /// ranges are handed over directly.)
     #[test]
     fn a_page_write_makes_an_uploaded_texture_slot_due_when_asked() {
         let Some(heap) = HostHeap::new(false, 8) else {
@@ -6708,6 +6743,71 @@ mod tests {
         assert_eq!(heap.slots_written_under(&written, 60, true), [1, 1, 1]);
         assert_eq!(slots(61), []);
         assert_eq!(slots(62), [1]);
+    }
+
+    fn uploaded_placed_view(slot: u32, at: u64) -> Option<HostHeap> {
+        let heap = HostHeap::new(false, 8)?;
+        let mut desc = [0u32; 16];
+        (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+        let view = View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc);
+        assert!(heap.note_buffer(slot, Some(&view), false).is_empty());
+        let (queued, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        assert_eq!(queued, slot);
+        heap.texture_slot_done(slot, write, None);
+        Some(heap)
+    }
+
+    #[test]
+    fn shared_texture_changes_reach_both_view_heaps_in_either_pass_order() {
+        let at = 0x7fec_0100_0000;
+        let Some(first) = uploaded_placed_view(1, at) else { return };
+        let second = uploaded_placed_view(3, at).expect("second view heap");
+        let due_slot = |heap: &HostHeap, frame| heap.texture_slots_due(frame, 8).0;
+
+        remapped(at as usize, 4096);
+        for (heap, slot) in [(&second, 3), (&first, 1)] {
+            assert_eq!(heap.texture_slots_remapped(50), 1);
+            assert!(due_slot(heap, 50).is_empty());
+            let &[(queued, write)] = due_slot(heap, 51).as_slice() else { panic!("one remapped slot") };
+            assert_eq!(queued, slot);
+            heap.texture_slot_done(slot, write, None);
+        }
+
+        page_written(at as usize, 4096);
+        for (heap, slot) in [(&first, 1), (&second, 3)] {
+            assert_eq!(heap.texture_slots_page_written(60, true), 1);
+            assert!(due_slot(heap, 61).is_empty());
+            let &[(queued, write)] = due_slot(heap, 62).as_slice() else { panic!("one physically written slot") };
+            assert_eq!(queued, slot);
+            heap.texture_slot_done(slot, write, None);
+        }
+
+        remapped(at as usize, 4096);
+        page_written(at as usize, 4096);
+        let first_id = first.id();
+        drop(first);
+        let replacement = uploaded_placed_view(5, at).expect("replacement view heap");
+        assert_ne!(replacement.id(), first_id);
+        assert!(!HEAP_TEXTURE_CHANGES.lock().unwrap().contains_key(&first_id));
+        assert_eq!(replacement.texture_slots_remapped(70), 0);
+        assert!(due_slot(&replacement, u64::MAX).is_empty());
+        assert_eq!(second.texture_slots_page_written(70, true), 1);
+        assert_eq!(second.texture_slots_remapped(70), 1);
+    }
+
+    #[test]
+    fn compacted_texture_changes_keep_coverage_below_the_queue_limit() {
+        let mut ranges = Vec::new();
+        for i in 0..=MAX_PENDING_TEXTURE_CHANGES as u64 {
+            let start = i * 0x2000;
+            remember_texture_change(&mut ranges, start, start + 0x1000);
+        }
+        assert!(ranges.len() < MAX_PENDING_TEXTURE_CHANGES);
+        for i in 0..=MAX_PENDING_TEXTURE_CHANGES as u64 {
+            let start = i * 0x2000;
+            let at = ranges.partition_point(|&(from, _)| from <= start);
+            assert!(at > 0 && ranges[at - 1].1 >= start + 0x1000);
+        }
     }
 
     /// `VICTORY_STALE_TEXTURES=0`: nothing is ever stale, and a view that

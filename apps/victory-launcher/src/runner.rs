@@ -3,19 +3,37 @@
 //! captura de logs UTF-8 y exportación directa al Escritorio.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
+use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
-use crate::config::{GameFilesStatus, LauncherConfig, local_app_data};
+use windows_sys::Win32::Foundation::{HWND, LPARAM};
+use windows_sys::Win32::Storage::FileSystem::MoveFileW;
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JobObjectExtendedLimitInformation,
+    SetInformationJobObject,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, WM_CLOSE,
+};
+use windows_sys::core::BOOL;
+
+use crate::config::{FsrQuality, GameFilesStatus, LauncherConfig, local_app_data};
 use crate::hardware::HardwareInfo;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const MAX_LOG_LINES: usize = 3000;
+const PREPARATION_STAMPS: &str = ".launcher-prepared";
+const GAME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskKind {
@@ -110,6 +128,7 @@ pub struct PrepProgress {
     pub done: u64,
     pub total: u64,
     pub unsupported: u64,
+    pub shaders_cached: Option<u64>,
     pub last_summary: String,
 }
 
@@ -137,6 +156,7 @@ impl PrepProgress {
                 let u_num = trimmed[..u_idx].split_whitespace().last().unwrap_or("");
                 if let Ok(u) = u_num.parse::<u64>() {
                     self.unsupported = u;
+                    self.shaders_cached = Some(self.done);
                 }
             }
             self.last_summary = trimmed.to_owned();
@@ -156,7 +176,7 @@ impl PrepProgress {
             return;
         }
         if trimmed.contains("saving ") && trimmed.contains("host-pipelines.bin") {
-            self.step_label = "Guardando biblioteca de escenas (host-pipelines.bin)...".to_owned();
+            self.step_label = "Preparando escenas y guardando pipelines compatibles...".to_owned();
             self.last_summary = trimmed.to_owned();
             return;
         }
@@ -200,10 +220,9 @@ pub struct CacheStatus {
 impl CacheStatus {
     /// Escaneo ultrarrápido (< 5 ms) para abrir la ventana al instante sin
     /// recorrer los ~230,000 archivos de shaders en el hilo principal.
-    pub fn scan_fast() -> Self {
-        let root = cache_dir();
+    pub fn scan_fast(root: &Path) -> Self {
         let shader_files = count_files_capped(&root.join("shaders"), 500);
-        let mut status = Self::scan_metadata_only(&root);
+        let mut status = Self::scan_metadata_only(root);
         status.shader_files = shader_files;
         status.shader_count_exact = shader_files < 500;
         if shader_files == 0 || !status.pipeline_lib_exists {
@@ -213,10 +232,9 @@ impl CacheStatus {
     }
 
     /// Escaneo completo (para ejecutar siempre en segundo plano).
-    pub fn scan_exact() -> Self {
-        let root = cache_dir();
+    pub fn scan_exact(root: &Path) -> Self {
         let (shader_files, shader_bytes) = count_files_recursive(&root.join("shaders"));
-        let mut status = Self::scan_metadata_only(&root);
+        let mut status = Self::scan_metadata_only(root);
         status.shader_files = shader_files;
         status.shader_mb = shader_bytes / (1024 * 1024);
         status.shader_count_exact = true;
@@ -256,9 +274,6 @@ impl CacheStatus {
         }
     }
 
-    pub fn shaders_ready(&self) -> bool {
-        self.shader_files >= 500
-    }
 }
 
 fn detect_legacy_scarlett_cache_fast() -> Option<LegacyCacheInfo> {
@@ -313,7 +328,7 @@ fn count_files_capped(dir: &Path, limit: usize) -> usize {
                 if files >= limit {
                     return files;
                 }
-            } else if ft.is_dir()
+            } else if ft.is_dir() && entry.file_name() != PREPARATION_STAMPS
                 && let Ok(sub) = std::fs::read_dir(entry.path())
             {
                 stack.push(sub);
@@ -340,7 +355,7 @@ fn count_files_recursive(dir: &Path) -> (usize, u64) {
                 if let Ok(meta) = entry.metadata() {
                     bytes += meta.len();
                 }
-            } else if ft.is_dir()
+            } else if ft.is_dir() && entry.file_name() != PREPARATION_STAMPS
                 && let Ok(sub) = std::fs::read_dir(entry.path())
             {
                 stack.push(sub);
@@ -424,7 +439,7 @@ pub struct GitInfo {
     pub local_sha: String,
     pub behind_count: usize,
     pub pending_commits: Vec<String>,
-    pub checked_once: bool,
+    pub up_to_date: bool,
     pub last_status_es: String,
 }
 
@@ -435,10 +450,10 @@ impl GitInfo {
         Self {
             available: has_git,
             branch: "nvidia-rtx4090".to_owned(),
-            local_sha: env!("VICTORY_GIT_SHA").to_owned(),
+            local_sha: "consultando…".to_owned(),
             behind_count: 0,
             pending_commits: Vec::new(),
-            checked_once: false,
+            up_to_date: false,
             last_status_es: if has_git {
                 "Pulsa 'Buscar actualizaciones' para comprobar mejoras nuevas en GitHub."
                     .to_owned()
@@ -462,16 +477,16 @@ impl GitInfo {
             };
         }
         let branch = git_stdout(root, &["rev-parse", "--abbrev-ref", "HEAD"])
-            .unwrap_or_else(|| "nvidia-rtx4090".to_owned());
+            .unwrap_or_else(|| "HEAD".to_owned());
         let local_sha = git_stdout(root, &["rev-parse", "--short", "HEAD"])
-            .unwrap_or_else(|| env!("VICTORY_GIT_SHA").to_owned());
+            .unwrap_or_else(|| "no disponible".to_owned());
         Self {
             available: true,
             branch,
             local_sha,
             behind_count: 0,
             pending_commits: Vec::new(),
-            checked_once: false,
+            up_to_date: false,
             last_status_es: "Pulsa 'Buscar actualizaciones' para comprobar mejoras nuevas en GitHub."
                 .to_owned(),
         }
@@ -482,26 +497,48 @@ impl GitInfo {
         if !info.available {
             return info;
         }
+        let remote_key = format!("branch.{}.remote", info.branch);
+        let Some(remote) = git_stdout(repo_root, &["config", "--get", &remote_key]) else {
+            info.last_status_es = "La rama actual no tiene un remoto de seguimiento.".to_owned();
+            return info;
+        };
         let fetch = Command::new("git")
-            .args(["fetch", "origin", "--quiet"])
+            .args(["fetch", "--quiet", "--", &remote])
             .current_dir(repo_root)
             .creation_flags(CREATE_NO_WINDOW)
             .output();
         match fetch {
             Ok(o) if o.status.success() => {
-                let range = format!("HEAD..origin/{}", info.branch);
-                let commits = git_stdout(repo_root, &["log", "--oneline", &range]).unwrap_or_default();
+                let counts = git_stdout(
+                    repo_root,
+                    &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+                );
+                let Some((local, incoming)) = counts.as_deref().and_then(parse_sync_counts) else {
+                    info.last_status_es =
+                        "No se pudo comparar la rama con su referencia remota.".to_owned();
+                    return info;
+                };
+                if local > 0 {
+                    info.last_status_es = if incoming > 0 {
+                        format!("La rama y el remoto tienen cambios distintos ({local} locales, {incoming} remotos).")
+                    } else {
+                        format!("La rama contiene {local} commit(s) locales que el remoto no tiene.")
+                    };
+                    return info;
+                }
+                let commits = git_stdout(repo_root, &["log", "--oneline", "HEAD..@{upstream}"])
+                    .unwrap_or_default();
                 let list: Vec<String> = commits
                     .lines()
                     .map(str::trim)
                     .filter(|l| !l.is_empty())
                     .map(ToOwned::to_owned)
                     .collect();
-                info.behind_count = list.len();
+                info.behind_count = incoming;
                 info.pending_commits = list;
-                info.checked_once = true;
+                info.up_to_date = incoming == 0;
                 info.last_status_es = if info.behind_count == 0 {
-                    "Estás completamente al día con la última versión.".to_owned()
+                    "Los archivos fuente del repositorio están al día.".to_owned()
                 } else {
                     format!(
                         "Hay {} mejora(s) nueva(s) lista(s) para descargar y compilar.",
@@ -511,19 +548,22 @@ impl GitInfo {
             }
             Ok(o) => {
                 let err = String::from_utf8_lossy(&o.stderr);
-                info.checked_once = true;
                 info.last_status_es = format!(
                     "No se pudo conectar con GitHub: {}",
                     err.lines().next().unwrap_or("revisa tu conexión o sesión de Git")
                 );
             }
             Err(e) => {
-                info.checked_once = true;
                 info.last_status_es = format!("Git no encontrado en este PC ({e}).");
             }
         }
         info
     }
+}
+
+fn parse_sync_counts(output: &str) -> Option<(usize, usize)> {
+    let mut fields = output.split_whitespace();
+    Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
 }
 
 fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {
@@ -552,12 +592,41 @@ pub struct LogFileEntry {
 struct SharedState {
     running: Option<TaskKind>,
     started_at: Option<Instant>,
-    child: Option<Arc<Mutex<Child>>>,
+    cancel_requested: bool,
     logs: VecDeque<String>,
     metrics: RunMetrics,
     progress: PrepProgress,
     last_exit_note: Option<String>,
     finished_seq: u64,
+}
+
+impl SharedState {
+    fn start(&mut self, kind: TaskKind) -> Result<(), String> {
+        if self.running.is_some() {
+            return Err("Ya hay otra tarea ejecutándose.".to_owned());
+        }
+        self.running = Some(kind);
+        self.started_at = Some(Instant::now());
+        self.cancel_requested = false;
+        self.last_exit_note = None;
+        Ok(())
+    }
+
+    fn request_stop(&mut self) -> bool {
+        if self.running.is_none() || self.cancel_requested {
+            return false;
+        }
+        self.cancel_requested = true;
+        true
+    }
+
+    fn finish(&mut self, note: String) {
+        self.running = None;
+        self.started_at = None;
+        self.cancel_requested = false;
+        self.finished_seq += 1;
+        self.last_exit_note = Some(note);
+    }
 }
 
 pub struct RunnerSnapshot {
@@ -602,18 +671,17 @@ impl ProcessRunner {
     }
 
     pub fn stop(&self) {
-        let child = {
-            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.request_stop() {
+            let message = if st.running == Some(TaskKind::Play) {
+                "[launcher] Solicitando el cierre del juego para guardar la caché..."
+            } else {
+                "[launcher] Cancelando la tarea..."
+            };
             push_log_locked(
                 &mut st,
-                "[launcher] Deteniendo tarea a petición del usuario...".to_owned(),
+                message.to_owned(),
             );
-            st.child.take()
-        };
-        if let Some(c) = child
-            && let Ok(mut guard) = c.lock()
-        {
-            let _ = guard.kill();
         }
     }
 
@@ -636,6 +704,7 @@ impl ProcessRunner {
             .active_victory(want_diag)
             .ok_or_else(|| "No se encontró victory.exe. Compila primero o usa la pestaña Actualizar.".to_owned())?
             .clone();
+        let running_diag = engine.diag_victory.as_ref() == Some(&base_victory);
 
         let victory_exe = if cfg.smooth_motion {
             let sm_copy = base_victory
@@ -649,7 +718,7 @@ impl ProcessRunner {
             base_victory
         };
 
-        let env = cfg.build_run_env(hw);
+        let env = runtime_environment(engine, cfg, hw);
         let console = cfg.effective_console(hw).to_owned();
         let args = vec![
             "run".to_owned(),
@@ -661,7 +730,10 @@ impl ProcessRunner {
 
         let log_dir = data_dir();
         let _ = std::fs::create_dir_all(&log_dir);
-        let stamp = timestamp_compact();
+        let stamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
         let log_path = log_dir.join(format!("nvidia-run-{stamp}.log"));
 
         // Encabezado limpio UTF-8 para que cualquier log compartido tenga toda la info del PC.
@@ -685,7 +757,7 @@ impl ProcessRunner {
             console,
             cfg.effective_output(hw).label_es(),
             cfg.effective_scale(hw),
-            if want_diag { "diag" } else { "release" },
+            if running_diag { "diag" } else { "release" },
             cfg.port_rt,
             cfg.effective_thin(hw),
             cfg.live_textures,
@@ -694,12 +766,7 @@ impl ProcessRunner {
 
         {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if st.running.is_some() {
-                return Err("Ya hay otra tarea ejecutándose.".to_owned());
-            }
-            st.running = Some(TaskKind::Play);
-            st.started_at = Some(Instant::now());
-            st.last_exit_note = None;
+            st.start(TaskKind::Play)?;
             st.metrics = RunMetrics {
                 last_log_path: Some(log_path.clone()),
                 ..Default::default()
@@ -722,13 +789,26 @@ impl ProcessRunner {
         let state = self.state.clone();
         std::thread::spawn(move || {
             let mut log_file = OpenOptions::new()
-                .create(true)
+                .create_new(true)
                 .write(true)
-                .truncate(true)
                 .open(&log_path)
                 .ok();
             if let Some(f) = log_file.as_mut() {
                 let _ = f.write_all(header.as_bytes());
+                let digest = File::open(&victory_exe).and_then(|file| {
+                    let mut hash = blake3::Hasher::new();
+                    hash.update_reader(file)?;
+                    Ok(hash.finalize())
+                });
+                match digest {
+                    Ok(hash) => {
+                        let name = victory_exe.file_name().unwrap_or_default().to_string_lossy();
+                        let _ = writeln!(f, "Motor    : {name} | BLAKE3 {hash}");
+                    }
+                    Err(e) => {
+                        let _ = writeln!(f, "Motor    : no se pudo calcular la huella: {e}");
+                    }
+                }
                 let _ = f.flush();
             }
             let code = run_single_process(
@@ -742,14 +822,13 @@ impl ProcessRunner {
                 TaskKind::Play,
             );
             let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-            st.running = None;
-            st.child = None;
-            st.finished_seq += 1;
-            st.last_exit_note = Some(match code {
+            let note = match code {
                 Ok(0) => "Partida cerrada correctamente.".to_owned(),
+                _ if st.cancel_requested => "Partida detenida. Consulta el registro para comprobar el cierre.".to_owned(),
                 Ok(c) => format!("El juego terminó con código {c}. Revisa 'Logs y Soporte' si hubo un error."),
                 Err(e) => format!("No se pudo iniciar el motor: {e}"),
-            });
+            };
+            st.finish(note);
         });
 
         Ok(())
@@ -759,31 +838,37 @@ impl ProcessRunner {
         &self,
         engine: &EnginePaths,
         cfg: &LauncherConfig,
+        hw: HardwareInfo,
         kind: TaskKind,
     ) -> Result<(), String> {
         let victory_exe = engine
-            .active_victory(false)
+            .active_victory(cfg.use_diag_build || cfg.gpu_timing)
             .ok_or_else(|| "No se encontró victory.exe.".to_owned())?
             .clone();
         let game = GameFilesStatus::inspect(Path::new(&cfg.game_dir));
         if !game.ready() && matches!(kind, TaskKind::PrepareAll) {
             return Err("Primero selecciona la carpeta válida del juego.".to_owned());
         }
-        let env = cfg.build_prep_env();
+        let env = runtime_environment(engine, cfg, &hw);
         let game_dir = cfg.game_dir.clone();
-        let work_dir = engine
-            .repo_root
-            .clone()
-            .or_else(|| victory_exe.parent().map(Path::to_path_buf));
+        let work_dir = engine_work_dir(engine, &victory_exe).to_path_buf();
+        let cache_root = resolved_cache_root(&work_dir, &env)?;
+        let stamp = if matches!(kind, TaskKind::PrepareAll) {
+            Some(preparation_stamp(
+                &cache_root,
+                &victory_exe,
+                game.exe_path.as_deref().ok_or("Falta el ejecutable del juego.")?,
+                cfg,
+                &hw,
+                &env,
+            ).map_err(|e| format!("No se pudo verificar el perfil gráfico: {e}"))?)
+        } else {
+            None
+        };
 
         {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if st.running.is_some() {
-                return Err("Ya hay otra tarea ejecutándose.".to_owned());
-            }
-            st.running = Some(kind);
-            st.started_at = Some(Instant::now());
-            st.last_exit_note = None;
+            st.start(kind)?;
             st.progress = PrepProgress {
                 step_label: kind.label_es().to_owned(),
                 ..Default::default()
@@ -799,14 +884,13 @@ impl ProcessRunner {
                         "warm".to_owned(),
                         "--save-library".to_owned(),
                         "--used".to_owned(),
-                        "--nvidia-preset".to_owned(),
                     ];
                     run_single_process(
                         &state,
                         &victory_exe,
                         &args,
                         &env,
-                        work_dir.as_deref(),
+                        Some(&work_dir),
                         true,
                         None,
                         kind,
@@ -817,23 +901,19 @@ impl ProcessRunner {
                         let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
                         st.progress.step_label = "Paso 1/2 · Traduciendo shaders Wave32...".to_owned();
                     }
-                    let args1 = vec![
-                        "shaders".to_owned(),
-                        game_dir,
-                        "--nvidia-preset".to_owned(),
-                    ];
+                    let args1 = vec!["shaders".to_owned(), game_dir];
                     match run_single_process(
                         &state,
                         &victory_exe,
                         &args1,
                         &env,
-                        work_dir.as_deref(),
+                        Some(&work_dir),
                         true,
                         None,
                         kind,
                     ) {
                         Ok(0) => {
-                            let early = cache_dir().join("pipelines").join("early-pipelines.txt");
+                            let early = cache_root.join("pipelines").join("early-pipelines.txt");
                             if early.is_file() {
                                 {
                                     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -850,14 +930,13 @@ impl ProcessRunner {
                                     "warm".to_owned(),
                                     "--save-library".to_owned(),
                                     "--used".to_owned(),
-                                    "--nvidia-preset".to_owned(),
                                 ];
                                 run_single_process(
                                     &state,
                                     &victory_exe,
                                     &args2,
                                     &env,
-                                    work_dir.as_deref(),
+                                    Some(&work_dir),
                                     true,
                                     None,
                                     kind,
@@ -878,14 +957,28 @@ impl ProcessRunner {
             };
 
             let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-            st.running = None;
-            st.child = None;
-            st.finished_seq += 1;
-            st.last_exit_note = Some(match result {
+            let result = match (&result, &stamp) {
+                (Ok(0), Some(stamp)) if !st.cancel_requested => {
+                    if st.progress.shaders_cached.unwrap_or(0) == 0 {
+                        Err("La preparación no confirmó shaders en la caché.".to_owned())
+                    } else {
+                        record_preparation(stamp).map(|()| 0)
+                    }
+                }
+                _ => result,
+            };
+            let note = match result {
+                _ if st.cancel_requested => "Preparación cancelada.".to_owned(),
+                Ok(0) if st.progress.unsupported > 0 => format!(
+                    "{} completado con {} shaders sin traducir. Consulta el registro.",
+                    kind.label_es(),
+                    st.progress.unsupported
+                ),
                 Ok(0) => format!("{} completado correctamente.", kind.label_es()),
                 Ok(c) => format!("{} terminó con código {c}.", kind.label_es()),
                 Err(e) => format!("Error en {}: {e}", kind.label_es()),
-            });
+            };
+            st.finish(note);
         });
 
         Ok(())
@@ -896,12 +989,7 @@ impl ProcessRunner {
     pub fn start_import_legacy_cache(&self, info: LegacyCacheInfo) -> Result<(), String> {
         {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if st.running.is_some() {
-                return Err("Ya hay otra tarea ejecutándose.".to_owned());
-            }
-            st.running = Some(TaskKind::ImportCache);
-            st.started_at = Some(Instant::now());
-            st.last_exit_note = None;
+            st.start(TaskKind::ImportCache)?;
             st.progress = PrepProgress {
                 step_label: "Importando caché y partidas existentes...".to_owned(),
                 done: 0,
@@ -948,27 +1036,15 @@ impl ProcessRunner {
             for (idx, (label, src, dst)) in steps.into_iter().enumerate() {
                 {
                     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                    if st.cancel_requested {
+                        break;
+                    }
                     st.progress.done = idx as u64;
                     st.progress.step_label = format!("Importando {label}...");
                 }
                 if src.is_dir() {
-                    let count = if label == "Shaders traducidos" {
-                        // Copia multihilo rápida con robocopy (/MT:16 /XC /XN /XO: no sobreescribe).
-                        let _ = std::fs::create_dir_all(&dst);
-                        let rc = Command::new("robocopy")
-                            .arg(&src)
-                            .arg(&dst)
-                            .args(["/E", "/MT:16", "/XC", "/XN", "/XO", "/NFL", "/NDL", "/NJH", "/NJS", "/NP", "/R:0", "/W:0"])
-                            .creation_flags(CREATE_NO_WINDOW)
-                            .status();
-                        if rc.is_ok_and(|s| s.code().unwrap_or(99) < 8) {
-                            info.shader_files
-                        } else {
-                            copy_dir_non_destructive(&src, &dst, false)
-                        }
-                    } else {
-                        copy_dir_non_destructive(&src, &dst, label == "Partidas guardadas")
-                    };
+                    let count =
+                        copy_dir_non_destructive(&state, &src, &dst, label == "Partidas guardadas");
                     copied_items += count;
                     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
                     push_log_locked(
@@ -979,108 +1055,204 @@ impl ProcessRunner {
             }
 
             let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-            st.progress.done = 4;
-            st.running = None;
-            st.finished_seq += 1;
-            st.last_exit_note = Some(format!(
-                "Importación lista ({copied_items} archivos copiados sin borrar el origen)."
-            ));
+            let note = if st.cancel_requested {
+                "Importación cancelada. Los archivos ya copiados se conservaron.".to_owned()
+            } else {
+                st.progress.done = 4;
+                format!("Importación lista ({copied_items} archivos copiados sin borrar el origen).")
+            };
+            st.finish(note);
         });
 
         Ok(())
     }
 
-    /// Ejecuta `git pull --ff-only` y recompila `victory.exe` en `--release`.
+    /// Avanza las fuentes por fast-forward y recompila el launcher y el motor.
     pub fn start_git_update(&self, repo_root: PathBuf, rebuild_engine: bool) -> Result<(), String> {
+        let rebuild_diag =
+            rebuild_engine && repo_root.join("target").join("diag").join("victory.exe").is_file();
         {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if st.running.is_some() {
-                return Err("Ya hay otra tarea ejecutándose.".to_owned());
-            }
-            st.running = Some(TaskKind::GitUpdate);
-            st.started_at = Some(Instant::now());
-            st.last_exit_note = None;
+            st.start(TaskKind::GitUpdate)?;
             st.progress = PrepProgress {
-                step_label: "Paso 1/2 · Descargando cambios desde GitHub...".to_owned(),
-                done: 1,
-                total: if rebuild_engine { 2 } else { 1 },
+                step_label: "Comprobando cambios locales...".to_owned(),
+                total: 2 + 2 * u64::from(rebuild_engine) + u64::from(rebuild_diag),
                 ..Default::default()
             };
-            push_log_locked(
-                &mut st,
-                "[actualizar] Ejecutando git pull --ff-only...".to_owned(),
-            );
         }
 
         let state = self.state.clone();
         std::thread::spawn(move || {
-            let empty_env = BTreeMap::new();
-            let pull_res = run_single_process(
-                &state,
-                Path::new("git"),
-                &["pull".to_owned(), "--ff-only".to_owned()],
-                &empty_env,
-                Some(&repo_root),
-                true,
-                None,
-                TaskKind::GitUpdate,
-            );
+            let mut sources_ready = false;
+            let mut update = || -> Result<(), String> {
+                require_clean_tree(&repo_root)?;
+                update_step(&state, 0, "Descargando cambios de la rama remota...");
+                git_update_command(&state, &repo_root, &["fetch", "--quiet"], true)?;
 
-            let final_res = match pull_res {
-                Ok(0) if rebuild_engine => {
-                    {
-                        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-                        st.progress.done = 2;
-                        st.progress.step_label =
-                            "Paso 2/2 · Compilando motor actualizado (release)...".to_owned();
-                        push_log_locked(
-                            &mut st,
-                            "[actualizar] Descarga lista. Compilando victory.exe (--release)..."
-                                .to_owned(),
-                        );
-                    }
-                    run_single_process(
-                        &state,
-                        Path::new("cargo"),
-                        &[
-                            "build".to_owned(),
-                            "--locked".to_owned(),
-                            "--release".to_owned(),
-                            "-p".to_owned(),
-                            "victory".to_owned(),
-                        ],
-                        &empty_env,
-                        Some(&repo_root),
-                        true,
-                        None,
-                        TaskKind::GitUpdate,
-                    )
+                require_clean_tree(&repo_root)?;
+                update_step(&state, 1, "Aplicando cambios a los archivos fuente...");
+                // Git debe terminar de actualizar el árbol aunque se cancele esta etapa.
+                git_update_command(&state, &repo_root, &["merge", "--ff-only", "@{upstream}"], false)?;
+                sources_ready = true;
+
+                if rebuild_engine {
+                    update_step(&state, 2, "Compilando el motor en release...");
+                    build_engine(&state, &repo_root, "release")?;
                 }
-                other => other,
+                if rebuild_diag {
+                    update_step(&state, 3, "Compilando el motor con diagnóstico...");
+                    build_engine(&state, &repo_root, "diag")?;
+                }
+                if rebuild_engine {
+                    update_step(&state, 3 + u64::from(rebuild_diag), "Compilando el launcher...");
+                    build_launcher(&state, &repo_root)?;
+                }
+                Ok(())
             };
+            let result = update();
 
             let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-            st.running = None;
-            st.child = None;
-            st.finished_seq += 1;
-            st.last_exit_note = Some(match final_res {
-                Ok(0) => "Actualización y compilación completadas. ¡Ya tienes las mejoras activas!".to_owned(),
-                Ok(c) => format!("La actualización terminó con código {c}. Revisa el registro."),
+            let note = match result {
+                _ if st.cancel_requested && sources_ready =>
+                    "Actualización cancelada. Las fuentes ya están listas. Vuelve a compilar para usar el motor actualizado.".to_owned(),
+                _ if st.cancel_requested => "Actualización cancelada.".to_owned(),
+                Ok(()) => {
+                    st.progress.done = st.progress.total;
+                    if rebuild_engine {
+                        let variants = if rebuild_diag { "release y diag" } else { "release" };
+                        format!("Motor {variants} y launcher compilados. Vuelve a abrir el launcher para cargar la nueva versión.")
+                    } else {
+                        "Fuentes actualizadas. Queda pendiente compilar el motor y el launcher.".to_owned()
+                    }
+                }
+                Err(e) if sources_ready => format!("Las fuentes avanzaron, pero la compilación falló: {e}. Reintenta para completar la actualización."),
                 Err(e) => format!("No se pudo actualizar: {e}"),
-            });
+            };
+            st.finish(note);
         });
 
         Ok(())
     }
 }
 
-fn copy_dir_non_destructive(src: &Path, dst: &Path, skip_logs: bool) -> usize {
+fn require_clean_tree(root: &Path) -> Result<(), String> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=normal"])
+        .current_dir(root)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("No se pudo consultar Git: {e}"))?;
+    if !output.status.success() {
+        return Err("Git no pudo comprobar los cambios locales.".to_owned());
+    }
+    if !output.stdout.is_empty() {
+        return Err("Hay cambios locales. Guárdalos antes de actualizar las fuentes.".to_owned());
+    }
+    Ok(())
+}
+
+fn update_step(state: &Mutex<SharedState>, done: u64, message: &str) {
+    let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+    st.progress.done = done;
+    st.progress.step_label = message.to_owned();
+    push_log_locked(&mut st, format!("[actualizar] {message}"));
+}
+
+fn git_update_command(
+    state: &Arc<Mutex<SharedState>>,
+    root: &Path,
+    args: &[&str],
+    interruptible: bool,
+) -> Result<(), String> {
+    let mut cmd = Command::new("git");
+    cmd.args(args).current_dir(root).creation_flags(CREATE_NO_WINDOW);
+    let status = run_command(state, cmd, None, TaskKind::GitUpdate, interruptible)?;
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(format!("git {} terminó con código {status}. Consulta el registro", args[0]))
+    }
+}
+
+fn build_engine(state: &Arc<Mutex<SharedState>>, root: &Path, profile: &str) -> Result<(), String> {
+    let mut cmd = Command::new("cargo");
+    cmd.args(["build", "--locked", "--profile", profile, "-p", "victory"])
+        .current_dir(root)
+        .creation_flags(CREATE_NO_WINDOW);
+    if profile == "diag" {
+        cmd.args(["--features", "diagnostics"]);
+    }
+    let status = run_command(state, cmd, None, TaskKind::GitUpdate, true)?;
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(format!("cargo build ({profile}) terminó con código {status}. Consulta el registro"))
+    }
+}
+
+fn build_launcher(state: &Arc<Mutex<SharedState>>, root: &Path) -> Result<(), String> {
+    let launcher = root.join("target").join("release").join("VIctory-RTX.exe");
+    let mut cmd = Command::new("cargo");
+    cmd.args(["build", "--locked", "--release", "-p", "victory-launcher"])
+        .current_dir(root)
+        .creation_flags(CREATE_NO_WINDOW);
+    with_launcher_backup(&launcher, || {
+        let status = run_command(state, cmd, None, TaskKind::GitUpdate, true)?;
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(format!("cargo build del launcher terminó con código {status}"))
+        }
+    })
+}
+
+/// Windows permite renombrar la imagen del launcher que sigue abierta. Cargo
+/// puede entonces instalar el nuevo exe, y podemos restaurar el anterior si falla.
+fn with_launcher_backup(launcher: &Path, build: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    let backup = if launcher.is_file() {
+        let id = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let backup = launcher.with_extension(format!("previous-{}-{id}.exe", std::process::id()));
+        std::fs::rename(launcher, &backup)
+            .map_err(|e| format!("No se pudo conservar el launcher anterior: {e}"))?;
+        Some(backup)
+    } else {
+        None
+    };
+    let install = build().and_then(|()| {
+        launcher.is_file().then_some(())
+            .ok_or_else(|| "Cargo no instaló el ejecutable del launcher.".to_owned())
+    });
+    match (install, backup) {
+        (Err(problem), Some(backup)) => {
+            std::fs::rename(&backup, launcher).map_err(|e| format!(
+                "{problem}. Falló la restauración: {e}. El launcher anterior queda en {}", backup.display()
+            ))?;
+            Err(problem)
+        }
+        (result, _) => result,
+    }
+}
+
+fn copy_dir_non_destructive(
+    state: &Mutex<SharedState>,
+    src: &Path,
+    dst: &Path,
+    skip_logs: bool,
+) -> usize {
     let mut copied = 0usize;
-    let _ = std::fs::create_dir_all(dst);
+    if std::fs::create_dir_all(dst).is_err() {
+        return 0;
+    }
+    let Ok(dst) = dst.canonicalize() else {
+        return 0;
+    };
     let Ok(entries) = std::fs::read_dir(src) else {
         return 0;
     };
     for entry in entries.flatten() {
+        if stop_requested(state) {
+            break;
+        }
         let from = entry.path();
         let name = entry.file_name();
         if skip_logs {
@@ -1090,13 +1262,37 @@ fn copy_dir_non_destructive(src: &Path, dst: &Path, skip_logs: bool) -> usize {
             }
         }
         let to = dst.join(&name);
-        if from.is_dir() {
-            copied += copy_dir_non_destructive(&from, &to, skip_logs);
-        } else if from.is_file() && !to.exists() && std::fs::copy(&from, &to).is_ok() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            copied += copy_dir_non_destructive(state, &from, &to, skip_logs);
+        } else if kind.is_file() && !to.exists() && copy_new_file(&from, &to).is_ok() {
             copied += 1;
         }
     }
     copied
+}
+
+fn copy_new_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    static NEXT_COPY: AtomicU64 = AtomicU64::new(0);
+    let index = NEXT_COPY.fetch_add(1, Ordering::Relaxed);
+    let staging = to.with_file_name(format!(".victory-import-{}-{index}", std::process::id()));
+    File::create_new(&staging)?;
+    let result = std::fs::copy(from, &staging).and_then(|_| {
+        let source: Vec<u16> = staging.as_os_str().encode_wide().chain([0]).collect();
+        let target: Vec<u16> = to.as_os_str().encode_wide().chain([0]).collect();
+        // SAFETY: both paths are valid UTF-16 strings with a terminating NUL.
+        // MoveFileW refuses to replace a destination created by another import.
+        if unsafe { MoveFileW(source.as_ptr(), target.as_ptr()) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_file(staging);
+    }
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1111,28 +1307,51 @@ fn run_single_process(
     kind: TaskKind,
 ) -> Result<i32, String> {
     let mut cmd = Command::new(exe);
-    cmd.args(args)
-        .envs(env)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.args(args).envs(env);
     if let Some(dir) = work_dir {
         cmd.current_dir(dir);
     }
     if hide_window {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
+    run_command(state, cmd, log_file, kind, true)
+}
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("No se pudo ejecutar {}: {e}", exe.display()))?;
+fn run_command(
+    state: &Arc<Mutex<SharedState>>,
+    mut cmd: Command,
+    log_file: Option<File>,
+    kind: TaskKind,
+    interruptible: bool,
+) -> Result<i32, String> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = {
+        // Mantiene la comprobación y el arranque en el mismo orden que Detener.
+        let st = state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.cancel_requested {
+            return Err("Tarea cancelada antes de iniciar el proceso.".to_owned());
+        }
+        cmd.spawn()
+            .map_err(|e| format!("No se pudo ejecutar {}: {e}", cmd.get_program().display()))?
+    };
+    let mut job = if kind == TaskKind::Play {
+        None
+    } else {
+        match child_job(&child) {
+            Ok(job) => Some(job),
+            Err(e) => {
+                if child.try_wait().map_err(|e| e.to_string())?.is_none() {
+                    kill_and_wait(&mut child).map_err(|e| e.to_string())?;
+                    return Err(format!("No se pudo administrar el grupo de procesos: {e}"));
+                }
+                None
+            }
+        }
+    };
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let child_arc = Arc::new(Mutex::new(child));
-    {
-        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-        st.child = Some(child_arc.clone());
-    }
 
     let shared_file = log_file.map(|f| Arc::new(Mutex::new(f)));
 
@@ -1147,17 +1366,35 @@ fn run_single_process(
         std::thread::spawn(move || pump_reader(pipe, st, lf, kind))
     });
 
+    let mut close_started = None;
+    let mut close_sent = false;
+    let mut interrupted = false;
     let status = loop {
-        let exited = {
-            let mut guard = child_arc.lock().unwrap_or_else(|e| e.into_inner());
-            guard.try_wait()
-        };
-        match exited {
-            Ok(Some(status)) => break status,
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(80)),
-            Err(e) => return Err(e.to_string()),
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            break status;
         }
+        if interruptible && stop_requested(state) {
+            if kind != TaskKind::Play {
+                drop(job.take());
+                interrupted = true;
+                break child.wait().map_err(|e| e.to_string())?;
+            }
+            let start = close_started.get_or_insert_with(Instant::now);
+            if !close_sent {
+                close_sent = request_game_close(child.id());
+            }
+            if start.elapsed() >= GAME_SHUTDOWN_TIMEOUT {
+                let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                push_log_locked(&mut st, "[launcher] El juego no terminó a tiempo. Cerrando de forma forzada.".to_owned());
+                drop(st);
+                interrupted = true;
+                break kill_and_wait(&mut child).map_err(|e| e.to_string())?;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(80));
     };
+    // Cierra también cualquier descendiente residual que retenga las tuberías.
+    drop(job);
 
     if let Some(t) = t_out {
         let _ = t.join();
@@ -1166,7 +1403,79 @@ fn run_single_process(
         let _ = t.join();
     }
 
+    if interrupted {
+        return Err("Tarea cancelada en ejecución.".to_owned());
+    }
     Ok(status.code().unwrap_or(-1))
+}
+
+fn stop_requested(state: &Mutex<SharedState>) -> bool {
+    state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .cancel_requested
+}
+
+fn kill_and_wait(child: &mut Child) -> std::io::Result<std::process::ExitStatus> {
+    if let Err(error) = child.kill() {
+        return child.try_wait()?.ok_or(error);
+    }
+    child.wait()
+}
+
+fn child_job(child: &Child) -> std::io::Result<OwnedHandle> {
+    // SAFETY: null asks for an unnamed job with the default security attributes.
+    let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if handle.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: CreateJobObjectW returned a fresh handle owned only by this worker.
+    let job = unsafe { OwnedHandle::from_raw_handle(handle) };
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // SAFETY: both handles are live, and limits is the value type required by
+    // JobObjectExtendedLimitInformation for the duration of the call.
+    let assigned = unsafe {
+        SetInformationJobObject(
+            job.as_raw_handle(),
+            JobObjectExtendedLimitInformation,
+            std::ptr::from_ref(&limits).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) != 0
+            && AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) != 0
+    };
+    if !assigned {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(job)
+}
+
+fn request_game_close(pid: u32) -> bool {
+    struct CloseRequest {
+        pid: u32,
+        posted: bool,
+    }
+
+    unsafe extern "system" fn close_window(hwnd: HWND, data: LPARAM) -> BOOL {
+        // SAFETY: EnumWindows invokes the callback synchronously. data points
+        // to the unique request on the calling thread's stack.
+        let request = unsafe { &mut *(data as *mut CloseRequest) };
+        let mut owner = 0;
+        // SAFETY: hwnd is supplied by EnumWindows; owner is valid output storage.
+        unsafe {
+            GetWindowThreadProcessId(hwnd, &mut owner);
+            if owner == request.pid && IsWindowVisible(hwnd) != 0 {
+                request.posted |= PostMessageW(hwnd, WM_CLOSE, 0, 0) != 0;
+            }
+        }
+        1
+    }
+
+    let mut request = CloseRequest { pid, posted: false };
+    // SAFETY: request remains live for the synchronous enumeration and is not
+    // accessed by this thread again until the call returns.
+    unsafe { EnumWindows(Some(close_window), std::ptr::from_mut(&mut request) as LPARAM) };
+    request.posted
 }
 
 fn pump_reader<R: std::io::Read>(
@@ -1233,6 +1542,116 @@ pub fn strip_ansi(s: &str) -> String {
 
 pub fn cache_dir() -> PathBuf {
     local_app_data().join("victory").join("cache")
+}
+
+fn engine_work_dir<'a>(engine: &'a EnginePaths, exe: &'a Path) -> &'a Path {
+    engine.repo_root.as_deref().or_else(|| exe.parent()).unwrap_or_else(|| Path::new("."))
+}
+
+fn runtime_environment(
+    engine: &EnginePaths,
+    cfg: &LauncherConfig,
+    hw: &HardwareInfo,
+) -> BTreeMap<String, String> {
+    let mut env = cfg.build_run_env(hw);
+    if cfg.fsr_4k != FsrQuality::Off
+        && !env.contains_key("VICTORY_FIDELITYFX_DIR")
+        && let Some(dir) = crate::config::fidelityfx_dir(engine.repo_root.as_deref())
+    {
+        env.insert("VICTORY_FIDELITYFX_DIR".into(), dir.to_string_lossy().into_owned());
+    }
+    env
+}
+
+fn resolved_cache_root(
+    work_dir: &Path,
+    env: &BTreeMap<String, String>,
+) -> Result<PathBuf, String> {
+    let config = victory_core::Config::load_in(work_dir, |key| {
+        env.get(key).map(OsString::from).or_else(|| std::env::var_os(key))
+    }).map_err(|e| format!("No se pudo leer la configuración del motor: {e:#}"))?;
+    let root = work_dir.join(config.cache_dir);
+    victory_core::ensure_outside_repo(&root)
+        .map_err(|e| format!("Directorio de caché inválido: {e}"))?;
+    Ok(root)
+}
+
+pub fn configured_cache_root(
+    engine: &EnginePaths,
+    cfg: &LauncherConfig,
+    hw: &HardwareInfo,
+) -> PathBuf {
+    let Some(exe) = engine.active_victory(cfg.use_diag_build || cfg.gpu_timing) else {
+        return cache_dir();
+    };
+    resolved_cache_root(engine_work_dir(engine, exe), &runtime_environment(engine, cfg, hw))
+        .unwrap_or_else(|_| cache_dir())
+}
+
+fn preparation_stamp(
+    root: &Path,
+    exe: &Path,
+    title: &Path,
+    cfg: &LauncherConfig,
+    hw: &HardwareInfo,
+    env: &BTreeMap<String, String>,
+) -> std::io::Result<PathBuf> {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"victory-launcher-prepared-1");
+    for path in [exe, title] {
+        let metadata = path.metadata()?;
+        hash_prep_part(&mut hash, path.as_os_str().as_encoded_bytes());
+        hash.update(&metadata.len().to_le_bytes());
+        let mtime = metadata.modified()?.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+        hash.update(&mtime.as_nanos().to_le_bytes());
+    }
+    hash_prep_part(&mut hash, hw.gpu_name.as_bytes());
+    hash.update(&hw.vram_total_mb.to_le_bytes());
+    hash_prep_part(&mut hash, cfg.effective_console(hw).as_bytes());
+    let mut settings: BTreeMap<String, OsString> = std::env::vars_os()
+        .filter_map(|(key, value)| {
+            let key = key.to_str()?.to_ascii_uppercase();
+            key.starts_with("VICTORY_").then_some((key, value))
+        })
+        .collect();
+    for (key, value) in env {
+        settings.insert(key.to_ascii_uppercase(), OsString::from(value));
+    }
+    for (key, value) in settings {
+        hash_prep_part(&mut hash, key.as_bytes());
+        hash_prep_part(&mut hash, value.as_encoded_bytes());
+    }
+    Ok(root.join("shaders").join(PREPARATION_STAMPS).join(hash.finalize().to_hex().as_str()))
+}
+
+fn hash_prep_part(hash: &mut blake3::Hasher, bytes: &[u8]) {
+    hash.update(&(bytes.len() as u64).to_le_bytes());
+    hash.update(bytes);
+}
+
+fn record_preparation(stamp: &Path) -> Result<(), String> {
+    let folder = stamp.parent().ok_or("Ruta del registro de preparación inválida.")?;
+    victory_core::ensure_outside_repo(folder).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(folder)
+        .and_then(|()| OpenOptions::new().create(true).write(true).truncate(false).open(stamp))
+        .map(|_| ())
+        .map_err(|e| format!("No se pudo guardar la verificación de la caché: {e}"))
+}
+
+pub fn preparation_verified(
+    engine: &EnginePaths,
+    cfg: &LauncherConfig,
+    hw: &HardwareInfo,
+    title: Option<&Path>,
+) -> bool {
+    let (Some(exe), Some(title)) = (engine.active_victory(cfg.use_diag_build || cfg.gpu_timing), title)
+    else { return false };
+    let env = runtime_environment(engine, cfg, hw);
+    let Ok(root) = resolved_cache_root(engine_work_dir(engine, exe), &env) else {
+        return false;
+    };
+    preparation_stamp(&root, exe, title, cfg, hw, &env).is_ok_and(|stamp| stamp.is_file())
+        && count_files_capped(&root.join("shaders"), 1) > 0
 }
 
 pub fn data_dir() -> PathBuf {
@@ -1487,6 +1906,121 @@ fn timestamp_compact() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_launcher_update_restores_previous_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let launcher = temp.path().join("VIctory-RTX.exe");
+        std::fs::write(&launcher, "old").unwrap();
+        assert!(with_launcher_backup(&launcher, || {
+            assert!(!launcher.exists());
+            Err("compilación cancelada".to_owned())
+        }).is_err());
+        assert_eq!(std::fs::read(&launcher).unwrap(), b"old");
+
+        with_launcher_backup(&launcher, || {
+            std::fs::write(&launcher, "new").map_err(|e| e.to_string())
+        }).unwrap();
+        assert_eq!(std::fs::read(&launcher).unwrap(), b"new");
+    }
+
+    #[test]
+    fn recorded_preparation_is_specific_to_settings_and_engine() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let exe = root.join("engine.exe");
+        let title = root.join("title.exe");
+        std::fs::write(&exe, "engine").unwrap();
+        std::fs::write(&title, "title").unwrap();
+        let cfg = LauncherConfig::default();
+        let hw = HardwareInfo::probe_fast();
+        let mut env = BTreeMap::from([("VICTORY_SHADER_OPT".to_owned(), "191".to_owned())]);
+        let stamp = preparation_stamp(root, &exe, &title, &cfg, &hw, &env).unwrap();
+        record_preparation(&stamp).unwrap();
+        assert!(stamp.is_file());
+        assert_eq!(count_files_capped(&root.join("shaders"), 1), 0);
+        env.insert("VICTORY_SHADER_OPT".to_owned(), "32".to_owned());
+        assert!(!preparation_stamp(root, &exe, &title, &cfg, &hw, &env).unwrap().is_file());
+        env.insert("VICTORY_SHADER_OPT".to_owned(), "191".to_owned());
+        std::fs::write(&exe, "updated engine").unwrap();
+        assert!(!preparation_stamp(root, &exe, &title, &cfg, &hw, &env).unwrap().is_file());
+    }
+
+    #[test]
+    fn stop_between_stages_prevents_another_spawn() {
+        let runner = ProcessRunner::default();
+        runner.state.lock().unwrap().start(TaskKind::PrepareAll).unwrap();
+        runner.stop();
+        let err = run_single_process(
+            &runner.state,
+            Path::new("unused-when-cancelled.exe"),
+            &[],
+            &BTreeMap::new(),
+            None,
+            true,
+            None,
+            TaskKind::PrepareAll,
+        )
+        .unwrap_err();
+        assert_eq!(err, "Tarea cancelada antes de iniciar el proceso.");
+        let mut st = runner.state.lock().unwrap();
+        st.finish("Preparación cancelada.".to_owned());
+        st.start(TaskKind::PrepareAll).unwrap();
+        assert!(!st.cancel_requested);
+    }
+
+    #[test]
+    fn stop_of_an_active_stage_releases_the_child_and_its_output() {
+        let runner = ProcessRunner::default();
+        runner.state.lock().unwrap().start(TaskKind::PrepareAll).unwrap();
+        let state = runner.state.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut cmd = Command::new("powershell.exe");
+            cmd.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$ErrorActionPreference='Stop'; Start-Process powershell.exe -NoNewWindow -ArgumentList '-NoProfile -Command Start-Sleep -Seconds 30'; Write-Output 'runner-ready'; Start-Sleep -Seconds 30",
+            ])
+            .creation_flags(CREATE_NO_WINDOW);
+            let _ = tx.send(run_command(&state, cmd, None, TaskKind::PrepareAll, true));
+        });
+        let start = Instant::now();
+        let ready = loop {
+            if runner.snapshot().logs.iter().any(|line| line == "runner-ready") {
+                break true;
+            }
+            if start.elapsed() >= Duration::from_secs(10) {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        runner.stop();
+        let exit = rx.recv_timeout(Duration::from_secs(5)).expect("child processes did not stop");
+        assert!(ready, "synthetic child never reached its ready signal: {exit:?}");
+        assert_eq!(exit.unwrap_err(), "Tarea cancelada en ejecución.");
+    }
+
+    #[test]
+    fn remote_comparison_requires_two_commit_counts() {
+        assert_eq!(parse_sync_counts("0\t17"), Some((0, 17)));
+        assert_eq!(parse_sync_counts("3\t0"), Some((3, 0)));
+        assert_eq!(parse_sync_counts("0"), None);
+    }
+
+    #[test]
+    fn imported_file_is_published_once_and_keeps_an_existing_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let from = temp.path().join("source");
+        let to = temp.path().join("destination");
+        std::fs::write(&from, "complete").unwrap();
+        copy_new_file(&from, &to).unwrap();
+        std::fs::write(&from, "changed").unwrap();
+        assert!(copy_new_file(&from, &to).is_err());
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "complete");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 2);
+    }
 
     #[test]
     fn diagnostic_lines_redact_the_game_dir() {

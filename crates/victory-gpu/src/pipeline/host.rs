@@ -783,6 +783,7 @@ impl HostPipeline {
                 return Err(told(format!("host root signature refused: {e}")));
             }
         };
+        let has_static_samplers = !samplers.is_empty();
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
@@ -801,7 +802,7 @@ impl HostPipeline {
             };
             let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
             let made = super::library::pipeline(
-                &name,
+                super::library::PipelineSource::for_root(&name, has_static_samplers),
                 // SAFETY: the description points at live data.
                 |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
                 // SAFETY: as above.
@@ -860,7 +861,8 @@ impl HostPipeline {
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
+            let source = super::library::PipelineSource::for_root(&name, has_static_samplers);
+            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, source) {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
@@ -951,11 +953,12 @@ impl HostPipeline {
             ),
         };
         let make = |desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, name: &str| {
+            let source = super::library::PipelineSource::for_root(name, has_static_samplers);
             if depth_bounds {
-                return graphics_depth_bounds_pipeline(&host.device, &root, desc, g.depth1(), name);
+                return graphics_depth_bounds_pipeline(&host.device, &root, desc, g.depth1(), source);
             }
             super::library::pipeline(
-                name,
+                source,
                 // SAFETY: the description points at live data.
                 |library, name| unsafe { library.LoadGraphicsPipeline(name, desc) },
                 // SAFETY: as above.
@@ -1040,7 +1043,7 @@ struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
 fn stream_pipeline<S>(
     device: &ID3D12Device,
     stream: &mut S,
-    name: &str,
+    source: super::library::PipelineSource<'_>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     use windows::core::Interface;
     let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
@@ -1049,7 +1052,7 @@ fn stream_pipeline<S>(
     };
     let device = device.cast::<ID3D12Device2>()?;
     super::library::pipeline(
-        name,
+        source,
         // SAFETY: the stream holds whole subobjects pointing at live data.
         |library, name| unsafe { library.LoadPipeline(name, &desc) },
         // SAFETY: as above.
@@ -1065,7 +1068,7 @@ fn graphics_depth_bounds_pipeline(
     root: &ID3D12RootSignature,
     d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC,
     depth: D3D12_DEPTH_STENCIL_DESC1,
-    name: &str,
+    source: super::library::PipelineSource<'_>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     use windows::core::Interface;
     #[repr(C)]
@@ -1110,13 +1113,13 @@ fn graphics_depth_bounds_pipeline(
     };
     if d.GS.pShaderBytecode.is_null() {
         let mut stream = base;
-        stream_pipeline(device, &mut stream, name)
+        stream_pipeline(device, &mut stream, source)
     } else {
         let mut stream = StreamGs {
             base,
             gs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, d.GS),
         };
-        stream_pipeline(device, &mut stream, name)
+        stream_pipeline(device, &mut stream, source)
     }
 }
 
@@ -1138,7 +1141,7 @@ fn mesh_pipeline(
     ps: D3D12_SHADER_BYTECODE,
     g: &GraphicsState,
     depth_bounds: bool,
-    name: &str,
+    source: super::library::PipelineSource<'_>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     use windows::core::Interface;
     #[repr(C)]
@@ -1172,7 +1175,7 @@ fn mesh_pipeline(
                 D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
             ),
         };
-        stream_pipeline(device, &mut stream, name)
+        stream_pipeline(device, &mut stream, source)
     };
     if depth_bounds {
         let mut stream = Stream {
@@ -1191,7 +1194,7 @@ fn mesh_pipeline(
                 D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
             ),
         };
-        stream_pipeline(device, &mut stream, name)
+        stream_pipeline(device, &mut stream, source)
     } else {
         build(Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth))
     }
@@ -1330,9 +1333,10 @@ mod tests {
         g.targets.NumRenderTargets = 1;
         g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, false, &name).expect("made");
+        let source = super::super::library::PipelineSource::for_root(&name, false);
+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, false, source).expect("made");
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, false, &name).expect("made again");
+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, false, source).expect("made again");
         assert!(
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the mesh pipeline was compiled again instead of loaded from the library"
@@ -1469,10 +1473,11 @@ mod tests {
             &[&vs, &ps],
             &g.describe(),
         );
-        let pso = graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
+        let source = super::super::library::PipelineSource::for_root(&name, false);
+        let pso = graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), source)
             .expect("depth-bounds PSO made");
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
-        graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
+        graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), source)
             .expect("depth-bounds PSO made again");
         assert!(
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
