@@ -98,6 +98,10 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
                 record[0] = 0;
                 record[1] = 0;
                 record[2] = 0;
+            } else if (MESH_X_ONLY) {
+                // Match the single-record clamp for one-dimensional console mesh records.
+                record[1] = 1u;
+                record[2] = 1u;
             }
             asked = record[0];
             record[1] = min(record[1], 1u);

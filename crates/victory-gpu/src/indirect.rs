@@ -134,6 +134,10 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         // through the garbage beside it read past every buffer.)
         if (g.x > 65535u) {
             g = uint3(0, 0, 0);
+        } else if (MESH_X_ONLY) {
+            // The console's other two words need not contain dispatch dimensions.
+            g.y = 1u;
+            g.z = 1u;
         }
         asked = g.x;
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
@@ -568,7 +572,29 @@ fn rest() -> u32 {
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-    let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(device), rest());
+    static MESH_X_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let mesh_x_only = MESH_X_ONLY.get_or_init(|| {
+        let enabled = std::env::var_os("VICTORY_MESH_INDIRECT_X_ONLY").is_some_and(|v| v == "1");
+        tracing::info!(enabled, "indirect mesh X-only translation");
+        enabled
+    });
+    make_with_mesh_mode(device, source, *mesh_x_only)
+}
+
+/// Opt-in adaptation of invismann's Series X terrain fix (GPL-3.0):
+/// <https://github.com/trustno1-coder/VIctory-NVIDIA/pull/996>.
+/// Both clamps compile the same mesh mode. Compute dispatches retain their three dimensions.
+fn make_with_mesh_mode(
+    device: &ID3D12Device,
+    source: &str,
+    mesh_x_only: bool,
+) -> windows::core::Result<Clamp> {
+    let source = &format!(
+        "#define WIDEST {}u\n#define REST {}\n#define MESH_X_ONLY {}\n{source}",
+        widest(device),
+        rest(),
+        u32::from(mesh_x_only)
+    );
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -2558,28 +2584,32 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         assert_ne!(clamped_words[21], 0xDEAD_BEEF);
     }
 
-    /// WARP D3D12 test proving `BUDGET` saturates without 32-bit unsigned
-    /// wraparound across >64 huge indexed-draw records (`count = None`), while
-    /// preserving `StartIndexLocation`, `BaseVertexLocation`,
-    /// `StartInstanceLocation`, and custom stride padding, and leaving
-    /// `src_args` untouched.
-    /// A window of mesh records clamped ahead: the filled ones come out as
-    /// they are and are charged, the slots of all ones come out empty and
-    /// charge nothing; clamped as single records the same slots are clamped
-    /// to the most and spend the budget.
+    /// Filled records follow the selected mesh mode in both windowed and single clamps.
+    /// An unfilled slot costs nothing and keeps its padding.
     #[test]
     fn warp_window_leaves_unfilled_slots_empty_and_uncharged() {
+        for mesh_x_only in [false, true] {
+            check_window_mesh_records(mesh_x_only);
+        }
+    }
+
+    fn check_window_mesh_records(mesh_x_only: bool) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
+        warp.clamp = make_with_mesh_mode(&warp.device, SOURCE, mesh_x_only)
+            .expect("the mesh clamp must compile on WARP");
         const KIND_MESH: u32 = 10;
         const STRIDE: u32 = 32;
         const RECORDS: u32 = 16;
-        let filled = [5u32, 0, 519];
+        let filled = [
+            [1593u32, 0, 0], [0, 1, 1], [519, u32::MAX, 0],
+            [5, 1, 1], [65535, 1, 1], [65536, 1, 1],
+        ];
         let total = (STRIDE * RECORDS) as usize;
         let mut src = vec![0xffu8; total];
-        for (i, groups) in filled.into_iter().enumerate() {
-            let words = [groups, 1, 1, 0xAB00 + i as u32];
+        for (i, [x, y, z]) in filled.into_iter().enumerate() {
+            let words = [x, y, z, 0xAB00 + i as u32];
             for (w, word) in words.into_iter().enumerate() {
                 let at = i * STRIDE as usize + w * 4;
                 src[at..at + 4].copy_from_slice(&word.to_le_bytes());
@@ -2625,18 +2655,26 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
                     std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), total / 4).to_vec(),
                 )
             };
-            for (i, groups) in filled.into_iter().enumerate() {
+            for (i, [x, y, z]) in filled.into_iter().enumerate() {
                 let rec = &out[i * 8..i * 8 + 4];
-                assert_eq!(rec, [groups, u32::from(groups > 0).max(1).min(1), 1, 0xAB00 + i as u32], "filled record {i}, ahead {ahead}");
+                let groups = if x > 65535 {
+                    [0; 3]
+                } else if mesh_x_only {
+                    [x, 1, 1]
+                } else {
+                    [x, y.min(1), z.min(1)]
+                };
+                assert_eq!(rec[..3], groups, "filled record {i}, ahead {ahead}, mesh X only {mesh_x_only}");
+                assert_eq!(rec[3], 0xAB00 + i as u32);
             }
-            let charged_filled = (5 + 519) * 128;
+            let charged_filled = (5 + 65535 + if mesh_x_only { 1593 + 519 } else { 0 }) * 128;
             // As one window ahead of its draws and one by one alike.
             for i in filled.len()..RECORDS as usize {
                 assert_eq!(out[i * 8..i * 8 + 3], [0, 0, 0], "unfilled slot {i} must come out empty");
                 assert_eq!(out[i * 8 + 3], u32::MAX, "the words after the record are copied as they are");
             }
             assert_eq!(spent, charged_filled, "unfilled slots charge nothing");
-            assert_eq!(largest, 519, "and are not counted as asked for");
+            assert_eq!(largest, 65535, "and are not counted as asked for");
         }
     }
 
@@ -3332,10 +3370,19 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
     /// was recorded; it charges each as often as it is read.
     #[test]
     fn warp_batch_clamps_as_the_clamp_of_one_does() {
+        for mesh_x_only in [false, true] {
+            check_batched_records(mesh_x_only);
+        }
+    }
+
+    fn check_batched_records(mesh_x_only: bool) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
+        warp.clamp = make_with_mesh_mode(&warp.device, SOURCE, mesh_x_only)
+            .expect("the single clamp must compile on WARP");
+        let pass = make_with_mesh_mode(&warp.device, batch::SOURCE, mesh_x_only)
+            .expect("the batched clamp must compile on WARP");
         let kinds = [0u32, 1, 2, 10];
         let values = [0u32, 1, 3, 100, 65_535, 65_536, 1 << 20, (1 << 23) - 1, 1 << 23, 1 << 24, (1 << 26) + 1, u32::MAX];
         // Every kind with many records, in two sources.
@@ -3347,6 +3394,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                 }
             }
         }
+        records.push((10, [1593, 0, 0, 0, 0]));
         // In passes of so few that the budget holds whatever one asks for,
         // and one pass of them all, which it does not.
         let (src, src_ptr, src_gpu) = warp.shared_buffer(64 << 10);
@@ -3364,7 +3412,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         let (back, back_ptr, _) = warp.shared_buffer(64 << 10);
         let dst = warp.default_uav(64 << 10);
         let (_table, table_ptr, table_gpu) = warp.shared_buffer(batch::TABLE);
-        for (i, (kind, _)) in records.iter().enumerate().step_by(3) {
+        for (i, (kind, input)) in records.iter().enumerate().step_by(3) {
             let offset = i as u64 * 32;
             let words = batch::words(*kind).unwrap();
             let stride = words * 4;
@@ -3404,8 +3452,13 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                 let budget: Vec<u32> = (0..3).map(|k| unsafe { budget_ptr.cast::<u32>().add(k).read_volatile() }).collect();
                 seen.push((read(back_ptr), budget));
             }
-            // (A mesh record that asks for nothing notes nothing.)
-            assert_eq!(seen[0], seen[1], "record {i} of kind {kind}: {:?}", records[i].1);
+            if *kind == 10 && mesh_x_only {
+                let x = input[0];
+                let expected = if x <= 65535 { [x, 1, 1] } else { [0; 3] };
+                assert_eq!(seen[1].0, expected, "batched mesh {input:?}");
+                assert_eq!(seen[1].1[0], expected[0] * 128);
+            }
+            assert_eq!(seen[0], seen[1], "record {i} of kind {kind}: {input:?}");
         }
     }
 
