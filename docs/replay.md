@@ -13,6 +13,15 @@ and records the following frame in `frame-<n>.png` and `frame-<n>-ops.txt`.
 This trigger is used once per run and the usual power-of-two pictures are also saved.
 Lists recorded before the request can be missing from the operation log.
 
+For a PIX GPU capture, set `VICTORY_PIX_CAPTURE_DIR` to a new absolute
+directory outside the repository and start a diagnostics build on Windows
+with Microsoft PIX installed. Wait for `PIX GPU capture armed` in the log.
+Create an empty `pix-next` file in that directory when the scene appears.
+PIX queues one present-to-present capture in `frame-<pid>.wpix`. Wait for
+the file to finish writing before closing the game. An accepted request
+records the frame number in the log. The capture can then be opened in PIX.
+[Microsoft's programmatic GPU capture API](https://learn.microsoft.com/en-us/windows/pix/get-started/programmatic-capture)
+
 ## Recording
 
 Off unless `VICTORY_RECORD` is set. Build with

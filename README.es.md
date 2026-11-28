@@ -149,6 +149,8 @@ Si prefieres PowerShell en lugar del launcher gráfico:
 
 La pasada de 15 minutos a 1080p nativos dio 16,8 FPS de mediana y 8,0 de mínimo en la lancha tras excluir menús y transiciones observados. El launcher 0.9.1 permite reproducir el perfil desde **Jugar → Calidad → Nítido 1080p**. Los tramos históricos de 720p y 1080p reescalados de la tabla corresponden a otras cargas. [Informe de calidad, mediciones y próximas pruebas](docs/rtx4090-informe-2026-11-27.md)
 
+El 28 de noviembre se midieron 15 minutos continuos de caminata y natación en la RTX 4090 con el perfil de terreno a 1080p nativos. La mediana fue de 14,65 FPS y el mínimo de 6,0. De 172 ventanas de medición, 161 quedaron por debajo de 20 FPS. En la piscina se recuperaron el suelo y las tumbonas. Los personajes del primer plano aún tienen contornos angulosos. [Comparación de calidad y tiempos de cuadro](docs/rtx4090-comparacion-victory-nvidia-2026-11-28.md)
+
 | Escenario (`release`, traductor `v6`) | FPS en el tramo medido | Espera GPU | Notas verificadas |
 |---|---|---|---|
 | **Menús / Interfaz** | **60.0 FPS** (`16.7 ms`) | `0.0 ms` | Tope de 60 FPS sin alterar velocidad de simulación |

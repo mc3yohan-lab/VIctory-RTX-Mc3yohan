@@ -159,3 +159,44 @@ Hay un conflicto concreto en los comandos de malla. El filtro de Neptune lee X, 
 ## Diagnóstico de un cuadro D3D12
 
 Para validar el instrumental se usó una aplicación sintética de 256×160 que borra el fondo, dibuja un triángulo y presenta el cuadro. PIX 2611.19 capturó, reabrió e identificó `ClearRenderTargetView`, `DrawInstanced` y `Present`. RenderDoc 1.47 recuperó los dos shaders, los tres vértices y el color de dos píxeles del destino RGBA8. En el triángulo leyó (229, 56, 10, 255) y en el fondo (9, 31, 76, 255). Con ese procedimiento se puede seguir un dibujo de la piscina y contrastar los enlaces y la profundidad en el contorno del brazo. La verificación del instrumental y las mediciones de FPS se hicieron en procesos distintos.
+
+### Dónde se pierde el detalle de los bañistas
+
+En la RTX 4090 se reconoció el plano por los dos sombreros y se registraron los destinos intermedios del cuadro 3.821 con el diagnóstico del motor. El juego renderizaba a 1920×1080. Los recuentos de la tabla proceden de las imágenes de diagnóstico a 960×540. Se usaron los mismos rectángulos interiores para cada destino, sin incluir los bordes de los personajes.
+
+| Zona | Píxeles | Colores en el destino de color base (#74) | Colores en la imagen HDR visualizada (#125) |
+|---|---:|---|---:|
+| Espalda izquierda | 6.804 | 1, RGB (178, 134, 121) | 355 |
+| Espalda derecha | 5.832 | 1, RGB (174, 128, 110) | 258 |
+| Vegetación cercana | 570 | 321 | 518 |
+| Franja oscura de la terraza | 4.074 | 1, negro | 11 |
+
+El color de ambas espaldas ya era uniforme antes del ajuste final de brillo. El contorno anguloso también aparecía en el destino de profundidad (#34). En la franja de terraza había 22 niveles de profundidad y llegaba algo de iluminación a la salida. Por tanto, un suelo oscuro en la imagen final también puede tener geometría presente. Estos datos pertenecen a este plano.
+
+Entre los dibujos que escribieron en #74 se identificaron 44 operaciones de transformación de mallas con animación de piel. La variante de fragmento usada por 30 de ellas carece de lecturas de imagen tanto en el programa original como en su traducción. Las otras dos variantes sí leen imágenes. Las 44 usan el mismo encuadre y recorte. Hasta atribuir el píxel del hombro a un dibujo concreto, estos tres grupos siguen siendo candidatos. Las capturas y los datos del juego se analizaron en almacenamiento local.
+
+El registro de operaciones de ese cuadro identificó el motivo de 251 descartes. Hubo 212 de resolución de trazado de rayos, 32 de luces locales por marcha de rayos y seis del constructor de estructuras de rayos. Esas rutas estaban desactivadas en el perfil. El descarte restante fue la traducción de un programa de cómputo de efectos. El contador de operaciones descartadas, por sí solo, sobrestimaría cuántas traducciones fallaron.
+
+### Qué pudieron capturar PIX y RenderDoc
+
+RenderDoc se conectó al proceso del juego y se solicitó un cuadro de la piscina. Windows agotó la memoria comprometida al reservar otros 4 MiB durante la captura y quedó sin escribirse el archivo RDC. En la prueba con el nuevo disparador de PIX, el capturador se armó antes de crear D3D12. La ventana se quedó en el menú mientras seguía la creación de pipelines y se cerró a los ocho minutos. Las medidas de color y profundidad anteriores proceden del diagnóstico interno del motor.
+
+El disparador de PIX se probó aparte con el módulo Rust del motor y un triángulo sintético. Al cuarto cuadro se solicitó una captura. PIX abrió el archivo de 328.939 bytes y exportó el borrado del destino, `DrawInstanced(3, 1, 0, 0)` y la presentación. El coste de instrumentación queda fuera de las mediciones de FPS.
+
+### Recuperación de la biblioteca nativa de pipelines
+
+Una sesión instrumentada de PIX rechazó la biblioteca del controlador y guardó 848 bytes en su lugar. La última partida nativa había guardado 279.977.728 bytes. Tras cerrar el proceso instrumentado se restauró la copia nativa anterior de 278.831.000 bytes y se verificó su huella. La siguiente partida aceptó una copia idéntica de esa biblioteca. En el cuadro 2.749 se distinguían el suelo, la vegetación y el edificio, y los dos personajes seguían mostrando piel lisa y contornos angulosos.
+
+El motor detecta ahora los módulos de captura de PIX y RenderDoc después de crear el dispositivo D3D12. Cuando encuentra uno, crea directamente los pipelines del dispositivo instrumentado. Una prueba con dos archivos independientes verifica que el perfilador conserva tanto la biblioteca nativa como un reemplazo pendiente para el siguiente arranque. Las siguientes pruebas de juego usan además copias privadas de toda la caché.
+
+## Precarga de contenedores incrustados
+
+El escáner aceptaba la longitud declarada de cada contenedor DXBC pero entregaba al cálculo de la clave todos los bytes desde el comienzo del contenedor hasta el final del archivo. En una prueba sintética, el mismo shader apareció tres veces, solo y en dos posiciones de otro archivo. El ejecutable anterior calculó tres claves distintas. La corrección usa el tramo que validó el lector DXBC y la prueba exige los mismos bytes en las tres posiciones.
+
+En el ejecutable de la instalación de prueba se encontraron diez contenedores válidos que sumaban 9.548 bytes. Antes entraban además 105.462.236 bytes ajenos a esos contenedores en los cálculos de claves. El cambio afecta a la identificación y precarga de shaders incrustados. Los materiales de los bañistas tienen una prueba visual independiente.
+
+Se descomprimieron en memoria los 26.503 registros reconocidos del archivo de shaders. Todos se pudieron leer. En la pasada de la piscina, las huellas de los dos shaders que el motor rechazó coincidieron con programas de cómputo de efectos para recopilar triángulos y reubicar memoria. El fallo fue la traducción de Wave64 al ancho de 32 carriles de la GPU. Los pases de iluminación estándar y de piel ya tenían pipeline disponible en su primer uso. Estos datos localizan dos rechazos reales y dejan pendiente identificar el dibujo que dio al hombro su contorno. Otro fork consiguió que el programa de reubicación pasara la validación DXIL en una RTX 5070. [Prueba del otro fork](https://github.com/DoubleGhosty/cool_fox/issues/3)
+
+## Repetición de la partida desde el launcher
+
+El launcher admite `--play-current-profile` para ejecutar el mismo perfil guardado, entorno y motor que usa el botón **Jugar**. El proceso espera al cierre del juego y devuelve un error si el motor falla. El registro identifica el perfil por nombre cuando coincide con los ajustes en vigor. En la prueba con un motor sintético se verificaron Series X, salida 1920×1080, escala 1, espera de texturas y mallas indirectas de una dimensión. Un hijo que terminó correctamente produjo salida 0 del launcher y uno que devolvió 19 produjo salida 1 y dejó el 19 en el registro.
